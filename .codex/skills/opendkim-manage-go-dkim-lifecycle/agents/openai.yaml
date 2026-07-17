@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenDKIM Manage DKIM Lifecycle"
+  short_description: "Maintain safe DKIM key lifecycle behavior"
+  default_prompt: "Use $opendkim-manage-go-dkim-lifecycle to change or verify DKIM lifecycle behavior."

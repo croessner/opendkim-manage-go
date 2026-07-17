@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenDKIM Manage Repo Workflow"
+  short_description: "Apply repository engineering and test rules"
+  default_prompt: "Use $opendkim-manage-go-repo-workflow to implement this repository change safely."

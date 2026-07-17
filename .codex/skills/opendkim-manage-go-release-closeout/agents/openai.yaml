@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenDKIM Manage Release Closeout"
+  short_description: "Validate and publish reproducible releases"
+  default_prompt: "Use $opendkim-manage-go-release-closeout to validate and publish this change."
