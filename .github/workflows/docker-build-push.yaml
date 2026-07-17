@@ -1,0 +1,67 @@
+---
+name: Docker Build Push Reusable
+
+"on":
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Git ref to check out before building.
+        required: true
+        type: string
+      tags:
+        description: Image tags passed to docker/build-push-action.
+        required: true
+        type: string
+      version:
+        description: Version embedded in the binary and OCI metadata.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.source_ref }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v3.11.1
+
+      - name: Login to GHCR
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v6.18.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: ${{ inputs.tags }}
+          annotations: >-
+            index,manifest:org.opencontainers.image.description=Manage OpenDKIM
+            keys in LDAP and DNS
+          labels: |
+            org.opencontainers.image.description=Manage OpenDKIM keys in LDAP and DNS
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.licenses=MIT
+          build-args: |
+            VERSION=${{ inputs.version }}
+            REVISION=${{ github.sha }}
+            SOURCE=https://github.com/${{ github.repository }}

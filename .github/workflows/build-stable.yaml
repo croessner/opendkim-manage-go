@@ -1,0 +1,238 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  APP_NAME: opendkim-manage
+  GOEXPERIMENT: runtimesecret
+  GOVULNCHECK_VERSION: v1.3.0
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: 1.26.5
+
+      - name: Install govulncheck
+        run: |
+          GOBIN="$(go env GOPATH)/bin" \
+            go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Enable vendored dependencies
+        run: go env -w GOFLAGS=-mod=vendor
+
+      - name: Run govulncheck
+        run: make govulncheck
+
+  build-artifact:
+    needs: govulncheck
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version: 1.26.5
+
+      - name: Build release binary
+        run: |
+          version="${GITHUB_REF_NAME}"
+          revision="${GITHUB_SHA:0:12}"
+          ldflags="-s -w -buildid= -X main.version=${version}-${revision}"
+
+          mkdir -p build
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -mod=vendor -trimpath -ldflags="${ldflags}" \
+            -o build/opendkim-manage ./cmd/opendkim-manage
+
+      - name: Create release archive
+        run: |
+          assets="${APP_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          mkdir -p "dist/${assets}/bin" "dist/${assets}/docs" "dist/${assets}/examples"
+          cp build/opendkim-manage "dist/${assets}/bin/"
+          cp AGENTS.md LICENSE POLICY.md README.md "dist/${assets}/"
+          cp docs/*.md "dist/${assets}/docs/"
+          cp examples/opendkim-manage.yaml "dist/${assets}/examples/"
+
+          (
+            cd dist
+            tar czf "${assets}.tar.gz" "${assets}"
+            sha256sum "${assets}.tar.gz" > "${assets}.tar.gz.sha256"
+          )
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: artifact-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+      - name: Attest release artifact
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          create-storage-record: false
+          subject-path: dist/*.tar.gz
+
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs:
+      - govulncheck
+      - build-artifact
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last_release_tag="$(gh release view \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json tagName \
+            --jq '.tagName' 2>/dev/null || true)"
+
+          notes_file="$(mktemp)"
+          trap 'rm -f "${notes_file}"' EXIT
+
+          {
+            echo "## Commit Summary"
+            echo
+          } > "${notes_file}"
+
+          append_section() {
+            local section_title="$1"
+            local grep_pattern="$2"
+            local log_output
+
+            if [[ -n "${last_release_tag}" ]]; then
+              log_output="$(git log "${last_release_tag}..${GITHUB_REF_NAME}" \
+                --pretty=format:'- %s (%h)' \
+                --no-merges \
+                --regexp-ignore-case \
+                --grep="^${grep_pattern}" || true)"
+            else
+              log_output="$(git log "${GITHUB_REF_NAME}" \
+                --pretty=format:'- %s (%h)' \
+                --no-merges \
+                --regexp-ignore-case \
+                --grep="^${grep_pattern}" || true)"
+            fi
+
+            if [[ -n "${log_output}" ]]; then
+              {
+                echo "### ${section_title}"
+                echo "${log_output}"
+                echo
+              } >> "${notes_file}"
+            fi
+          }
+
+          append_section "Added" "Add:"
+          append_section "Changed" "Change:"
+          append_section "Fixed" "Fix:"
+          append_section "Removed" "Remove:"
+          append_section "Refactored" "Refactor:"
+          append_section "Tests" "Test:"
+          append_section "Documentation" "Docs:"
+          append_section "Build and CI" "(Build|Ci):"
+          append_section "Security" "Security:"
+          append_section "Dependencies" "Vendor:"
+          append_section "Chores" "Chore:"
+
+          if ! grep -q '^### ' "${notes_file}"; then
+            if [[ -n "${last_release_tag}" ]]; then
+              fallback_range="${last_release_tag}..${GITHUB_REF_NAME}"
+            else
+              fallback_range="${GITHUB_REF_NAME}"
+            fi
+
+            {
+              echo "### Other Commits"
+              git log "${fallback_range}" \
+                --pretty=format:'- %s (%h)' \
+                --no-merges \
+                -n 20
+              echo
+            } >> "${notes_file}"
+          fi
+
+          args=(
+            "${GITHUB_REF_NAME}"
+            --repo "${GITHUB_REPOSITORY}"
+            --verify-tag
+            --title "${GITHUB_REF_NAME}"
+            --notes-file "${notes_file}"
+            --generate-notes
+          )
+
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            args+=(--prerelease)
+          else
+            args+=(--latest)
+          fi
+
+          gh release create "${args[@]}"
+
+  upload-release:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    needs:
+      - create-release
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: artifact-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets="${APP_NAME}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          gh release upload "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            "dist/${assets}.tar.gz" \
+            "dist/${assets}.tar.gz.sha256"
