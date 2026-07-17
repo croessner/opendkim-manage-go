@@ -77,7 +77,7 @@ jobs:
           mkdir -p "dist/${assets}/bin" "dist/${assets}/docs" "dist/${assets}/examples"
           cp build/opendkim-manage "dist/${assets}/bin/"
           cp AGENTS.md LICENSE POLICY.md README.md "dist/${assets}/"
-          cp docs/*.md "dist/${assets}/docs/"
+          cp -R docs/. "dist/${assets}/docs/"
           cp examples/opendkim-manage.yaml "dist/${assets}/examples/"
 
           (
