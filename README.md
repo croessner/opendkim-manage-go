@@ -10,7 +10,7 @@ records through authenticated TSIG updates. It is a Go 1.26 rewrite of the
 legacy Python `opendkim-manage` utility and is distributed under the MIT
 license.
 
-The current prerelease is `v1.0.0-Beta.1`.
+The current prerelease is `v1.0.0-beta.1`.
 
 ## Features
 
@@ -51,7 +51,7 @@ The source default is `dev`. Release and container builds replace
 
 ```bash
 go build -mod=vendor -trimpath \
-  -ldflags "-X main.version=v1.0.0-Beta.1" \
+  -ldflags "-X main.version=v1.0.0-beta.1" \
   -o bin/opendkim-manage ./cmd/opendkim-manage
 ```
 

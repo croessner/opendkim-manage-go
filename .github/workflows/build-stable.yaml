@@ -140,12 +140,14 @@ jobs:
               log_output="$(git log "${last_release_tag}..${GITHUB_REF_NAME}" \
                 --pretty=format:'- %s (%h)' \
                 --no-merges \
+                --extended-regexp \
                 --regexp-ignore-case \
                 --grep="^${grep_pattern}" || true)"
             else
               log_output="$(git log "${GITHUB_REF_NAME}" \
                 --pretty=format:'- %s (%h)' \
                 --no-merges \
+                --extended-regexp \
                 --regexp-ignore-case \
                 --grep="^${grep_pattern}" || true)"
             fi
