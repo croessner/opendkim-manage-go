@@ -38,14 +38,15 @@ type RunResult struct {
 }
 
 type Manager struct {
-	cfg             *config.Config
-	opts            *cli.Options
-	runtime         RuntimeConfig
-	ldap            *ldapstore.Client
-	tree            *ldapstore.Tree
-	dns             *dnsupdate.Client
-	lookupTXT       func(string) ([]string, error)
-	writeAuthorized bool
+	cfg               *config.Config
+	opts              *cli.Options
+	runtime           RuntimeConfig
+	ldap              *ldapstore.Client
+	tree              *ldapstore.Tree
+	dns               *dnsupdate.Client
+	lookupTXT         func(string) ([]string, error)
+	replaceDKIMDomain func(string, string) error
+	writeAuthorized   bool
 }
 
 var errConfirmationRequired = errors.New("confirmation required; use --yes for non-interactive writes or --interactive")
@@ -284,10 +285,7 @@ func (m *Manager) CmdCreate(domainName string, explicitType types.DKIMKeyType) e
 				val := "@" + dName
 				identity = &val
 			}
-			signingTableDomain := dName
-			if _, ok := m.runtime.MultipleSignaturesDomains[strings.ToLower(strings.TrimSpace(dName))]; ok {
-				signingTableDomain = "*"
-			}
+			signingTableDomain := m.signingDomainFor(dName)
 			dn := fmt.Sprintf("%s=%s,%s", m.cfg.Scheme.DKIMSelector, newSelector, domain.LDAPDN)
 			if err := m.storeDKIMKey(dn, privateKey, keyType, dName, signingTableDomain, identity); err != nil {
 				return err
@@ -295,8 +293,9 @@ func (m *Manager) CmdCreate(domainName string, explicitType types.DKIMKeyType) e
 			if m.opts.DryRun {
 				now := time.Now().UTC()
 				domain.Selectors[newSelector] = &ldapstore.Selector{
-					DomainName: dName, SelectorName: newSelector, LDAPDN: dn, Created: now, Modified: now,
-					State: types.DKIMDisabled, RevokeState: types.RevokeDisabled, KeyType: keyType, Key: privateKey,
+					DomainName: dName, SelectorName: newSelector, LDAPDN: dn, SigningDomain: signingTableDomain,
+					Created: now, Modified: now, State: types.DKIMDisabled, RevokeState: types.RevokeDisabled,
+					KeyType: keyType, Key: privateKey,
 				}
 			}
 			m.verbosef("DN %s created (%s)", dn, keyType.String())
@@ -1126,6 +1125,9 @@ func (m *Manager) CmdAuto() error {
 	if err := m.preflightMutationDomains(); err != nil {
 		return err
 	}
+	if err := m.reconcileActiveSigningDomainDrift(); err != nil {
+		return err
+	}
 
 	m.verbosef("running add-new")
 	if err := m.CmdAddNew(); err != nil {
@@ -1251,6 +1253,95 @@ func (m *Manager) CmdAuto() error {
 		}
 	}
 
+	return nil
+}
+
+// signingDomainFor returns the authoritative DKIMDomain value for newly
+// created and reconciled selectors of a domain.
+func (m *Manager) signingDomainFor(domainName string) string {
+	if _, ok := m.runtime.MultipleSignaturesDomains[strings.ToLower(strings.TrimSpace(domainName))]; ok {
+		return "*"
+	}
+	return domainName
+}
+
+// reconcileActiveSigningDomainDrift repairs configured exact/wildcard drift
+// before automatic lifecycle steps can mistake an existing key for a gap.
+func (m *Manager) reconcileActiveSigningDomainDrift() error {
+	domainNames, err := m.tree.GetDomainNames()
+	if err != nil {
+		return err
+	}
+	for _, domainName := range domainNames {
+		domain, err := m.tree.GetDomainByDomainName(domainName)
+		if err != nil {
+			return err
+		}
+		if domain == nil {
+			return fmt.Errorf("domain %q disappeared during signing-domain reconciliation", domainName)
+		}
+		if err := m.reconcileActiveSigningDomains(domain); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileActiveSigningDomains changes only DKIMDomain on active selectors
+// whose exact/wildcard state disagrees with the current configuration.
+func (m *Manager) reconcileActiveSigningDomains(domain *ldapstore.Domain) error {
+	if domain == nil || strings.TrimSpace(domain.DomainName) == "" {
+		return errors.New("cannot reconcile signing domains for an empty domain")
+	}
+	expected := m.signingDomainFor(domain.DomainName)
+	selectorNames := make([]string, 0, len(domain.Selectors))
+	for selectorName := range domain.Selectors {
+		selectorNames = append(selectorNames, selectorName)
+	}
+	sort.Strings(selectorNames)
+
+	for _, selectorName := range selectorNames {
+		current := domain.Selectors[selectorName]
+		if current == nil {
+			return fmt.Errorf("domain %q contains an empty selector entry", domain.DomainName)
+		}
+		if current.State != types.DKIMEnabled {
+			continue
+		}
+		stored := current.SigningDomain
+		actual := strings.TrimSpace(stored)
+		if actual != "*" && !strings.EqualFold(actual, domain.DomainName) {
+			return fmt.Errorf("active selector %q for domain %q has unsupported DKIMDomain state", selectorName, domain.DomainName)
+		}
+		if stored == expected {
+			continue
+		}
+		if strings.TrimSpace(current.LDAPDN) == "" || strings.TrimSpace(current.SelectorName) == "" {
+			return fmt.Errorf("active selector for domain %q lacks an LDAP identity", domain.DomainName)
+		}
+		if err := m.replaceActiveSelectorSigningDomain(current, domain.DomainName, actual, expected); err != nil {
+			return fmt.Errorf("reconcile active selector %q for domain %q: %w", selectorName, domain.DomainName, err)
+		}
+		current.SigningDomain = expected
+	}
+	return nil
+}
+
+// replaceActiveSelectorSigningDomain performs the sole LDAP mutation allowed
+// by signing-domain reconciliation and keeps dry-run strictly write-free.
+func (m *Manager) replaceActiveSelectorSigningDomain(selector *ldapstore.Selector, domainName, actual, expected string) error {
+	if m.opts.DryRun {
+		m.dryRunf("would replace LDAP DKIMDomain selector=%s domain=%s current=%s expected=%s", selector.SelectorName, domainName, actual, expected)
+		return nil
+	}
+	replace := m.replaceDKIMDomain
+	if replace == nil {
+		replace = m.ldap.ReplaceDKIMDomain
+	}
+	if err := replace(selector.LDAPDN, expected); err != nil {
+		return err
+	}
+	m.verbosef("reconciled LDAP DKIMDomain selector=%s domain=%s expected=%s", selector.SelectorName, domainName, expected)
 	return nil
 }
 

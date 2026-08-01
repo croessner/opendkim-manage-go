@@ -89,6 +89,8 @@ GOEXPERIMENT=runtimesecret go test -mod=vendor ./internal/dkim -v
 - CLI parsing for `--dry-run` and `--yes`
 - LDAP filter escaping while keeping the internal `*` wildcard
 - literal `DKIMDomain=*` lookup constrained by `associatedDomain`
+- bidirectional active-selector `DKIMDomain` reconciliation, idempotence,
+  inactive-history preservation, and dry-run write suppression
 - exact-one-TXT-RR parsing and TXT-RRset replacement
 - TSIG response presence and DNS failure propagation
 - time-based direct-record tombstone retention

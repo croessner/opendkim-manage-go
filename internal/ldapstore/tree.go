@@ -13,15 +13,16 @@ import (
 )
 
 type Selector struct {
-	DomainName   string
-	SelectorName string
-	LDAPDN       string
-	Created      time.Time
-	Modified     time.Time
-	State        types.DKIMActiveState
-	RevokeState  types.DKIMRevokeState
-	KeyType      types.DKIMKeyType
-	Key          string
+	DomainName    string
+	SelectorName  string
+	LDAPDN        string
+	SigningDomain string
+	Created       time.Time
+	Modified      time.Time
+	State         types.DKIMActiveState
+	RevokeState   types.DKIMRevokeState
+	KeyType       types.DKIMKeyType
+	Key           string
 }
 
 type Domain struct {
@@ -33,7 +34,6 @@ type Domain struct {
 }
 
 type Tree struct {
-	cfg          *config.Config
 	client       *Client
 	scheme       types.Scheme
 	domain       string
@@ -51,7 +51,6 @@ func NewTree(cfg *config.Config, domain string) (*Tree, error) {
 		domain = "*"
 	}
 	return &Tree{
-		cfg:     cfg,
 		client:  client,
 		scheme:  cfg.Scheme,
 		domain:  domain,
@@ -138,7 +137,7 @@ func (t *Tree) loadDomains(filterDomain string) (map[string]*Domain, error) {
 			Selectors:            map[string]*Selector{},
 		}
 
-		selFilter := selectorSearchFilter(t.scheme, domainName, containsDomain(t.cfg.Global.MultipleSignaturesDomains, domainName))
+		selFilter := selectorSearchFilter(t.scheme, domainName)
 		selAttrs := []string{t.scheme.DKIMDomain, t.scheme.AssociatedDomain, t.scheme.DKIMSelector, t.scheme.DKIMActive, t.scheme.CreateTimestamp, t.scheme.ModifyTimestamp, t.scheme.DKIMKeyType}
 		selEntries, err := t.client.Search(selFilter, "", selAttrs, ldap.ScopeWholeSubtree)
 		if err != nil {
@@ -149,12 +148,25 @@ func (t *Tree) loadDomains(filterDomain string) (map[string]*Domain, error) {
 			if strings.TrimSpace(selName) == "" {
 				continue
 			}
+			associatedDomains := se.GetAttributeValues(t.scheme.AssociatedDomain)
+			if len(associatedDomains) != 1 || !strings.EqualFold(strings.TrimSpace(associatedDomains[0]), domainName) {
+				return nil, fmt.Errorf("selector %q has ambiguous associatedDomain state", selName)
+			}
+			signingDomains := se.GetAttributeValues(t.scheme.DKIMDomain)
+			if len(signingDomains) != 1 {
+				return nil, fmt.Errorf("selector %q has ambiguous DKIMDomain state", selName)
+			}
+			signingDomain := strings.TrimSpace(signingDomains[0])
+			if signingDomain != "*" && !strings.EqualFold(signingDomain, domainName) {
+				return nil, fmt.Errorf("selector %q has unsupported DKIMDomain state", selName)
+			}
 			sel := &Selector{
-				LDAPDN:       se.DN,
-				DomainName:   domainName,
-				SelectorName: selName,
-				State:        types.DKIMDisabled,
-				RevokeState:  types.RevokeDisabled,
+				LDAPDN:        se.DN,
+				DomainName:    domainName,
+				SelectorName:  selName,
+				SigningDomain: signingDomains[0],
+				State:         types.DKIMDisabled,
+				RevokeState:   types.RevokeDisabled,
 			}
 			if strings.EqualFold(se.GetAttributeValue(t.scheme.DKIMActive), "TRUE") {
 				sel.State = types.DKIMEnabled
@@ -191,20 +203,10 @@ func (t *Tree) loadDomains(filterDomain string) (map[string]*Domain, error) {
 	return domains, nil
 }
 
-func selectorSearchFilter(scheme types.Scheme, domainName string, includeWildcard bool) string {
-	if !includeWildcard {
-		return fmt.Sprintf("(&(objectClass=%s)(%s=%s))", scheme.DKIM, scheme.DKIMDomain, ldapFilterValue(domainName))
-	}
+// selectorSearchFilter keeps both exact and associated wildcard selectors
+// visible so configuration changes can be reconciled without creating keys.
+func selectorSearchFilter(scheme types.Scheme, domainName string) string {
 	return fmt.Sprintf("(&(objectClass=%s)(|(%s=%s)(&(%s=%s)(%s=%s))))", scheme.DKIM, scheme.DKIMDomain, ldapFilterValue(domainName), scheme.DKIMDomain, ldap.EscapeFilter("*"), scheme.AssociatedDomain, ldapFilterValue(domainName))
-}
-
-func containsDomain(domains []string, domain string) bool {
-	for _, candidate := range domains {
-		if strings.EqualFold(strings.TrimSpace(candidate), domain) {
-			return true
-		}
-	}
-	return false
 }
 
 func (t *Tree) ensureLoaded() error {

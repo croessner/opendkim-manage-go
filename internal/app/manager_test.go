@@ -1,6 +1,9 @@
 package app
 
 import (
+	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -177,6 +180,178 @@ func TestDryRunWriteWrappersDoNotNeedExternalClients(t *testing.T) {
 	}
 	if err := m.changeDNSDKIMKey("example.org", "selector", "content", ""); err != nil {
 		t.Fatalf("dry-run DNS change: %v", err)
+	}
+}
+
+func TestReconcileActiveSigningDomainPlansExactToWildcardInDryRun(t *testing.T) {
+	const domainName = "tenant.example.org"
+	selector := &ldapstore.Selector{
+		DomainName:    domainName,
+		SelectorName:  "rsa-2026",
+		LDAPDN:        "DKIMSelector=rsa-2026,associatedDomain=tenant.example.org,dc=example,dc=org",
+		State:         types.DKIMEnabled,
+		KeyType:       types.DKIMKeyTypeRSA,
+		SigningDomain: domainName,
+	}
+	domain := &ldapstore.Domain{
+		DomainName: domainName,
+		Selectors:  map[string]*ldapstore.Selector{selector.SelectorName: selector},
+	}
+	writes := 0
+	m := &Manager{
+		opts: &cli.Options{DryRun: true},
+		runtime: RuntimeConfig{MultipleSignaturesDomains: map[string]struct{}{
+			domainName: {},
+		}},
+		replaceDKIMDomain: func(_, _ string) error {
+			writes++
+			return nil
+		},
+	}
+
+	stderrReader, stderrWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("open stderr pipe: %v", err)
+	}
+	originalStderr := os.Stderr
+	os.Stderr = stderrWriter
+	reconcileErr := m.reconcileActiveSigningDomains(domain)
+	closeWriterErr := stderrWriter.Close()
+	os.Stderr = originalStderr
+	if closeWriterErr != nil {
+		t.Fatalf("close stderr writer: %v", closeWriterErr)
+	}
+	output, readErr := io.ReadAll(stderrReader)
+	if closeErr := stderrReader.Close(); closeErr != nil {
+		t.Fatalf("close stderr reader: %v", closeErr)
+	}
+	if readErr != nil {
+		t.Fatalf("read dry-run output: %v", readErr)
+	}
+	if reconcileErr != nil {
+		t.Fatalf("reconcile active signing domains: %v", reconcileErr)
+	}
+	if !strings.Contains(string(output), "would replace LDAP DKIMDomain") || !strings.Contains(string(output), "current=tenant.example.org expected=*") {
+		t.Fatalf("dry-run did not report the planned DKIMDomain correction: %q", output)
+	}
+	if writes != 0 {
+		t.Fatalf("dry-run performed %d LDAP writes", writes)
+	}
+	if selector.SigningDomain != "*" {
+		t.Fatalf("dry-run did not simulate wildcard correction: %q", selector.SigningDomain)
+	}
+}
+
+func TestReconcileActiveSigningDomainReplacesWildcardWithExactOnly(t *testing.T) {
+	const domainName = "single.example.org"
+	created := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	modified := time.Date(2026, 7, 2, 11, 0, 0, 0, time.UTC)
+	selector := &ldapstore.Selector{
+		DomainName:    domainName,
+		SelectorName:  "ed25519-2026",
+		LDAPDN:        "DKIMSelector=ed25519-2026,associatedDomain=single.example.org,dc=example,dc=org",
+		SigningDomain: "*",
+		Created:       created,
+		Modified:      modified,
+		State:         types.DKIMEnabled,
+		RevokeState:   types.RevokeDisabled,
+		KeyType:       types.DKIMKeyTypeED25519,
+		Key:           "opaque-test-key",
+	}
+	domain := &ldapstore.Domain{
+		DomainName: domainName,
+		Selectors:  map[string]*ldapstore.Selector{selector.SelectorName: selector},
+	}
+	type replacement struct {
+		dn    string
+		value string
+	}
+	replacements := make([]replacement, 0, 1)
+	m := &Manager{
+		opts: &cli.Options{},
+		replaceDKIMDomain: func(dn, value string) error {
+			replacements = append(replacements, replacement{dn: dn, value: value})
+			return nil
+		},
+	}
+
+	if err := m.reconcileActiveSigningDomains(domain); err != nil {
+		t.Fatalf("reconcile active signing domains: %v", err)
+	}
+	if len(replacements) != 1 || replacements[0].dn != selector.LDAPDN || replacements[0].value != domainName {
+		t.Fatalf("unexpected LDAP replacement: %#v", replacements)
+	}
+	if selector.SigningDomain != domainName {
+		t.Fatalf("selector did not converge to the exact signing domain: %q", selector.SigningDomain)
+	}
+	if selector.DomainName != domainName || selector.SelectorName != "ed25519-2026" || selector.KeyType != types.DKIMKeyTypeED25519 || selector.Key != "opaque-test-key" || selector.State != types.DKIMEnabled || selector.RevokeState != types.RevokeDisabled || !selector.Created.Equal(created) || !selector.Modified.Equal(modified) {
+		t.Fatal("reconciliation changed selector state outside DKIMDomain")
+	}
+	if err := m.reconcileActiveSigningDomains(domain); err != nil {
+		t.Fatalf("repeat reconciliation: %v", err)
+	}
+	if len(replacements) != 1 {
+		t.Fatalf("idempotent reconciliation performed %d replacements", len(replacements))
+	}
+}
+
+func TestReconcileSigningDomainLeavesInactiveHistoryUntouched(t *testing.T) {
+	const domainName = "history.example.org"
+	selector := &ldapstore.Selector{
+		DomainName:    domainName,
+		SelectorName:  "old-rsa",
+		LDAPDN:        "DKIMSelector=old-rsa,associatedDomain=history.example.org,dc=example,dc=org",
+		SigningDomain: domainName,
+		State:         types.DKIMDisabled,
+		KeyType:       types.DKIMKeyTypeRSA,
+	}
+	domain := &ldapstore.Domain{DomainName: domainName, Selectors: map[string]*ldapstore.Selector{selector.SelectorName: selector}}
+	writes := 0
+	m := &Manager{
+		opts: &cli.Options{},
+		runtime: RuntimeConfig{MultipleSignaturesDomains: map[string]struct{}{
+			domainName: {},
+		}},
+		replaceDKIMDomain: func(_, _ string) error {
+			writes++
+			return nil
+		},
+	}
+
+	if err := m.reconcileActiveSigningDomains(domain); err != nil {
+		t.Fatalf("reconcile inactive history: %v", err)
+	}
+	if writes != 0 || selector.SigningDomain != domainName {
+		t.Fatal("inactive selector history was rewritten")
+	}
+}
+
+func TestReconcileSigningDomainFailsClosedOnLDAPError(t *testing.T) {
+	const domainName = "failure.example.org"
+	selector := &ldapstore.Selector{
+		DomainName:    domainName,
+		SelectorName:  "rsa-current",
+		LDAPDN:        "DKIMSelector=rsa-current,associatedDomain=failure.example.org,dc=example,dc=org",
+		SigningDomain: domainName,
+		State:         types.DKIMEnabled,
+		KeyType:       types.DKIMKeyTypeRSA,
+	}
+	domain := &ldapstore.Domain{DomainName: domainName, Selectors: map[string]*ldapstore.Selector{selector.SelectorName: selector}}
+	m := &Manager{
+		opts: &cli.Options{},
+		runtime: RuntimeConfig{MultipleSignaturesDomains: map[string]struct{}{
+			domainName: {},
+		}},
+		replaceDKIMDomain: func(_, _ string) error {
+			return errors.New("ldap replace DKIMDomain request failed")
+		},
+	}
+
+	if err := m.reconcileActiveSigningDomains(domain); err == nil {
+		t.Fatal("expected LDAP replacement failure")
+	}
+	if selector.SigningDomain != domainName {
+		t.Fatal("failed LDAP replacement was applied to the in-memory selector")
 	}
 }
 

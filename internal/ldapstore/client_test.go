@@ -8,6 +8,7 @@ import (
 	"github.com/go-ldap/ldap/v3"
 
 	"github.com/croessner/opendkim-manage-go/internal/config"
+	"github.com/croessner/opendkim-manage-go/internal/types"
 )
 
 func TestTLSConfigUsesLDAPURIHostAsServerName(t *testing.T) {
@@ -199,6 +200,32 @@ func TestSafeRequestErrorRedactsDiagnosticsAndPreservesResultCode(t *testing.T) 
 	}
 	if !ldap.IsErrorWithCode(err, ldap.LDAPResultAssertionFailed) {
 		t.Fatalf("request error lost LDAP result code: %v", err)
+	}
+}
+
+func TestReplaceDKIMDomainRequestChangesOnlyTargetAttribute(t *testing.T) {
+	const dn = "DKIMSelector=ed25519-2026,associatedDomain=single.example.org,ou=dkim2,dc=example,dc=org"
+	req := replaceDKIMDomainRequest(types.DefaultScheme(), dn, "single.example.org")
+	if req.DN != dn {
+		t.Fatalf("unexpected target DN: %q", req.DN)
+	}
+	if len(req.Changes) != 1 {
+		t.Fatalf("expected one LDAP change, got %d", len(req.Changes))
+	}
+	change := req.Changes[0]
+	if change.Operation != ldap.ReplaceAttribute || change.Modification.Type != "DKIMDomain" || len(change.Modification.Vals) != 1 || change.Modification.Vals[0] != "single.example.org" {
+		t.Fatalf("unexpected LDAP change: %#v", change)
+	}
+}
+
+func TestReplaceDKIMDomainErrorRedactsServerDiagnostics(t *testing.T) {
+	const diagnosticMarker = "server-diagnostic-marker"
+	err := safeRequestError("replace DKIMDomain", ldap.NewError(ldap.LDAPResultConstraintViolation, errors.New(diagnosticMarker)))
+	if strings.Contains(err.Error(), diagnosticMarker) {
+		t.Fatalf("DKIMDomain replacement error exposed server diagnostics: %v", err)
+	}
+	if !ldap.IsErrorWithCode(err, ldap.LDAPResultConstraintViolation) {
+		t.Fatalf("DKIMDomain replacement error lost LDAP result code: %v", err)
 	}
 }
 

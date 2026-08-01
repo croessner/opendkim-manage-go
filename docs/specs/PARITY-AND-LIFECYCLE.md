@@ -68,6 +68,22 @@ Every `destinationIndicator` must be allowlisted as an exact DNS name in
 LDH-compliant. In particular, underscores are forbidden in customer domains
 so mapping dots to underscores remains collision-free.
 
+## Signing-Table Domain Reconciliation
+
+An active selector has `DKIMDomain=*` if and only if its `associatedDomain` is
+configured in `global.multiple_signatures_domains`. All other active selectors
+use their exact associated domain as `DKIMDomain`. Automatic reconciliation
+loads both representations for every domain so a configuration change cannot
+hide an existing selector and cause an unnecessary replacement key.
+
+Before other `--auto` lifecycle steps, exact/wildcard drift is corrected by a
+single LDAP replacement of `DKIMDomain` on each affected active selector.
+Selector names and DNs, `associatedDomain`, key type and material, activation
+and revocation state, and DNS remain unchanged. Inactive and revoked history is
+not rewritten. Dry-run reports and simulates the same correction without an
+LDAP or DNS write. Ambiguous LDAP attribute state or a failed replacement stops
+the automatic lifecycle.
+
 ## Parity Matrix
 
 | Area | Go behavior | Relationship to the legacy implementation |
@@ -82,7 +98,7 @@ so mapping dots to underscores remains collision-free.
 | LDAP transport | LDAPS/StartTLS and certificate verification by default; `allow_insecure` must be explicit | Intentional hardening |
 | SASL | EXTERNAL with a client certificate only; no fallback | Intentional hardening |
 | Selector resolution | Global ambiguity is an error; domain context resolves exactly | Fixes first-match behavior |
-| Multiple signatures | Literal `DKIMDomain=*` lookup is combined with `associatedDomain` | Fixes a legacy gap |
+| Multiple signatures | Exact and literal `DKIMDomain=*` selectors remain visible and active-selector drift is reconciled to current configuration | Fixes a legacy gap without creating replacement keys |
 | DNS update | Replaces only the complete TXT RRset; other RR types remain intact | Fixes add/delete semantics |
 | DNS authentication | Requires TSIG configuration and a signed success response | Intentional hardening |
 | DNS test | Requires exactly one logical TXT RR; strings are joined only within that RR | Prevents concatenation of multiple RRs |

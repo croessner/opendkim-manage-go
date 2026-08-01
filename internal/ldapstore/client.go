@@ -581,6 +581,24 @@ func (c *Client) SetActive(dn string, active bool) error {
 	return nil
 }
 
+// ReplaceDKIMDomain changes only the signing-table domain of one existing
+// selector and redacts all LDAP connection and server diagnostics on failure.
+func (c *Client) ReplaceDKIMDomain(dn, signingDomain string) error {
+	req := replaceDKIMDomainRequest(c.scheme, dn, signingDomain)
+	if _, err := c.ModifyRequest(req); err != nil {
+		return safeRequestError("replace DKIMDomain", err)
+	}
+	return nil
+}
+
+// replaceDKIMDomainRequest constructs the single-attribute replacement used
+// by active-selector signing-domain reconciliation.
+func replaceDKIMDomainRequest(scheme types.Scheme, dn, signingDomain string) *ldap.ModifyRequest {
+	req := ldap.NewModifyRequest(dn, nil)
+	req.Replace(scheme.DKIMDomain, []string{signingDomain})
+	return req
+}
+
 func (c *Client) RevokeDKIMKey(dn string) error {
 	if err := c.EnsureConnected(); err != nil {
 		return err

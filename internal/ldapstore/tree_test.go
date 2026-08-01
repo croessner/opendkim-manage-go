@@ -115,7 +115,10 @@ func TestGetSelectorByDomainNameReturnsNilWhenMissing(t *testing.T) {
 }
 
 func TestSelectorSearchFilterMatchesLiteralWildcardDomain(t *testing.T) {
-	filter := selectorSearchFilter(types.DefaultScheme(), "example.org", true)
+	filter := selectorSearchFilter(types.DefaultScheme(), "example.org")
+	if !strings.Contains(filter, "(DKIMDomain=example.org)") {
+		t.Fatalf("filter does not match the exact signing domain: %s", filter)
+	}
 	if !strings.Contains(filter, "(DKIMDomain=\\2a)") {
 		t.Fatalf("filter does not match literal wildcard: %s", filter)
 	}
