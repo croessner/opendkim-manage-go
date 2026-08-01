@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"reflect"
+	"regexp"
 	"strings"
 	"time"
 
@@ -31,6 +33,19 @@ type Client struct {
 	uri    URI
 	conn   *ldap.Conn
 }
+
+// RequestExecutor exposes the exact LDAP operations needed by immutable
+// generation repositories without exposing the underlying connection.
+type RequestExecutor interface {
+	BaseDN() string
+	SearchRequest(*ldap.SearchRequest) (*ldap.SearchResult, error)
+	AddRequest(*ldap.AddRequest) error
+	ModifyRequest(*ldap.ModifyRequest) (*ldap.ModifyResult, error)
+}
+
+var _ RequestExecutor = (*Client)(nil)
+
+var attributeDescriptionPattern = regexp.MustCompile(`^(?:[A-Za-z][A-Za-z0-9-]*|[0-9]+(?:\.[0-9]+)+)(?:;[A-Za-z0-9-]+)*$`)
 
 func NewClient(cfg *config.Config) (*Client, error) {
 	u, err := ParseLDAPURI(cfg.LDAP.URI)
@@ -73,13 +88,24 @@ func ParseLDAPURI(raw string) (URI, error) {
 		}
 	}
 
+	baseDN := strings.TrimPrefix(u.Path, "/")
+	if _, err := ldap.ParseDN(baseDN); err != nil {
+		return URI{}, fmt.Errorf("invalid ldap uri base dn")
+	}
+
 	return URI{
 		Scheme:             u.Scheme,
 		HostPort:           u.Host,
-		BaseDN:             strings.TrimPrefix(u.Path, "/"),
+		BaseDN:             baseDN,
 		Scope:              scope,
 		CustomSearchFilter: customFilter,
 	}, nil
+}
+
+// BaseDN returns the validated dataset base parsed from the configured LDAP
+// URI so repositories never derive a write base from request input.
+func (c *Client) BaseDN() string {
+	return c.uri.BaseDN
 }
 
 func (c *Client) CustomSearchFilter() string {
@@ -252,6 +278,254 @@ func (c *Client) Search(searchFilter, base string, attrs []string, scope int) ([
 		return nil, fmt.Errorf("ldap search failed: %w", err)
 	}
 	return resp.Entries, nil
+}
+
+// SearchRequest validates and executes one bounded exact-attribute search
+// through the client's existing secure connection and bind policy.
+func (c *Client) SearchRequest(req *ldap.SearchRequest) (*ldap.SearchResult, error) {
+	if err := c.validateSearchRequest(req); err != nil {
+		return nil, err
+	}
+	if err := c.EnsureConnected(); err != nil {
+		return nil, err
+	}
+
+	result, err := c.conn.Search(req)
+	if err != nil {
+		return nil, safeRequestError("search", err)
+	}
+	return result, nil
+}
+
+// AddRequest validates and executes one complete LDAP entry add without
+// formatting its DN or potentially secret-bearing values into errors.
+func (c *Client) AddRequest(req *ldap.AddRequest) error {
+	if err := c.validateAddRequest(req); err != nil {
+		return err
+	}
+	if err := c.EnsureConnected(); err != nil {
+		return err
+	}
+
+	if err := c.conn.Add(req); err != nil {
+		return safeRequestError("add", err)
+	}
+	return nil
+}
+
+// ModifyRequest validates and executes one replacement-only LDAP modify and
+// returns response metadata so callers can reject referrals or ambiguity.
+func (c *Client) ModifyRequest(req *ldap.ModifyRequest) (*ldap.ModifyResult, error) {
+	if err := c.validateModifyRequest(req); err != nil {
+		return nil, err
+	}
+	if err := c.EnsureConnected(); err != nil {
+		return nil, err
+	}
+
+	result, err := c.conn.ModifyWithResult(req)
+	if err != nil {
+		return nil, safeRequestError("modify", err)
+	}
+	return result, nil
+}
+
+// validateSearchRequest enforces bounded exact reads inside the configured
+// dataset before any connection can be established.
+func (c *Client) validateSearchRequest(req *ldap.SearchRequest) error {
+	if req == nil {
+		return errors.New("ldap search request is nil")
+	}
+	if err := c.validateRequestDN(req.BaseDN); err != nil {
+		return fmt.Errorf("ldap search request base: %w", err)
+	}
+	if req.Scope != ldap.ScopeBaseObject && req.Scope != ldap.ScopeSingleLevel && req.Scope != ldap.ScopeWholeSubtree {
+		return errors.New("ldap search request scope is unsupported")
+	}
+	if req.DerefAliases != ldap.NeverDerefAliases {
+		return errors.New("ldap search request must not dereference aliases")
+	}
+	if req.SizeLimit <= 0 || !req.EnforceSizeLimit {
+		return errors.New("ldap search request requires an enforced positive size limit")
+	}
+	if req.TimeLimit <= 0 {
+		return errors.New("ldap search request requires a positive time limit")
+	}
+	if req.TypesOnly {
+		return errors.New("ldap search request must request attribute values")
+	}
+	if strings.TrimSpace(req.Filter) == "" {
+		return errors.New("ldap search request filter is empty")
+	}
+	if _, err := ldap.CompileFilter(req.Filter); err != nil {
+		return errors.New("ldap search request filter is invalid")
+	}
+	if err := validateAttributeDescriptions(req.Attributes); err != nil {
+		return fmt.Errorf("ldap search request attributes: %w", err)
+	}
+	if err := validateControls(req.Controls); err != nil {
+		return fmt.Errorf("ldap search request controls: %w", err)
+	}
+	return nil
+}
+
+// validateAddRequest rejects incomplete or ambiguous entries before any
+// potentially secret-bearing values reach the LDAP connection.
+func (c *Client) validateAddRequest(req *ldap.AddRequest) error {
+	if req == nil {
+		return errors.New("ldap add request is nil")
+	}
+	if err := c.validateRequestDN(req.DN); err != nil {
+		return fmt.Errorf("ldap add request dn: %w", err)
+	}
+	if len(req.Attributes) == 0 {
+		return errors.New("ldap add request requires at least one attribute")
+	}
+
+	seen := make(map[string]struct{}, len(req.Attributes))
+	for _, attribute := range req.Attributes {
+		if err := validateAttributeDescription(attribute.Type); err != nil {
+			return fmt.Errorf("ldap add request attribute: %w", err)
+		}
+		name := strings.ToLower(attribute.Type)
+		if _, ok := seen[name]; ok {
+			return errors.New("ldap add request contains a duplicate attribute")
+		}
+		seen[name] = struct{}{}
+		if err := validateNonemptyValues(attribute.Vals); err != nil {
+			return fmt.Errorf("ldap add request attribute values: %w", err)
+		}
+	}
+	if err := validateControls(req.Controls); err != nil {
+		return fmt.Errorf("ldap add request controls: %w", err)
+	}
+	return nil
+}
+
+// validateModifyRequest limits immutable-generation publication to exact
+// replacement operations inside the configured dataset.
+func (c *Client) validateModifyRequest(req *ldap.ModifyRequest) error {
+	if req == nil {
+		return errors.New("ldap modify request is nil")
+	}
+	if err := c.validateRequestDN(req.DN); err != nil {
+		return fmt.Errorf("ldap modify request dn: %w", err)
+	}
+	if len(req.Changes) == 0 {
+		return errors.New("ldap modify request requires at least one change")
+	}
+
+	seen := make(map[string]struct{}, len(req.Changes))
+	for _, change := range req.Changes {
+		if change.Operation != ldap.ReplaceAttribute {
+			return errors.New("ldap modify request permits replacement changes only")
+		}
+		if err := validateAttributeDescription(change.Modification.Type); err != nil {
+			return fmt.Errorf("ldap modify request attribute: %w", err)
+		}
+		name := strings.ToLower(change.Modification.Type)
+		if _, ok := seen[name]; ok {
+			return errors.New("ldap modify request contains a duplicate attribute")
+		}
+		seen[name] = struct{}{}
+		if err := validateNonemptyValues(change.Modification.Vals); err != nil {
+			return fmt.Errorf("ldap modify request attribute values: %w", err)
+		}
+	}
+	if err := validateControls(req.Controls); err != nil {
+		return fmt.Errorf("ldap modify request controls: %w", err)
+	}
+	return nil
+}
+
+// validateRequestDN requires a syntactically valid target at or below the
+// configured LDAP URI base.
+func (c *Client) validateRequestDN(raw string) error {
+	if strings.TrimSpace(raw) == "" {
+		return errors.New("dn is empty")
+	}
+	target, err := ldap.ParseDN(raw)
+	if err != nil {
+		return errors.New("dn is invalid")
+	}
+	base, err := ldap.ParseDN(c.uri.BaseDN)
+	if err != nil || len(base.RDNs) == 0 {
+		return errors.New("configured base dn is invalid or empty")
+	}
+	if !base.Equal(target) && !base.AncestorOf(target) {
+		return errors.New("dn is outside the configured base")
+	}
+	return nil
+}
+
+// validateAttributeDescriptions requires a unique list of explicit LDAP
+// attribute descriptions and rejects wildcard selectors.
+func validateAttributeDescriptions(attributes []string) error {
+	if len(attributes) == 0 {
+		return errors.New("at least one exact attribute is required")
+	}
+	seen := make(map[string]struct{}, len(attributes))
+	for _, attribute := range attributes {
+		if err := validateAttributeDescription(attribute); err != nil {
+			return err
+		}
+		name := strings.ToLower(attribute)
+		if _, ok := seen[name]; ok {
+			return errors.New("duplicate attribute is not allowed")
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+// validateAttributeDescription accepts named or numeric LDAP attribute
+// descriptions with optional explicit attribute options.
+func validateAttributeDescription(attribute string) error {
+	if !attributeDescriptionPattern.MatchString(attribute) {
+		return errors.New("attribute description is empty, broad, or invalid")
+	}
+	return nil
+}
+
+// validateNonemptyValues prevents incomplete add or replacement operations.
+func validateNonemptyValues(values []string) error {
+	if len(values) == 0 {
+		return errors.New("at least one value is required")
+	}
+	for _, value := range values {
+		if len(value) == 0 {
+			return errors.New("empty values are not allowed")
+		}
+	}
+	return nil
+}
+
+// validateControls rejects controls that would panic or encode without an OID.
+func validateControls(controls []ldap.Control) error {
+	for _, control := range controls {
+		if control == nil {
+			return errors.New("nil control is not allowed")
+		}
+		value := reflect.ValueOf(control)
+		if (value.Kind() == reflect.Pointer || value.Kind() == reflect.Interface) && value.IsNil() {
+			return errors.New("nil control is not allowed")
+		}
+		if strings.TrimSpace(control.GetControlType()) == "" {
+			return errors.New("control type is empty")
+		}
+	}
+	return nil
+}
+
+// safeRequestError preserves an LDAP result code while discarding server
+// diagnostics that could repeat request DNs or secret-bearing values.
+func safeRequestError(operation string, err error) error {
+	var ldapErr *ldap.Error
+	if errors.As(err, &ldapErr) {
+		redacted := ldap.NewError(ldapErr.ResultCode, errors.New("request rejected"))
+		return fmt.Errorf("ldap %s request failed: %w", operation, redacted)
+	}
+	return fmt.Errorf("ldap %s request failed", operation)
 }
 
 func (c *Client) StoreDKIMKey(dn, pemKey string, keyType types.DKIMKeyType, domain, signingTableDomain string, identity *string) error {

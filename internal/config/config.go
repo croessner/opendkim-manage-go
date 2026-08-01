@@ -10,23 +10,34 @@ import (
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 
+	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
 	"github.com/croessner/opendkim-manage-go/internal/types"
 )
 
 const DefaultConfigPath = "/etc/opendkim-manage.yaml"
 
 type GlobalConfig struct {
-	DeleteDelay                int      `mapstructure:"delete_delay" yaml:"delete_delay"`
-	ExpireAfter                int      `mapstructure:"expire_after" yaml:"expire_after"`
-	SelectorFormat             string   `mapstructure:"selectorformat" yaml:"selectorformat"`
-	UseDKIMIdentity            bool     `mapstructure:"use_dkim_identity" yaml:"use_dkim_identity"`
-	TerminalBackground         string   `mapstructure:"terminal_background" yaml:"terminal_background"`
-	KeyType                    string   `mapstructure:"keytype" yaml:"keytype"`
-	MaxRevoked                 int      `mapstructure:"max_revoked" yaml:"max_revoked"`
-	RevokedRetention           int      `mapstructure:"revoked_retention" yaml:"revoked_retention"`
-	CNAMESelectorRSAPrefix     string   `mapstructure:"cname_selector_rsa_prefix" yaml:"cname_selector_rsa_prefix"`
-	CNAMESelectorED25519Prefix string   `mapstructure:"cname_selector_ed25519_prefix" yaml:"cname_selector_ed25519_prefix"`
-	MultipleSignaturesDomains  []string `mapstructure:"multiple_signatures_domains" yaml:"multiple_signatures_domains"`
+	Mode                       types.Mode `mapstructure:"mode" yaml:"mode"`
+	DeleteDelay                int        `mapstructure:"delete_delay" yaml:"delete_delay"`
+	ExpireAfter                int        `mapstructure:"expire_after" yaml:"expire_after"`
+	SelectorFormat             string     `mapstructure:"selectorformat" yaml:"selectorformat"`
+	UseDKIMIdentity            bool       `mapstructure:"use_dkim_identity" yaml:"use_dkim_identity"`
+	TerminalBackground         string     `mapstructure:"terminal_background" yaml:"terminal_background"`
+	KeyType                    string     `mapstructure:"keytype" yaml:"keytype"`
+	MaxRevoked                 int        `mapstructure:"max_revoked" yaml:"max_revoked"`
+	RevokedRetention           int        `mapstructure:"revoked_retention" yaml:"revoked_retention"`
+	CNAMESelectorRSAPrefix     string     `mapstructure:"cname_selector_rsa_prefix" yaml:"cname_selector_rsa_prefix"`
+	CNAMESelectorED25519Prefix string     `mapstructure:"cname_selector_ed25519_prefix" yaml:"cname_selector_ed25519_prefix"`
+	MultipleSignaturesDomains  []string   `mapstructure:"multiple_signatures_domains" yaml:"multiple_signatures_domains"`
+}
+
+// DKIM2Config contains the closed policy inputs needed to construct a native DKIM2 dataset.
+type DKIM2Config struct {
+	TenantID        string `mapstructure:"tenant_id" yaml:"tenant_id"`
+	ProfileUse      string `mapstructure:"profile_use" yaml:"profile_use"`
+	Rollout         string `mapstructure:"rollout" yaml:"rollout"`
+	Compatibility   string `mapstructure:"compatibility" yaml:"compatibility"`
+	FeedbackRouteID string `mapstructure:"feedback_route_id" yaml:"feedback_route_id"`
 }
 
 type LDAPConfig struct {
@@ -61,6 +72,7 @@ type Config struct {
 	Global GlobalConfig `mapstructure:"global" yaml:"global"`
 	LDAP   LDAPConfig   `mapstructure:"ldap" yaml:"ldap"`
 	DNS    DNSConfig    `mapstructure:"dns" yaml:"dns"`
+	DKIM2  DKIM2Config  `mapstructure:"dkim2" yaml:"dkim2"`
 
 	ResolvedPath string            `mapstructure:"-" yaml:"-"`
 	Scheme       types.Scheme      `mapstructure:"-" yaml:"-"`
@@ -70,6 +82,7 @@ type Config struct {
 func defaultConfig() Config {
 	return Config{
 		Global: GlobalConfig{
+			Mode:                       types.ModeOpenDKIM,
 			DeleteDelay:                10,
 			ExpireAfter:                365,
 			UseDKIMIdentity:            false,
@@ -128,6 +141,9 @@ func strictDecode(path string, out *Config) error {
 	if err != nil {
 		return fmt.Errorf("read config file: %w", err)
 	}
+	if err := validateExplicitMode(b); err != nil {
+		return err
+	}
 	dec := yaml.NewDecoder(strings.NewReader(string(b)))
 	dec.KnownFields(true)
 	if err := dec.Decode(out); err != nil {
@@ -136,7 +152,50 @@ func strictDecode(path string, out *Config) error {
 	return nil
 }
 
+// validateExplicitMode distinguishes an omitted default from an explicit YAML
+// null or empty value before Viper merges the document into initialized defaults.
+func validateExplicitMode(document []byte) error {
+	var root yaml.Node
+	if err := yaml.Unmarshal(document, &root); err != nil {
+		return fmt.Errorf("invalid config schema: %w", err)
+	}
+	if len(root.Content) != 1 || root.Content[0].Kind != yaml.MappingNode {
+		return errors.New("invalid config schema: document must be a mapping")
+	}
+	global := yamlMappingValue(root.Content[0], "global")
+	if global == nil {
+		return nil
+	}
+	if global.Kind != yaml.MappingNode {
+		return errors.New("invalid config schema: global must be a mapping")
+	}
+	mode := yamlMappingValue(global, "mode")
+	if mode == nil {
+		return nil
+	}
+	if mode.Kind != yaml.ScalarNode || mode.Tag != "!!str" || mode.Value == "" {
+		return errors.New("global.mode must be an explicit non-empty string when present")
+	}
+	return nil
+}
+
+// yamlMappingValue returns one exact mapping value or nil when the key is absent.
+func yamlMappingValue(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for index := 0; index+1 < len(mapping.Content); index += 2 {
+		if mapping.Content[index].Value == key {
+			return mapping.Content[index+1]
+		}
+	}
+	return nil
+}
+
 func (c *Config) Validate() error {
+	if err := c.ValidateForMode(c.Global.Mode); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.LDAP.URI) == "" {
 		return errors.New("ldap.uri is required")
 	}
@@ -247,6 +306,68 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+// ValidateForMode validates the selected mode before its implementation is constructed.
+func (c *Config) ValidateForMode(mode types.Mode) error {
+	if c == nil {
+		return errors.New("config is required")
+	}
+	if _, err := types.ParseMode(string(mode)); err != nil {
+		return fmt.Errorf("global.mode: %w", err)
+	}
+	if mode == types.ModeDKIM2 || c.DKIM2.configured() {
+		if err := c.DKIM2.validate(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// configured reports whether any DKIM2-only field was supplied.
+func (c DKIM2Config) configured() bool {
+	return c.TenantID != "" || c.ProfileUse != "" || c.Rollout != "" || c.Compatibility != "" || c.FeedbackRouteID != ""
+}
+
+// validate enforces the complete closed DKIM2 policy contract.
+func (c DKIM2Config) validate() error {
+	if !canonicalIdentifier(c.TenantID) {
+		return errors.New("dkim2.tenant_id must be a lowercase ASCII identifier of at most 128 bytes")
+	}
+	use, err := dkim2model.ParseProfileUse(c.ProfileUse)
+	if err != nil || !use.SupportsNativeKeyCustody() {
+		return errors.New("dkim2.profile_use must be originator or ordinary_transit for native key custody")
+	}
+	switch c.Rollout {
+	case "enforce", "observe", "off":
+	default:
+		return errors.New("dkim2.rollout must be enforce, observe, or off")
+	}
+	if c.Compatibility != "strict" {
+		return errors.New("dkim2.compatibility must be strict")
+	}
+	if c.FeedbackRouteID != "" && !canonicalIdentifier(c.FeedbackRouteID) {
+		return errors.New("dkim2.feedback_route_id must be empty or a lowercase ASCII identifier of at most 128 bytes")
+	}
+	return nil
+}
+
+// canonicalIdentifier validates the bounded DKIM2 identifier grammar.
+func canonicalIdentifier(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for index := range len(value) {
+		character := value[index]
+		if character >= 'a' && character <= 'z' || character >= '0' && character <= '9' {
+			continue
+		}
+		if index > 0 && (character == '.' || character == '_' || character == '-') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (c *Config) DNSAlgorithmFQDN() string {

@@ -2,6 +2,31 @@ package types
 
 import "fmt"
 
+// Mode selects one structurally isolated application implementation.
+type Mode string
+
+const (
+	ModeOpenDKIM Mode = "opendkim"
+	ModeDKIM2    Mode = "dkim2"
+)
+
+// ParseMode accepts only the exact public mode names.
+func ParseMode(value string) (Mode, error) {
+	mode := Mode(value)
+	switch mode {
+	case ModeOpenDKIM, ModeDKIM2:
+		return mode, nil
+	default:
+		return "", fmt.Errorf("unsupported mode %q", value)
+	}
+}
+
+// Valid reports whether the mode names a supported implementation.
+func (m Mode) Valid() bool {
+	_, err := ParseMode(string(m))
+	return err == nil
+}
+
 type DKIMKeyType int
 
 const (

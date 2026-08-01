@@ -46,19 +46,19 @@ func run(args []string, stdout io.Writer, stderr io.Writer) int {
 		return 70
 	}
 
-	manager, err := app.NewManager(cfg, opts)
+	application, err := app.NewApplication(cfg, opts)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
 
 		return 70
 	}
 	defer func() {
-		if err := manager.Close(); err != nil {
-			_, _ = fmt.Fprintf(stderr, "Error closing LDAP connections: %v\n", err)
+		if err := application.Close(); err != nil {
+			_, _ = fmt.Fprintf(stderr, "Error closing application resources: %v\n", err)
 		}
 	}()
 
-	result, err := manager.Run()
+	result, err := application.Run()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "Error: %v\n", err)
 

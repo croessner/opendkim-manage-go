@@ -1,6 +1,10 @@
 package cli
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/croessner/opendkim-manage-go/internal/types"
+)
 
 func TestParseDryRunAndYes(t *testing.T) {
 	opts, err := Parse([]string{"--create", "--domain", "example.org", "--dry-run", "--yes"})
@@ -40,5 +44,32 @@ func TestParseRejectsAgeWithoutValue(t *testing.T) {
 func TestParseRejectsTestKeyWithoutScope(t *testing.T) {
 	if _, err := Parse([]string{"--testkey"}); err == nil {
 		t.Fatal("expected --testkey without domain or selector to fail")
+	}
+}
+
+func TestParseModeOverrideIsExactAndOptional(t *testing.T) {
+	opts, err := Parse([]string{"--list"})
+	if err != nil {
+		t.Fatalf("parse default: %v", err)
+	}
+	if opts.ModeSet {
+		t.Fatal("mode unexpectedly marked as explicitly set")
+	}
+	if got := opts.EffectiveMode(types.ModeOpenDKIM); got != types.ModeOpenDKIM {
+		t.Fatalf("effective default mode = %q", got)
+	}
+
+	opts, err = Parse([]string{"--list", "--mode", "dkim2"})
+	if err != nil {
+		t.Fatalf("parse DKIM2 override: %v", err)
+	}
+	if !opts.ModeSet || opts.Mode != types.ModeDKIM2 {
+		t.Fatalf("mode override not retained: set=%t mode=%q", opts.ModeSet, opts.Mode)
+	}
+
+	for _, value := range []string{"", "DKIM2", " dkim2", "future"} {
+		if _, err := Parse([]string{"--list", "--mode=" + value}); err == nil {
+			t.Fatalf("expected exact mode value %q to fail", value)
+		}
 	}
 }

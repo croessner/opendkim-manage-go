@@ -3,7 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/croessner/opendkim-manage-go/internal/types"
 )
 
 func writeTemp(t *testing.T, content string) string {
@@ -125,5 +128,122 @@ ldap:
 `)
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected strict schema error")
+	}
+}
+
+func TestLoadDefaultsToOpenDKIMMode(t *testing.T) {
+	path := writeTemp(t, `
+ldap:
+  uri: "ldaps://ldap.example.org/ou=dkim,dc=example"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Global.Mode != types.ModeOpenDKIM {
+		t.Fatalf("mode = %q, want %q", cfg.Global.Mode, types.ModeOpenDKIM)
+	}
+}
+
+func TestLoadDKIM2ModeAndTypedConfiguration(t *testing.T) {
+	path := writeTemp(t, `
+global:
+  mode: dkim2
+ldap:
+  uri: "ldaps://ldap.example.org/ou=dkim,dc=example"
+dkim2:
+  tenant_id: tenant-example
+  profile_use: ordinary_transit
+  rollout: observe
+  compatibility: strict
+  feedback_route_id: feedback-primary
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Global.Mode != types.ModeDKIM2 {
+		t.Fatalf("mode = %q, want %q", cfg.Global.Mode, types.ModeDKIM2)
+	}
+	if cfg.DKIM2.ProfileUse != "ordinary_transit" || cfg.DKIM2.FeedbackRouteID != "feedback-primary" {
+		t.Fatalf("unexpected DKIM2 config: %#v", cfg.DKIM2)
+	}
+}
+
+func TestValidateRejectsUnknownAndEmptyExplicitModes(t *testing.T) {
+	for _, mode := range []types.Mode{"", "DKIM2", " dkim2", "future"} {
+		cfg := defaultConfig()
+		cfg.LDAP.URI = "ldaps://ldap.example.org/ou=dkim,dc=example"
+		cfg.Global.Mode = mode
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("expected mode %q to be rejected", mode)
+		}
+	}
+}
+
+func TestLoadRejectsExplicitEmptyModes(t *testing.T) {
+	for _, value := range []string{`""`, `null`} {
+		t.Run(value, func(t *testing.T) {
+			path := writeTemp(t, `
+global:
+  mode: `+value+`
+ldap:
+  uri: "ldaps://ldap.example.org/ou=dkim,dc=example"
+`)
+			if _, err := Load(path); err == nil {
+				t.Fatalf("expected explicit mode %s to be rejected", value)
+			}
+		})
+	}
+}
+
+func TestValidateDKIM2RequiresClosedConfiguration(t *testing.T) {
+	valid := defaultConfig()
+	valid.Global.Mode = types.ModeDKIM2
+	valid.LDAP.URI = "ldaps://ldap.example.org/ou=dkim,dc=example"
+	valid.DKIM2 = DKIM2Config{
+		TenantID:      "tenant-example",
+		ProfileUse:    "originator",
+		Rollout:       "enforce",
+		Compatibility: "strict",
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid DKIM2 config rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*DKIM2Config)
+	}{
+		{name: "tenant missing", mutate: func(c *DKIM2Config) { c.TenantID = "" }},
+		{name: "tenant uppercase", mutate: func(c *DKIM2Config) { c.TenantID = "Tenant" }},
+		{name: "tenant leading punctuation", mutate: func(c *DKIM2Config) { c.TenantID = "-tenant" }},
+		{name: "tenant oversized", mutate: func(c *DKIM2Config) { c.TenantID = strings.Repeat("a", 129) }},
+		{name: "profile use", mutate: func(c *DKIM2Config) { c.ProfileUse = "transit" }},
+		{name: "unsupported native key use", mutate: func(c *DKIM2Config) { c.ProfileUse = "next_domain_transit" }},
+		{name: "rollout", mutate: func(c *DKIM2Config) { c.Rollout = "enabled" }},
+		{name: "compatibility", mutate: func(c *DKIM2Config) { c.Compatibility = "legacy" }},
+		{name: "feedback route", mutate: func(c *DKIM2Config) { c.FeedbackRouteID = "bad route" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			cfg.DKIM2 = valid.DKIM2
+			tt.mutate(&cfg.DKIM2)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("expected invalid DKIM2 config to be rejected")
+			}
+		})
+	}
+}
+
+func TestValidateForModeChecksCLIOverrideRequirements(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.LDAP.URI = "ldaps://ldap.example.org/ou=dkim,dc=example"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("legacy config rejected: %v", err)
+	}
+	if err := cfg.ValidateForMode(types.ModeDKIM2); err == nil {
+		t.Fatal("expected DKIM2 override without DKIM2 config to fail")
 	}
 }

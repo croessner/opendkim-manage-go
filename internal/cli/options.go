@@ -11,6 +11,8 @@ import (
 )
 
 type Options struct {
+	Mode            types.Mode
+	ModeSet         bool
 	List            bool
 	Create          bool
 	Delete          bool
@@ -48,7 +50,9 @@ type Options struct {
 func Parse(args []string) (*Options, error) {
 	o := &Options{}
 	fs := pflag.NewFlagSet("opendkim-manage", pflag.ContinueOnError)
+	var mode string
 
+	fs.StringVar(&mode, "mode", "", "Application mode: opendkim or dkim2")
 	fs.BoolVarP(&o.List, "list", "l", false, "List DKIM keys")
 	fs.BoolVarP(&o.Create, "create", "c", false, "Create a new DKIM key")
 	fs.BoolVarP(&o.Delete, "delete", "d", false, "Delete one or many DKIM keys")
@@ -102,11 +106,27 @@ func Parse(args []string) (*Options, error) {
 		o.DeleteDelay = &del
 	}
 	o.MaxRevokedSet = fs.Lookup("max-revoked").Changed
+	o.ModeSet = fs.Lookup("mode").Changed
+	if o.ModeSet {
+		parsedMode, err := types.ParseMode(mode)
+		if err != nil {
+			return nil, fmt.Errorf("invalid --mode: %w", err)
+		}
+		o.Mode = parsedMode
+	}
 
 	if err := o.Validate(); err != nil {
 		return nil, err
 	}
 	return o, nil
+}
+
+// EffectiveMode applies an exact command-line override to the configured mode.
+func (o *Options) EffectiveMode(configured types.Mode) types.Mode {
+	if o != nil && o.ModeSet {
+		return o.Mode
+	}
+	return configured
 }
 
 func (o *Options) Validate() error {

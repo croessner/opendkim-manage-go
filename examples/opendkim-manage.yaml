@@ -1,4 +1,8 @@
 global:
+  # opendkim|dkim2; omitting this value defaults to opendkim.
+  # --mode provides an exact per-invocation override.
+  mode: opendkim
+
   # Number of days that old keys stay protected before revoke/delete handling
   delete_delay: 10
 
@@ -33,8 +37,30 @@ global:
   multiple_signatures_domains:
     - "example.org"
 
+# Required when global.mode is dkim2 or --mode dkim2 is used. DKIM2 manages
+# complete immutable dkim2-datasource-v2 generations and does not convert
+# legacy OpenDKIM selector objects.
+dkim2:
+  # Lowercase ASCII identifier: [a-z0-9][a-z0-9._-]*, at most 128 bytes.
+  tenant_id: tenant-example
+
+  # originator|ordinary_transit; the bound native signing bridge does not
+  # project private keys for next_domain_transit.
+  profile_use: originator
+
+  # enforce|observe|off
+  rollout: enforce
+
+  # Only strict is supported.
+  compatibility: strict
+
+  # Optional lowercase ASCII identifier using the same bounded grammar.
+  feedback_route_id: ""
+
 ldap:
   # LDAP URL format: ldap://host:port/base??scope?filter
+  # In dkim2 mode, the URL base DN is the immutable dataset base. Install the
+  # dkim2-datasource-v2 schema before use; request input never selects a base.
   uri: "ldap://localhost:389/ou=dkim,o=company??sub?(&(objectClass=domain)(associatedDomain={0}))"
 
   # LDAP attribute carrying the DKIM domain
@@ -63,6 +89,7 @@ dns:
   primary_nameserver: "127.0.0.1"
 
   # TSIG is mandatory for --update-dns; name and file are a required pair.
+  # A missing, unsigned, or non-success response makes the update fail.
   tsig_key_file: "/etc/opendkim-manage/Kexample.+165+50659.private"
   tsig_key_name: "example"
   algorithm: "hmac_sha512"
