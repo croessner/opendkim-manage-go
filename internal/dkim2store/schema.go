@@ -1,6 +1,7 @@
 package dkim2store
 
 const (
+	legacySchemaVersion      = "dkim2-datasource-v1"
 	attributeObjectClass     = "objectClass"
 	attributeCN              = "cn"
 	attributeOU              = "ou"

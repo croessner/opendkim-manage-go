@@ -84,6 +84,7 @@ func TestLDAPRepositoryReadHistoryAcceptsMateriallessBootstrapOnly(t *testing.T)
 	}
 
 	legacyMaterialBase := removeHistoricalUnit(t, executor, "key-material", repository.generationRoot(1))
+	setEntryAttribute(executor.entries[dnKey(repository.generationRoot(1))], attributeSchemaVersion, []string{legacySchemaVersion})
 	executor.mutateSearch = func(request *ldap.SearchRequest, _ *ldap.SearchResult) error {
 		if sameDN(request.BaseDN, legacyMaterialBase) {
 			return ldap.NewError(ldap.LDAPResultNoSuchObject, errors.New("absent legacy container"))
@@ -106,6 +107,33 @@ func TestLDAPRepositoryReadHistoryAcceptsMateriallessBootstrapOnly(t *testing.T)
 	removeHistoricalUnit(t, executor, "key-material", repository.generationRoot(2))
 	if _, err := repository.LoadRetainedHistory(context.Background(), 8); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("materialless successor error = %v", err)
+	}
+}
+
+func TestLDAPRepositoryReadHistoryRejectsLegacySchemaOutsideMateriallessBootstrap(t *testing.T) {
+	for _, mode := range []string{"material", "successor"} {
+		t.Run(mode, func(t *testing.T) {
+			executor := newFakeExecutor(testBaseDN)
+			repository := mustRepository(t, executor)
+			first := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+			defer func() { _ = first.Close() }()
+			if err := repository.Publish(context.Background(), 0, first); err != nil {
+				t.Fatal(err)
+			}
+			target := repository.generationRoot(1)
+			if mode == "successor" {
+				second := readSuccessorGeneration(t, first, 2)
+				defer func() { _ = second.Close() }()
+				if err := repository.Publish(context.Background(), 1, second); err != nil {
+					t.Fatal(err)
+				}
+				target = repository.generationRoot(2)
+			}
+			setEntryAttribute(executor.entries[dnKey(target)], attributeSchemaVersion, []string{legacySchemaVersion})
+			if _, err := repository.LoadRetainedHistory(context.Background(), 8); !errors.Is(err, ErrMalformed) {
+				t.Fatalf("legacy %s history error = %v", mode, err)
+			}
+		})
 	}
 }
 
@@ -211,6 +239,48 @@ func TestLDAPRepositoryReadHistoryRejectsUnusedProfileAndPolicy(t *testing.T) {
 				t.Fatalf("unused relationship error = %v", err)
 			}
 		})
+	}
+}
+
+func TestLDAPRepositoryReadHistoryReportsOnlyFixedMalformedStage(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	repository := mustRepository(t, executor)
+	first := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+	defer func() { _ = first.Close() }()
+	if err := repository.Publish(context.Background(), 0, first); err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range executor.entries {
+		if hasObjectClass(entry, classCredential) {
+			setEntryAttribute(entry, attributeHandleID, []string{"sensitive-marker"})
+			break
+		}
+	}
+	_, err := repository.LoadRetainedHistory(context.Background(), 8)
+	if !errors.Is(err, ErrMalformed) || !strings.Contains(err.Error(), "native-relationships is malformed") ||
+		strings.Contains(err.Error(), "sensitive-marker") || strings.Contains(err.Error(), testBaseDN) {
+		t.Fatalf("safe malformed history error = %q", err)
+	}
+}
+
+func TestLDAPRepositoryReadHistoryReportsOnlyFixedUnavailableStage(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	repository := mustRepository(t, executor)
+	first := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+	defer func() { _ = first.Close() }()
+	if err := repository.Publish(context.Background(), 0, first); err != nil {
+		t.Fatal(err)
+	}
+	executor.mutateSearch = func(request *ldap.SearchRequest, _ *ldap.SearchResult) error {
+		if strings.HasPrefix(strings.ToLower(request.BaseDN), "ou=handles,") {
+			return errors.New("sensitive-backend-marker")
+		}
+		return nil
+	}
+	_, err := repository.LoadRetainedHistory(context.Background(), 8)
+	if !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), "handles is unavailable") ||
+		strings.Contains(err.Error(), "sensitive-backend-marker") || strings.Contains(err.Error(), testBaseDN) {
+		t.Fatalf("safe unavailable history error = %q", err)
 	}
 }
 

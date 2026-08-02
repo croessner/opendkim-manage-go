@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"slices"
 	"strconv"
@@ -150,8 +151,18 @@ func (r *LDAPRepository) LoadCurrentActivation(ctx context.Context) (CurrentActi
 }
 
 func (r *LDAPRepository) loadOperationalTimestamp(ctx context.Context, dn, attribute string) (time.Time, error) {
+	return r.loadOperationalTimestampWithSchema(ctx, dn, attribute, dkim2model.SchemaVersion)
+}
+
+// loadOperationalTimestampWithSchema binds the timestamp read to one already validated root schema.
+func (r *LDAPRepository) loadOperationalTimestampWithSchema(
+	ctx context.Context,
+	dn string,
+	attribute string,
+	schemaVersion string,
+) (time.Time, error) {
 	result, err := r.search(ctx, boundedSearch(
-		dn, ldap.ScopeBaseObject, 2, metadataAssertionFilter(""), []string{attribute},
+		dn, ldap.ScopeBaseObject, 2, metadataAssertionFilterWithSchema("", schemaVersion), []string{attribute},
 	))
 	if err != nil || !exactSearchResult(result, 1) {
 		if contextErr := validContext(ctx); contextErr != nil {
@@ -167,8 +178,13 @@ func (r *LDAPRepository) loadOperationalTimestamp(ctx context.Context, dn, attri
 }
 
 func metadataAssertionFilter(state string) string {
+	return metadataAssertionFilterWithSchema(state, dkim2model.SchemaVersion)
+}
+
+// metadataAssertionFilterWithSchema constructs an exact dataset-state filter for one bound schema version.
+func metadataAssertionFilterWithSchema(state, schemaVersion string) string {
 	filter := "(&(" + attributeObjectClass + "=" + ldap.EscapeFilter(classDataset) + ")(" +
-		attributeSchemaVersion + "=" + ldap.EscapeFilter(dkim2model.SchemaVersion) + ")"
+		attributeSchemaVersion + "=" + ldap.EscapeFilter(schemaVersion) + ")"
 	if state != "" {
 		filter += "(" + attributeDatasetState + "=" + ldap.EscapeFilter(state) + ")"
 	}
@@ -231,7 +247,7 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 		if contextErr := validContext(ctx); contextErr != nil {
 			return RetainedHistory{}, contextErr
 		}
-		return RetainedHistory{}, ErrUnavailable
+		return RetainedHistory{}, fmt.Errorf("DKIM2 retained history root index is unavailable: %w", ErrUnavailable)
 	}
 	if len(result.Entries) >= limit {
 		return NewRetainedHistory(nil, false, nil, nil), nil
@@ -244,32 +260,42 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 			return RetainedHistory{}, err
 		}
 		if err := budget.consume(0, 0, 1); err != nil {
-			return RetainedHistory{}, err
+			return RetainedHistory{}, fmt.Errorf("DKIM2 retained history work budget is unavailable: %w", ErrUnavailable)
 		}
 		values, entryErr := exactEntry(entry, entry.DN, classDataset,
 			[]string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState}, nil)
 		if entryErr != nil {
-			return RetainedHistory{}, ErrMalformed
-		}
-		if string(values[attributeSchemaVersion][0]) != dkim2model.SchemaVersion {
-			return RetainedHistory{}, ErrMalformed
+			return RetainedHistory{}, fmt.Errorf("DKIM2 retained history roots are malformed: %w", ErrMalformed)
 		}
 		generation, parseErr := parseGeneration(values[attributeGeneration][0])
 		state, stateErr := dkim2model.ParseDatasetState(string(values[attributeDatasetState][0]))
 		if parseErr != nil || stateErr != nil || !sameDN(entry.DN, r.generationRoot(generation)) ||
 			string(values[attributeCN][0]) != "generation-"+strconv.FormatUint(generation, 10) {
-			return RetainedHistory{}, ErrMalformed
+			return RetainedHistory{}, fmt.Errorf("DKIM2 retained history root identity is malformed: %w", ErrMalformed)
+		}
+		schemaVersion := string(values[attributeSchemaVersion][0])
+		legacyBootstrap := generation == 1 && schemaVersion == legacySchemaVersion
+		if schemaVersion != dkim2model.SchemaVersion && !legacyBootstrap {
+			return RetainedHistory{}, fmt.Errorf("DKIM2 retained history schema is malformed: %w", ErrMalformed)
 		}
 		if _, duplicate := seen[generation]; duplicate {
-			return RetainedHistory{}, ErrMalformed
+			return RetainedHistory{}, fmt.Errorf("DKIM2 retained history roots are malformed: %w", ErrMalformed)
 		}
 		seen[generation] = struct{}{}
-		created, createdErr := r.loadOperationalTimestamp(ctx, r.generationRoot(generation), attributeCreateTimestamp)
+		created, createdErr := r.loadOperationalTimestampWithSchema(
+			ctx, r.generationRoot(generation), attributeCreateTimestamp, schemaVersion,
+		)
 		if createdErr != nil {
+			if errors.Is(createdErr, ErrMalformed) {
+				return RetainedHistory{}, fmt.Errorf("DKIM2 retained history creation time is malformed: %w", ErrMalformed)
+			}
+			if errors.Is(createdErr, ErrUnavailable) {
+				return RetainedHistory{}, fmt.Errorf("DKIM2 retained history creation time is unavailable: %w", ErrUnavailable)
+			}
 			return RetainedHistory{}, createdErr
 		}
 		history.Roots = append(history.Roots, GenerationRoot{Number: generation, State: state})
-		if err := r.loadHistoricalLineages(ctx, &history, generation, created); err != nil {
+		if err := r.loadHistoricalLineages(ctx, &history, generation, created, legacyBootstrap); err != nil {
 			if errors.Is(err, errHistoryIncomplete) {
 				return NewRetainedHistory(nil, false, nil, nil), nil
 			}
@@ -287,7 +313,7 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 		}
 	})
 	if len(history.Roots) != 0 && !contiguousGenerationRoots(history.Roots) {
-		return RetainedHistory{}, ErrMalformed
+		return RetainedHistory{}, fmt.Errorf("DKIM2 retained history roots are noncontiguous: %w", ErrMalformed)
 	}
 	if err := validContext(ctx); err != nil {
 		return RetainedHistory{}, err
@@ -603,7 +629,22 @@ type historicalMaterial struct {
 }
 
 // loadHistoricalLineages validates one complete public generation projection without private keys.
-func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *RetainedHistory, generation uint64, created time.Time) error {
+func (r *LDAPRepository) loadHistoricalLineages(
+	ctx context.Context,
+	history *RetainedHistory,
+	generation uint64,
+	created time.Time,
+	legacyBootstrap bool,
+) (err error) {
+	stage := "structure"
+	defer func() {
+		switch {
+		case errors.Is(err, ErrMalformed):
+			err = fmt.Errorf("DKIM2 retained history %s is malformed: %w", stage, ErrMalformed)
+		case errors.Is(err, ErrUnavailable):
+			err = fmt.Errorf("DKIM2 retained history %s is unavailable: %w", stage, ErrUnavailable)
+		}
+	}()
 	root := r.generationRoot(generation)
 	load := func(unit string, attributes []string, allowAbsent bool) ([]*ldap.Entry, error) {
 		base := "ou=" + ldap.EscapeDN(unit) + "," + root
@@ -633,6 +674,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		return result.Entries, nil
 	}
 
+	stage = "handles"
 	handles := make(map[string]struct{})
 	handleEntries, err := load("handles",
 		[]string{attributeObjectClass, attributeCN, attributeGeneration, attributeHandleID}, false)
@@ -656,6 +698,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		handles[handle] = struct{}{}
 	}
 
+	stage = "profiles"
 	profiles := make(map[string]historicalProfile)
 	profileEntries, err := load("profiles", []string{
 		attributeObjectClass, attributeCN, attributeGeneration, attributeProfileID, attributeSigningDomain,
@@ -680,6 +723,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		profiles[profile.id] = profile
 	}
 
+	stage = "policies"
 	policies := make(map[string]historicalPolicy)
 	policyEntries, err := load("policies", []string{
 		attributeObjectClass, attributeCN, attributeGeneration, attributeTenantID,
@@ -712,6 +756,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		policies[key] = policy
 	}
 
+	stage = "credentials"
 	credentials := make(map[string]historicalCredential)
 	credentialEntries, err := load("credentials", []string{
 		attributeObjectClass, attributeCN, attributeGeneration, attributeProfileID, attributeAlgorithm,
@@ -762,6 +807,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		credentials[credential.handle] = credential
 	}
 
+	stage = "key-material"
 	materials := make(map[string]historicalMaterial)
 	bindingAlgorithms := make(map[string]struct{})
 	materialEntries, err := load("key-material", []string{
@@ -801,6 +847,10 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		materials[material.handle] = material
 	}
 
+	stage = "cardinality"
+	if legacyBootstrap && len(materials) != 0 {
+		return ErrMalformed
+	}
 	if len(handles) == 0 || len(handles) != len(credentials) || len(materials) != 0 && len(handles) != len(materials) {
 		return ErrMalformed
 	}
@@ -818,6 +868,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		return nil
 	}
 	if len(materials) == 0 {
+		stage = "bootstrap-relationships"
 		if generation != 1 {
 			return ErrMalformed
 		}
@@ -849,6 +900,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		}
 		return nil
 	}
+	stage = "native-relationships"
 	for handle := range handles {
 		credential, credentialFound := credentials[handle]
 		material, materialFound := materials[handle]

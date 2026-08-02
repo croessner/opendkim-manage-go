@@ -24,7 +24,10 @@ func (m *DKIM2Manager) autoRotate(ctx context.Context, result *RunResult) error 
 	}
 	defer func() { _ = current.Close() }()
 	history, err := m.rotationRepository.LoadRetainedHistory(ctx, m.cfg.DKIM2.HistoryLimit)
-	if err != nil || !history.Complete {
+	if err != nil {
+		return fmt.Errorf("DKIM2 automatic rotation cannot validate retained history: %w", err)
+	}
+	if !history.Complete {
 		return errors.New("DKIM2 automatic rotation requires complete retained history")
 	}
 	pendingNumber, err := exactPendingSuccessor(history, current.Number())

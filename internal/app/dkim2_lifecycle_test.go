@@ -84,6 +84,19 @@ func TestDKIM2AutoResumesExactPendingCandidateBeforeEligibilityOrRandomness(t *t
 	}
 }
 
+func TestDKIM2AutoPreservesRetainedHistoryFailureClass(t *testing.T) {
+	current := rotationGeneration(t, []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256})
+	manager, repository, _ := newRotationHarness(t, current, &cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
+	defer repository.close()
+	manager.cfg.DKIM2.RotationEnabled = true
+	repository.fail["load-history"] = dkim2store.ErrMalformed
+
+	_, err := manager.Run()
+	if !errors.Is(err, dkim2store.ErrMalformed) {
+		t.Fatalf("automatic history error = %v", err)
+	}
+}
+
 func TestDKIM2AutoSelectsAtMostOneDueBindingDeterministicallyAndNeverRetires(t *testing.T) {
 	current := rotationGenerationBindings(t, []rotationBindingSpec{
 		{domain: "other.example", suffix: "other", algorithms: []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256}},
