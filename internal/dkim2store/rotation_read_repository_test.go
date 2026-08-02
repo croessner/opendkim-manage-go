@@ -69,6 +69,57 @@ func TestLDAPRepositoryReadHistoryAcceptsProvenEmptyContainer(t *testing.T) {
 	}
 }
 
+func TestLDAPRepositoryReadHistoryAcceptsMateriallessBootstrapOnly(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	repository := mustRepository(t, executor)
+	first := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+	defer func() { _ = first.Close() }()
+	if err := repository.Publish(context.Background(), 0, first); err != nil {
+		t.Fatal(err)
+	}
+	second := readSuccessorGeneration(t, first, 2)
+	defer func() { _ = second.Close() }()
+	if err := repository.Publish(context.Background(), 1, second); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyMaterialBase := removeHistoricalUnit(t, executor, "key-material", repository.generationRoot(1))
+	executor.mutateSearch = func(request *ldap.SearchRequest, _ *ldap.SearchResult) error {
+		if sameDN(request.BaseDN, legacyMaterialBase) {
+			return ldap.NewError(ldap.LDAPResultNoSuchObject, errors.New("absent legacy container"))
+		}
+		return nil
+	}
+	history, err := repository.LoadRetainedHistory(context.Background(), 8)
+	if err != nil || !history.Complete || len(history.Roots) != 2 {
+		t.Fatalf("materialless bootstrap history = %v, %v", history, err)
+	}
+	credential := first.Credentials()[0]
+	if used, usedErr := history.SelectorUsed(credential.Selector()); usedErr != nil || !used {
+		t.Fatalf("bootstrap selector history = %v, %v", used, usedErr)
+	}
+	if used, usedErr := history.HandleUsed(credential.HandleID()); usedErr != nil || !used {
+		t.Fatalf("bootstrap handle history = %v, %v", used, usedErr)
+	}
+
+	executor.mutateSearch = nil
+	removeHistoricalUnit(t, executor, "key-material", repository.generationRoot(2))
+	if _, err := repository.LoadRetainedHistory(context.Background(), 8); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("materialless successor error = %v", err)
+	}
+}
+
+func removeHistoricalUnit(t *testing.T, executor *fakeExecutor, unit, root string) string {
+	t.Helper()
+	base := "ou=" + unit + "," + root
+	for key, entry := range executor.entries {
+		if isAtOrBelow(entry.DN, base) {
+			delete(executor.entries, key)
+		}
+	}
+	return base
+}
+
 func TestLDAPRepositoryReadHistoryAllowsIdenticalLineageAndRejectsConflictingReuse(t *testing.T) {
 	executor := newFakeExecutor(testBaseDN)
 	repository := mustRepository(t, executor)

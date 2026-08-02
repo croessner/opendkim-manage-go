@@ -28,6 +28,11 @@ accepted.
 - Incomplete history, ambiguous bindings, unexpected higher roots, arithmetic
   exhaustion, algorithm-set changes, uncertain LDAP results, and DNS conflicts
   fail closed before the next write.
+- A retained generation 1 from the pre-custody bootstrap may omit only its
+  `key-material` container. Its handles, credentials, profiles, and policies
+  must still prove one complete unambiguous public lineage per binding;
+  generation 2 and every later root require full native key-material parity.
+  This compatibility rule is read-only and never mutates retained history.
 - `cn=current` moves only forward under a critical exact-current assertion.
   A staging root becomes committed only under a critical exact-staging
   assertion. Committed generation contents are never edited.

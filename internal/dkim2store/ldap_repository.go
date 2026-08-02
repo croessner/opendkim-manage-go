@@ -605,10 +605,13 @@ type historicalMaterial struct {
 // loadHistoricalLineages validates one complete public generation projection without private keys.
 func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *RetainedHistory, generation uint64, created time.Time) error {
 	root := r.generationRoot(generation)
-	load := func(unit string, attributes []string) ([]*ldap.Entry, error) {
+	load := func(unit string, attributes []string, allowAbsent bool) ([]*ldap.Entry, error) {
 		base := "ou=" + ldap.EscapeDN(unit) + "," + root
 		result, err := r.search(ctx, boundedSearch(base, ldap.ScopeSingleLevel, maximumSearchEntries,
 			"("+attributeObjectClass+"=*)", attributes))
+		if allowAbsent && ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
+			return nil, nil
+		}
 		if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) ||
 			err == nil && result != nil && len(result.Referrals) == 0 && len(result.Entries) >= maximumSearchEntries {
 			return nil, errHistoryIncomplete
@@ -632,7 +635,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 
 	handles := make(map[string]struct{})
 	handleEntries, err := load("handles",
-		[]string{attributeObjectClass, attributeCN, attributeGeneration, attributeHandleID})
+		[]string{attributeObjectClass, attributeCN, attributeGeneration, attributeHandleID}, false)
 	if err != nil {
 		return err
 	}
@@ -656,7 +659,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 	profiles := make(map[string]historicalProfile)
 	profileEntries, err := load("profiles", []string{
 		attributeObjectClass, attributeCN, attributeGeneration, attributeProfileID, attributeSigningDomain,
-	})
+	}, false)
 	if err != nil {
 		return err
 	}
@@ -681,7 +684,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 	policyEntries, err := load("policies", []string{
 		attributeObjectClass, attributeCN, attributeGeneration, attributeTenantID,
 		attributeSigningDomain, attributeProfileUse, attributeProfileID,
-	})
+	}, false)
 	if err != nil {
 		return err
 	}
@@ -713,7 +716,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 	credentialEntries, err := load("credentials", []string{
 		attributeObjectClass, attributeCN, attributeGeneration, attributeProfileID, attributeAlgorithm,
 		attributeSelector, attributePublicKeySPKI, attributeHandleID,
-	})
+	}, false)
 	if err != nil {
 		return err
 	}
@@ -764,7 +767,7 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 	materialEntries, err := load("key-material", []string{
 		attributeObjectClass, attributeCN, attributeGeneration, attributeTenantID, attributeSigningDomain,
 		attributeProfileUse, attributeHandleID, attributeAlgorithm, attributePublicKeySPKI,
-	})
+	}, generation == 1)
 	if err != nil {
 		return err
 	}
@@ -798,11 +801,54 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		materials[material.handle] = material
 	}
 
-	if len(handles) == 0 || len(handles) != len(credentials) || len(handles) != len(materials) {
+	if len(handles) == 0 || len(handles) != len(credentials) || len(materials) != 0 && len(handles) != len(materials) {
 		return ErrMalformed
 	}
 	usedProfiles := make(map[string]struct{}, len(profiles))
 	usedPolicies := make(map[string]struct{}, len(policies))
+	appendLineage := func(lineage publicLineage) error {
+		for _, prior := range history.lineages {
+			if (prior.selector == lineage.selector || prior.handle == lineage.handle) && !samePublicLineage(prior, lineage) {
+				return ErrMalformed
+			}
+		}
+		history.selectors[lineage.selector] = struct{}{}
+		history.handles[lineage.handle] = struct{}{}
+		history.lineages = append(history.lineages, lineage)
+		return nil
+	}
+	if len(materials) == 0 {
+		if generation != 1 {
+			return ErrMalformed
+		}
+		policyByProfile := make(map[string]historicalPolicy, len(policies))
+		for policyKey, policy := range policies {
+			if _, duplicate := policyByProfile[policy.profileID]; duplicate {
+				return ErrMalformed
+			}
+			policyByProfile[policy.profileID] = policy
+			usedPolicies[policyKey] = struct{}{}
+		}
+		for handle := range handles {
+			credential, credentialFound := credentials[handle]
+			profile, profileFound := profiles[credential.profileID]
+			policy, policyFound := policyByProfile[credential.profileID]
+			if !credentialFound || !profileFound || !policyFound || profile.domain != policy.domain {
+				return ErrMalformed
+			}
+			usedProfiles[credential.profileID] = struct{}{}
+			if err := appendLineage(publicLineage{generation: generation, created: created.Format(generalizedTimeLayout),
+				tenant: policy.tenant, domain: policy.domain, use: policy.use, profileID: credential.profileID,
+				selector: credential.selector, algorithm: credential.algorithm,
+				publicSPKI: append([]byte(nil), credential.public...), handle: handle}); err != nil {
+				return err
+			}
+		}
+		if len(usedProfiles) != len(profiles) || len(usedPolicies) != len(policies) {
+			return ErrMalformed
+		}
+		return nil
+	}
 	for handle := range handles {
 		credential, credentialFound := credentials[handle]
 		material, materialFound := materials[handle]
@@ -821,14 +867,9 @@ func (r *LDAPRepository) loadHistoricalLineages(ctx context.Context, history *Re
 		lineage := publicLineage{generation: generation, created: created.Format(generalizedTimeLayout),
 			tenant: material.tenant, domain: material.domain, use: material.use, profileID: credential.profileID,
 			selector: credential.selector, algorithm: credential.algorithm, publicSPKI: append([]byte(nil), credential.public...), handle: handle}
-		for _, prior := range history.lineages {
-			if (prior.selector == lineage.selector || prior.handle == lineage.handle) && !samePublicLineage(prior, lineage) {
-				return ErrMalformed
-			}
+		if err := appendLineage(lineage); err != nil {
+			return err
 		}
-		history.selectors[lineage.selector] = struct{}{}
-		history.handles[lineage.handle] = struct{}{}
-		history.lineages = append(history.lineages, lineage)
 	}
 	if len(usedProfiles) != len(profiles) || len(usedPolicies) != len(policies) {
 		return ErrMalformed
