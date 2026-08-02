@@ -25,6 +25,13 @@ func TestLDAPV2RepositoryAgainstSlapd(t *testing.T) {
 	}
 	executor := startIsolatedSlapd(t)
 	repository := newSlapdRepository(t, executor)
+	history, err := repository.LoadRetainedHistory(context.Background(), 8)
+	if err != nil {
+		t.Fatalf("empty retained-history read failed: %v", err)
+	}
+	if !history.Complete || len(history.Roots) != 0 {
+		t.Fatal("empty retained-history read did not prove a complete empty generation container")
+	}
 	current := fixedStoreGeneration(t, 1, dkim2model.DatasetStateStaging)
 	defer func() { _ = current.Close() }()
 	if err := repository.Publish(context.Background(), 0, current); err != nil {

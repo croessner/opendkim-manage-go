@@ -286,7 +286,7 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 			return 0
 		}
 	})
-	if !contiguousGenerationRoots(history.Roots) {
+	if len(history.Roots) != 0 && !contiguousGenerationRoots(history.Roots) {
 		return RetainedHistory{}, ErrMalformed
 	}
 	if err := validContext(ctx); err != nil {

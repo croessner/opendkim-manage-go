@@ -57,6 +57,18 @@ func TestNewRetainedHistoryWithLineageRejectsIncompleteFacts(t *testing.T) {
 	}
 }
 
+func TestLDAPRepositoryReadHistoryAcceptsProvenEmptyContainer(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	repository := mustRepository(t, executor)
+	history, err := repository.LoadRetainedHistory(context.Background(), 8)
+	if err != nil {
+		t.Fatalf("LoadRetainedHistory() error = %v", err)
+	}
+	if !history.Complete || len(history.Roots) != 0 {
+		t.Fatal("empty generation container was not reported as complete empty history")
+	}
+}
+
 func TestLDAPRepositoryReadHistoryAllowsIdenticalLineageAndRejectsConflictingReuse(t *testing.T) {
 	executor := newFakeExecutor(testBaseDN)
 	repository := mustRepository(t, executor)
