@@ -57,6 +57,31 @@ dkim2:
   # Optional lowercase ASCII identifier using the same bounded grammar.
   feedback_route_id: ""
 
+  # Native DKIM2 automatic rotation is opt-in. Manual rotation, prepare,
+  # resume, retirement, and forward rollback remain separately authorized.
+  rotation_enabled: false
+
+  # Exact retained-lineage age threshold for automatic rotation.
+  rotate_after_days: 365
+
+  # Bounded retained-generation scan. Reaching this limit fails closed.
+  history_limit: 1024
+
+  # Maximum accepted future skew for canonical LDAP operational timestamps.
+  max_clock_skew_seconds: 300
+
+  # One deadline bounds the complete native lifecycle run.
+  run_timeout_seconds: 900
+
+  # Fresh authoritative and recursive proof polling bounds.
+  proof_poll_interval_seconds: 5
+  proof_max_attempts: 60
+  dns_query_timeout_seconds: 5
+
+  # Minimum overlap after the exact cn=current activation timestamp before
+  # explicitly attested DNS retirement can become eligible.
+  retirement_min_overlap_seconds: 604800
+
 ldap:
   # LDAP URL format: ldap://host:port/base??scope?filter
   # In dkim2 mode, the URL base DN is the immutable dataset base. Install the
@@ -84,9 +109,13 @@ ldap:
   binddn: "cn=admin,o=company"
   bindpw: "CHANGE_ME"
 
-# Optional DNS section, required for --update-dns
+# Optional for read-only legacy operations; required for DNS-writing commands.
 dns:
-  primary_nameserver: "127.0.0.1"
+  # Native DKIM2 lifecycle operations require two distinct canonical
+  # host-or-IP:port endpoints. The primary endpoint is queried directly as
+  # authoritative; the recursive endpoint is queried directly with recursion.
+  primary_nameserver: "127.0.0.1:53"
+  recursive_nameserver: "127.0.0.2:53"
 
   # TSIG is mandatory for --update-dns; name and file are a required pair.
   # A missing, unsigned, or non-success response makes the update fail.

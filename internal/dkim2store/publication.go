@@ -1,6 +1,8 @@
 package dkim2store
 
 import (
+	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -10,10 +12,10 @@ import (
 )
 
 // addCandidate creates one complete staging generation without editing committed data.
-func (r *LDAPRepository) addCandidate(candidate *dkim2model.Generation) error {
+func (r *LDAPRepository) addCandidate(ctx context.Context, candidate *dkim2model.Generation) error {
 	generation := strconv.FormatUint(candidate.Number(), 10)
 	rootDN := r.generationRoot(candidate.Number())
-	if err := r.addEntry(rootDN, map[string][][]byte{
+	if err := r.addEntry(ctx, rootDN, map[string][][]byte{
 		attributeObjectClass:   bytesValues(classTop, classDataset),
 		attributeCN:            bytesValues("generation-" + generation),
 		attributeSchemaVersion: bytesValues(dkim2model.SchemaVersion),
@@ -23,7 +25,7 @@ func (r *LDAPRepository) addCandidate(candidate *dkim2model.Generation) error {
 		return err
 	}
 	for _, unit := range generationUnits {
-		if err := r.addEntry("ou="+ldap.EscapeDN(unit)+","+rootDN, map[string][][]byte{
+		if err := r.addEntry(ctx, "ou="+ldap.EscapeDN(unit)+","+rootDN, map[string][][]byte{
 			attributeObjectClass: bytesValues(classTop, classOrganizationalUnit),
 			attributeOU:          bytesValues(unit),
 		}); err != nil {
@@ -31,7 +33,7 @@ func (r *LDAPRepository) addCandidate(candidate *dkim2model.Generation) error {
 		}
 	}
 	for index, handle := range candidate.Handles() {
-		if err := r.addEntry(r.recordDN(index, "handles", rootDN), map[string][][]byte{
+		if err := r.addEntry(ctx, r.recordDN(index, "handles", rootDN), map[string][][]byte{
 			attributeObjectClass: bytesValues(classTop, classHandle),
 			attributeCN:          bytesValues(recordCN(index)),
 			attributeGeneration:  bytesValues(generation),
@@ -53,7 +55,7 @@ func (r *LDAPRepository) addCandidate(candidate *dkim2model.Generation) error {
 			attributes[attributeNotBefore] = bytesValues(notBefore.Format(time.RFC3339Nano))
 			attributes[attributeNotAfter] = bytesValues(notAfter.Format(time.RFC3339Nano))
 		}
-		if err := r.addEntry(r.recordDN(index, "profiles", rootDN), attributes); err != nil {
+		if err := r.addEntry(ctx, r.recordDN(index, "profiles", rootDN), attributes); err != nil {
 			return err
 		}
 	}
@@ -69,7 +71,7 @@ func (r *LDAPRepository) addCandidate(candidate *dkim2model.Generation) error {
 			attributePublicKeySPKI: {publicSPKI},
 			attributeHandleID:      bytesValues(credential.HandleID()),
 		}
-		err := r.addEntry(r.recordDN(index, "credentials", rootDN), attributes)
+		err := r.addEntry(ctx, r.recordDN(index, "credentials", rootDN), attributes)
 		clear(publicSPKI)
 		if err != nil {
 			return err
@@ -91,7 +93,7 @@ func (r *LDAPRepository) addCandidate(candidate *dkim2model.Generation) error {
 		if route := policy.FeedbackRouteID(); route != "" {
 			attributes[attributeFeedbackRouteID] = bytesValues(route)
 		}
-		if err := r.addEntry(r.recordDN(index, "policies", rootDN), attributes); err != nil {
+		if err := r.addEntry(ctx, r.recordDN(index, "policies", rootDN), attributes); err != nil {
 			return err
 		}
 	}
@@ -116,7 +118,7 @@ func (r *LDAPRepository) addCandidate(candidate *dkim2model.Generation) error {
 			attributePublicKeySPKI: {publicSPKI},
 			attributePrivatePKCS8:  {privatePKCS8},
 		}
-		err := r.addEntry(r.recordDN(index, "key-material", rootDN), attributes)
+		err := r.addEntry(ctx, r.recordDN(index, "key-material", rootDN), attributes)
 		clear(publicSPKI)
 		clear(privatePKCS8)
 		if err != nil {
@@ -127,8 +129,8 @@ func (r *LDAPRepository) addCandidate(candidate *dkim2model.Generation) error {
 }
 
 // validateReadback proves that staged LDAP data is valid and exactly equivalent to the candidate.
-func (r *LDAPRepository) validateReadback(candidate *dkim2model.Generation) error {
-	entries, err := r.readGeneration(candidate.Number())
+func (r *LDAPRepository) validateReadback(ctx context.Context, candidate *dkim2model.Generation) error {
+	entries, err := r.readGeneration(ctx, candidate.Number())
 	if err != nil {
 		return err
 	}
@@ -146,21 +148,29 @@ func (r *LDAPRepository) validateReadback(candidate *dkim2model.Generation) erro
 }
 
 // commitGeneration changes only a fully read-back generation root to committed.
-func (r *LDAPRepository) commitGeneration(generation uint64) error {
+func (r *LDAPRepository) commitGeneration(ctx context.Context, generation uint64) error {
 	request := ldap.NewModifyRequest(r.generationRoot(generation), nil)
 	request.Replace(attributeDatasetState, []string{datasetStateCommitted})
-	result, err := r.executor.ModifyRequest(request)
+	control, err := newAssertionControl(metadataAssertion(generation, datasetStateStaging))
 	if err != nil {
+		return ErrMalformed
+	}
+	request.Controls = []ldap.Control{control}
+	result, err := r.modify(ctx, request)
+	if err != nil {
+		if contextErr := validContext(ctx); contextErr != nil {
+			return contextErr
+		}
 		return classifyWriteError(err)
 	}
 	if result == nil || result.Referral != "" {
-		return ErrUnavailable
+		return ErrOutcomeUncertain
 	}
 	return nil
 }
 
 // switchCurrent atomically claims the committed generation through RFC 4528.
-func (r *LDAPRepository) switchCurrent(expected, generation uint64) error {
+func (r *LDAPRepository) switchCurrent(ctx context.Context, expected, generation uint64) error {
 	var assertion string
 	request := ldap.NewModifyRequest(r.currentDN, nil)
 	if expected == 0 {
@@ -175,14 +185,41 @@ func (r *LDAPRepository) switchCurrent(expected, generation uint64) error {
 		return ErrMalformed
 	}
 	request.Controls = []ldap.Control{control}
-	result, err := r.executor.ModifyRequest(request)
+	result, err := r.modify(ctx, request)
 	if err != nil {
-		return classifyWriteError(err)
+		if contextErr := validContext(ctx); contextErr != nil {
+			return contextErr
+		}
+		classified := classifyWriteError(err)
+		if !errors.Is(classified, ErrOutcomeUncertain) {
+			return classified
+		}
+		pointer, absent, readErr := r.readCurrentPointer(ctx)
+		if readErr != nil || absent {
+			return ErrOutcomeUncertain
+		}
+		if pointer.generation == generation {
+			return nil
+		}
+		if pointer.generation == expected {
+			return ErrOutcomeUncertain
+		}
+		return ErrConflict
 	}
 	if result == nil || result.Referral != "" {
-		return ErrUnavailable
+		pointer, absent, readErr := r.readCurrentPointer(ctx)
+		if readErr != nil || absent {
+			return ErrOutcomeUncertain
+		}
+		if pointer.generation == generation {
+			return nil
+		}
+		if pointer.generation == expected {
+			return ErrOutcomeUncertain
+		}
+		return ErrConflict
 	}
-	pointer, absent, err := r.readCurrentPointer()
+	pointer, absent, err := r.readCurrentPointer(ctx)
 	if err != nil || absent || pointer.generation != generation {
 		return ErrConflict
 	}
@@ -206,9 +243,9 @@ func newAssertionControl(filter string) (ldap.Control, error) {
 }
 
 // addEntry performs one complete immutable add and releases request-owned values afterward.
-func (r *LDAPRepository) addEntry(dn string, attributes map[string][][]byte) error {
+func (r *LDAPRepository) addEntry(ctx context.Context, dn string, attributes map[string][][]byte) error {
 	request := newAdd(dn, attributes)
-	err := r.executor.AddRequest(request)
+	err := r.add(ctx, request)
 	for attributeIndex := range request.Attributes {
 		for valueIndex := range request.Attributes[attributeIndex].Vals {
 			request.Attributes[attributeIndex].Vals[valueIndex] = ""
@@ -216,6 +253,9 @@ func (r *LDAPRepository) addEntry(dn string, attributes map[string][][]byte) err
 		request.Attributes[attributeIndex].Vals = nil
 	}
 	if err != nil {
+		if contextErr := validContext(ctx); contextErr != nil {
+			return contextErr
+		}
 		return classifyWriteError(err)
 	}
 	return nil

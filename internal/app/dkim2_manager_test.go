@@ -13,18 +13,23 @@ import (
 	"github.com/croessner/opendkim-manage-go/internal/cli"
 	"github.com/croessner/opendkim-manage-go/internal/config"
 	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
+	"github.com/croessner/opendkim-manage-go/internal/dkim2store"
 	"github.com/croessner/opendkim-manage-go/internal/types"
 )
 
 type fakeGenerationRepository struct {
-	current     *dkim2model.Generation
-	loads       int
-	publishes   int
-	expected    uint64
-	published   *dkim2model.Generation
-	loadErr     error
-	publishErr  error
-	publishHook func()
+	current           *dkim2model.Generation
+	loads             int
+	publishes         int
+	expected          uint64
+	published         *dkim2model.Generation
+	loadErr           error
+	publishErr        error
+	publishHook       func()
+	historyIncomplete bool
+	historyErr        error
+	historyLoads      int
+	history           *dkim2store.RetainedHistory
 }
 
 func (f *fakeGenerationRepository) LoadCurrent(context.Context) (*dkim2model.Generation, error) {
@@ -33,6 +38,86 @@ func (f *fakeGenerationRepository) LoadCurrent(context.Context) (*dkim2model.Gen
 		return nil, f.loadErr
 	}
 	return f.current.Clone()
+}
+
+func (f *fakeGenerationRepository) LoadRetainedHistory(context.Context, int) (dkim2store.RetainedHistory, error) {
+	f.historyLoads++
+	if f.historyErr != nil {
+		return dkim2store.RetainedHistory{}, f.historyErr
+	}
+	if f.history != nil {
+		return *f.history, nil
+	}
+	if f.historyIncomplete {
+		return dkim2store.NewRetainedHistory(nil, false, nil, nil), nil
+	}
+	if f.current == nil {
+		return dkim2store.NewRetainedHistory(nil, true, nil, nil), nil
+	}
+	var selectors, handles []string
+	for _, credential := range f.current.Credentials() {
+		selectors = append(selectors, credential.Selector())
+	}
+	for _, handle := range f.current.Handles() {
+		handles = append(handles, handle.ID())
+	}
+	return dkim2store.NewRetainedHistory([]dkim2store.GenerationRoot{{Number: f.current.Number(), State: f.current.State()}}, true, selectors, handles), nil
+}
+
+func TestDKIM2CreateAndActiveRejectIncompleteOrOrphanHistoryBeforeProtectedWork(t *testing.T) {
+	for _, command := range []string{"create", "active"} {
+		t.Run(command, func(t *testing.T) {
+			current := testGeneration(t, dkim2model.RecordStatusDisabled, dkim2model.RolloutOff)
+			repository := &fakeGenerationRepository{current: current, historyIncomplete: true}
+			defer repository.close()
+			opts := &cli.Options{Size: 2048, DryRun: true}
+			if command == "create" {
+				opts.Create, opts.Domains, opts.KeyType = true, []string{"new.example.test"}, "ed25519"
+			} else {
+				opts.Active, opts.Domains, opts.Selectors = true, []string{"example.test"}, []string{"selector-rsa"}
+			}
+			manager := testDKIM2Manager(repository, opts)
+			manager.random = &countingAppReader{}
+			manager.lookupTXT = func(string) ([]string, error) {
+				t.Fatal("DNS lookup occurred before history preflight")
+				return nil, nil
+			}
+			if _, err := manager.Run(); err == nil || !strings.Contains(err.Error(), "history is incomplete") {
+				t.Fatalf("Run() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestDKIM2CreateRejectsHigherOrphanRootBeforeRandomness(t *testing.T) {
+	current := testGeneration(t, dkim2model.RecordStatusDisabled, dkim2model.RolloutOff)
+	repository := &fakeGenerationRepository{current: current}
+	defer repository.close()
+	selectors := []string{"selector-rsa", "selector-ed"}
+	handles := []string{"handle-secret-marker-rsa", "handle-secret-marker-ed"}
+	history := dkim2store.NewRetainedHistory([]dkim2store.GenerationRoot{
+		{Number: 1, State: dkim2model.DatasetStateCommitted},
+		{Number: 2, State: dkim2model.DatasetStateStaging},
+	}, true, selectors, handles)
+	repository.history = &history
+	manager := testDKIM2Manager(repository, &cli.Options{
+		Create: true, Domains: []string{"new.example.test"}, KeyType: "ed25519", Size: 2048, DryRun: true,
+	})
+	random := &countingAppReader{}
+	manager.random = random
+	if _, err := manager.Run(); err == nil || !strings.Contains(err.Error(), "higher generation") {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if random.reads != 0 {
+		t.Fatalf("higher orphan consumed randomness: %d", random.reads)
+	}
+}
+
+type countingAppReader struct{ reads int }
+
+func (r *countingAppReader) Read([]byte) (int, error) {
+	r.reads++
+	return 0, errors.New("unexpected random read")
 }
 
 func (f *fakeGenerationRepository) Publish(_ context.Context, expected uint64, candidate *dkim2model.Generation) error {

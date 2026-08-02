@@ -1,0 +1,37 @@
+# RNS DKIM2 immutable datasource schema.
+#
+# This fixture is pinned to DKIM2 commit
+# 75e2bb2ba6a71fc4f017201da021b5509acbfb4f. It is consumed only by the
+# isolated repository contract harness; it is not an installed LDAP schema.
+# The accepted dataset marker is exactly dkim2-datasource-v2.
+objectidentifier RNSRoot      1.3.6.1.4.1.31612
+objectidentifier RNSLDAP      RNSRoot:1
+objectidentifier RNSDKIM2     RNSLDAP:7
+objectidentifier RNSDKIM2at   RNSDKIM2:1
+objectidentifier RNSDKIM2oc   RNSDKIM2:2
+
+attributetype ( RNSDKIM2at:1 NAME 'dkim2SchemaVersion' DESC 'Exact DKIM2 datasource schema version' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:2 NAME 'dkim2Generation' DESC 'Nonzero immutable datasource generation' EQUALITY integerMatch ORDERING integerOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.27 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:3 NAME 'dkim2DatasetState' DESC 'Closed immutable dataset publication state' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:4 NAME 'dkim2HandleID' DESC 'Provider-neutral opaque signing handle identifier' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:5 NAME 'dkim2ProfileID' DESC 'Exact immutable signing profile identifier' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:6 NAME 'dkim2SigningDomain' DESC 'Canonical lowercase ASCII signing domain' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:7 NAME 'dkim2RecordStatus' DESC 'Closed administrative record status' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:8 NAME 'dkim2NotBefore' DESC 'Canonical UTC RFC3339Nano validity start' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:9 NAME 'dkim2NotAfter' DESC 'Canonical UTC RFC3339Nano validity end' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:10 NAME 'dkim2Algorithm' DESC 'Closed DKIM2 signing algorithm' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:11 NAME 'dkim2Selector' DESC 'Canonical lowercase ASCII DNS selector' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:12 NAME 'dkim2PublicKeySPKI' DESC 'Canonical public SubjectPublicKeyInfo DER' EQUALITY octetStringMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:13 NAME 'dkim2TenantID' DESC 'Exact administrative tenant identifier' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:14 NAME 'dkim2ProfileUse' DESC 'Closed administrative profile use' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:15 NAME 'dkim2Rollout' DESC 'Closed administrative rollout state' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:16 NAME 'dkim2Compatibility' DESC 'Closed compatibility policy' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:17 NAME 'dkim2FeedbackRouteID' DESC 'Opaque future-service feedback route identifier' EQUALITY caseExactIA5Match SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )
+attributetype ( RNSDKIM2at:18 NAME 'dkim2PrivateKeyPKCS8' DESC 'Canonical unencrypted private key PKCS8 DER' EQUALITY octetStringMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 SINGLE-VALUE )
+
+objectclass ( RNSDKIM2oc:1 NAME 'dkim2Dataset' DESC 'Immutable datasource generation metadata or current reference' SUP top STRUCTURAL MUST ( cn $ dkim2SchemaVersion $ dkim2Generation $ dkim2DatasetState ) )
+objectclass ( RNSDKIM2oc:2 NAME 'dkim2Handle' DESC 'One provider-neutral opaque handle declaration' SUP top STRUCTURAL MUST ( cn $ dkim2Generation $ dkim2HandleID ) )
+objectclass ( RNSDKIM2oc:3 NAME 'dkim2Profile' DESC 'One bounded immutable signing profile' SUP top STRUCTURAL MUST ( cn $ dkim2Generation $ dkim2ProfileID $ dkim2SigningDomain $ dkim2RecordStatus ) MAY ( dkim2NotBefore $ dkim2NotAfter ) )
+objectclass ( RNSDKIM2oc:4 NAME 'dkim2Credential' DESC 'One public signing credential and opaque handle binding' SUP top STRUCTURAL MUST ( cn $ dkim2Generation $ dkim2ProfileID $ dkim2Algorithm $ dkim2Selector $ dkim2PublicKeySPKI $ dkim2HandleID ) )
+objectclass ( RNSDKIM2oc:5 NAME 'dkim2Policy' DESC 'One exact tenant domain and profile-use policy' SUP top STRUCTURAL MUST ( cn $ dkim2Generation $ dkim2TenantID $ dkim2SigningDomain $ dkim2ProfileUse $ dkim2ProfileID $ dkim2RecordStatus $ dkim2Rollout $ dkim2Compatibility ) MAY dkim2FeedbackRouteID )
+objectclass ( RNSDKIM2oc:6 NAME 'dkim2KeyMaterial' DESC 'One native immutable private signing key and exact binding' SUP top STRUCTURAL MUST ( cn $ dkim2Generation $ dkim2TenantID $ dkim2SigningDomain $ dkim2ProfileUse $ dkim2HandleID $ dkim2Algorithm $ dkim2PublicKeySPKI $ dkim2PrivateKeyPKCS8 ) )

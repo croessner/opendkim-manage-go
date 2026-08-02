@@ -549,6 +549,86 @@ func (b *Builder) ReplaceProfile(profile Profile) error {
 	return ErrInvalid
 }
 
+// ReplaceProfileKeys atomically replaces every credential, handle, and key owner for one profile.
+func (b *Builder) ReplaceProfileKeys(
+	profileID string,
+	credentials []Credential,
+	materials []*KeyMaterial,
+) error {
+	if b == nil || b.number == 0 || ValidateIdentifier(profileID) != nil ||
+		len(credentials) == 0 || len(credentials) != len(materials) {
+		return ErrInvalid
+	}
+	profileFound := false
+	for _, profile := range b.profiles {
+		if profile.ID() == profileID {
+			profileFound = true
+			break
+		}
+	}
+	if !profileFound {
+		return ErrInvalid
+	}
+	owned := make([]*KeyMaterial, 0, len(materials))
+	newHandles := make([]Handle, 0, len(materials))
+	for index, credential := range credentials {
+		material := materials[index]
+		if credential.Generation() != b.number || credential.ProfileID() != profileID ||
+			material == nil || material.Generation() != b.number ||
+			credential.HandleID() != material.HandleID() ||
+			credential.Algorithm() != material.Algorithm() ||
+			!bytes.Equal(credential.PublicSPKIDER(), material.PublicSPKIDER()) {
+			closeKeyMaterials(owned)
+			return ErrInvalid
+		}
+		clone, err := material.Clone()
+		if err != nil {
+			closeKeyMaterials(owned)
+			return err
+		}
+		handle, err := NewHandle(b.number, material.HandleID())
+		if err != nil {
+			_ = clone.Close()
+			closeKeyMaterials(owned)
+			return err
+		}
+		owned = append(owned, clone)
+		newHandles = append(newHandles, handle)
+	}
+
+	removedHandles := make(map[string]struct{}, 2)
+	keptCredentials := b.credentials[:0]
+	for _, credential := range b.credentials {
+		if credential.ProfileID() == profileID {
+			removedHandles[credential.HandleID()] = struct{}{}
+			continue
+		}
+		keptCredentials = append(keptCredentials, credential)
+	}
+	if len(removedHandles) == 0 {
+		closeKeyMaterials(owned)
+		return ErrInvalid
+	}
+	keptHandles := b.handles[:0]
+	for _, handle := range b.handles {
+		if _, remove := removedHandles[handle.ID()]; !remove {
+			keptHandles = append(keptHandles, handle)
+		}
+	}
+	keptMaterials := b.materials[:0]
+	for _, material := range b.materials {
+		if _, remove := removedHandles[material.HandleID()]; remove {
+			_ = material.Close()
+			continue
+		}
+		keptMaterials = append(keptMaterials, material)
+	}
+	b.credentials = append(keptCredentials, cloneCredentials(credentials)...)
+	b.handles = append(keptHandles, newHandles...)
+	b.materials = append(keptMaterials, owned...)
+	return nil
+}
+
 // UpsertPolicy replaces one exact tenant/domain/use binding or appends it.
 func (b *Builder) UpsertPolicy(policy Policy) error {
 	if b == nil || policy.Generation() != b.number {

@@ -202,10 +202,13 @@ func TestValidateDKIM2RequiresClosedConfiguration(t *testing.T) {
 	valid.Global.Mode = types.ModeDKIM2
 	valid.LDAP.URI = "ldaps://ldap.example.org/ou=dkim,dc=example"
 	valid.DKIM2 = DKIM2Config{
-		TenantID:      "tenant-example",
-		ProfileUse:    "originator",
-		Rollout:       "enforce",
-		Compatibility: "strict",
+		TenantID:        "tenant-example",
+		ProfileUse:      "originator",
+		Rollout:         "enforce",
+		Compatibility:   "strict",
+		RotateAfterDays: 365, HistoryLimit: 1024, MaxClockSkewSeconds: 300,
+		RunTimeoutSeconds: 900, ProofPollIntervalSeconds: 5, ProofMaxAttempts: 60,
+		DNSQueryTimeoutSeconds: 5, RetirementMinOverlapSeconds: 604800,
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid DKIM2 config rejected: %v", err)
@@ -245,5 +248,70 @@ func TestValidateForModeChecksCLIOverrideRequirements(t *testing.T) {
 	}
 	if err := cfg.ValidateForMode(types.ModeDKIM2); err == nil {
 		t.Fatal("expected DKIM2 override without DKIM2 config to fail")
+	}
+}
+
+func TestLoadDKIM2RotationDefaults(t *testing.T) {
+	path := writeTemp(t, `
+global:
+  mode: dkim2
+ldap:
+  uri: "ldaps://ldap.example.org/ou=dkim,dc=example"
+dkim2:
+  tenant_id: tenant-example
+  profile_use: originator
+  rollout: enforce
+  compatibility: strict
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load DKIM2 defaults: %v", err)
+	}
+	if cfg.DKIM2.RotationEnabled || cfg.DKIM2.RotateAfterDays != 365 || cfg.DKIM2.HistoryLimit != 1024 ||
+		cfg.DKIM2.MaxClockSkewSeconds != 300 || cfg.DKIM2.RunTimeoutSeconds != 900 ||
+		cfg.DKIM2.ProofPollIntervalSeconds != 5 || cfg.DKIM2.ProofMaxAttempts != 60 ||
+		cfg.DKIM2.DNSQueryTimeoutSeconds != 5 || cfg.DKIM2.RetirementMinOverlapSeconds != 604800 {
+		t.Fatalf("unexpected DKIM2 rotation defaults: %#v", cfg.DKIM2)
+	}
+	if cfg.DNS.PrimaryNameserver != "127.0.0.1:53" || cfg.DNS.RecursiveNameserver != "127.0.0.2:53" {
+		t.Fatalf("unexpected proof endpoints: %#v", cfg.DNS)
+	}
+}
+
+func TestValidateDKIM2RotationRangesAndDistinctProofEndpoints(t *testing.T) {
+	valid := defaultConfig()
+	valid.Global.Mode = types.ModeDKIM2
+	valid.LDAP.URI = "ldaps://ldap.example.org/ou=dkim,dc=example"
+	valid.DKIM2.TenantID = "tenant-example"
+	valid.DKIM2.ProfileUse = "originator"
+	valid.DKIM2.Rollout = "enforce"
+	valid.DKIM2.Compatibility = "strict"
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid rotation config rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "rotate days", mutate: func(c *Config) { c.DKIM2.RotateAfterDays = 0 }},
+		{name: "history", mutate: func(c *Config) { c.DKIM2.HistoryLimit = 1 }},
+		{name: "skew", mutate: func(c *Config) { c.DKIM2.MaxClockSkewSeconds = 3601 }},
+		{name: "run timeout", mutate: func(c *Config) { c.DKIM2.RunTimeoutSeconds = 29 }},
+		{name: "poll", mutate: func(c *Config) { c.DKIM2.ProofPollIntervalSeconds = 301 }},
+		{name: "attempts", mutate: func(c *Config) { c.DKIM2.ProofMaxAttempts = 0 }},
+		{name: "query timeout", mutate: func(c *Config) { c.DKIM2.DNSQueryTimeoutSeconds = 31 }},
+		{name: "overlap", mutate: func(c *Config) { c.DKIM2.RetirementMinOverlapSeconds = 3599 }},
+		{name: "same endpoint", mutate: func(c *Config) { c.DNS.RecursiveNameserver = c.DNS.PrimaryNameserver }},
+		{name: "missing port", mutate: func(c *Config) { c.DNS.PrimaryNameserver = "127.0.0.1" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := valid
+			tt.mutate(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("invalid DKIM2 rotation config was accepted")
+			}
+		})
 	}
 }

@@ -18,7 +18,12 @@ The current prerelease is `v1.0.0-beta.1`.
 - Select either the legacy OpenDKIM or native DKIM2 LDAP model
 - Manage RSA and ED25519 DKIM keys in LDAP
 - List, create, delete, revoke, activate, rotate, and reorder OpenDKIM selectors
-- Create and activate complete immutable DKIM2 datasource generations
+- Create and activate complete immutable DKIM2 datasource generations with
+  crash-resumable rotation
+- Run default-off, bounded DKIM2 automatic rotation and explicitly authorized
+  DNS retirement
+- Recover by rebasing a retained DKIM2 generation forward without moving the
+  current pointer backward
 - Verify published DNS keys before activation
 - Run key-age checks and automated lifecycle maintenance
 - Add missing keys per domain
@@ -93,7 +98,9 @@ example is available in
 
 The parity and lifecycle contract is documented in
 [`docs/specs/PARITY-AND-LIFECYCLE.md`](docs/specs/PARITY-AND-LIFECYCLE.md). Testing
-and quality-gate details are in [`docs/TESTING.md`](docs/TESTING.md).
+and quality-gate details are in [`docs/TESTING.md`](docs/TESTING.md). The native
+rotation and recovery contract is specified separately in
+[`docs/specs/DKIM2-ROTATION.md`](docs/specs/DKIM2-ROTATION.md).
 
 ### Operating modes
 
@@ -164,20 +171,78 @@ DKIM2 mode supports only these commands:
   key match the LDAP credential exactly.
 - `--print-dns` emits DNS-04-compatible `v=DKIM1` records with the algorithm's
   correct RSA PKCS#1 or Ed25519 raw public-key encoding.
+- `--rotate --domain ... --update-dns` rotates exactly one active native
+  binding while preserving its RSA-only, Ed25519-only, or dual algorithm set.
+  `--prepare-only` stops after exact LDAP staging and readback, before TSIG or
+  DNS access. `--resume-generation <G>` continues only the exact protected
+  candidate already stored in LDAP and never generates replacement keys.
+- `--auto --update-dns` is available only when `dkim2.rotation_enabled: true`.
+  It resumes one pending candidate first or rotates at most one deterministically
+  selected due binding from an exact, complete historical-lineage clock. It
+  never retires DNS records or deletes LDAP history.
+- `--observe --domain ...` reports the bounded LDAP/DNS lifecycle phase for
+  exactly one native binding without performing a write or opening TSIG
+  material.
+- `--retire-generation <G-old> --domain ... --update-dns` removes only the
+  exact predecessor TXT values after the minimum overlap and all seven external
+  operator attestations have been revalidated. Partial progress continues only
+  through `--resume-retirement`; LDAP generations are never deleted.
+- `--rollback-from-generation <G-source> --domain ... --update-dns` rebases
+  retained approved content and protected key material into a new generation
+  higher than every retained root. It never moves `cn=current` backward and
+  continues a staged rebase only with `--resume-generation <G-new>`.
 
-`--delete`, `--force-delete`, `--age`, `--add-missing`, `--add-new`,
-`--rotate`, `--auto`, and CNAME-oriented behavior are unsupported in DKIM2
-mode and fail before LDAP or DNS writes. A native DKIM2 lifecycle-history and
-retention contract is required before these operations can be implemented
-truthfully.
+`--delete`, `--force-delete`, `--age`, `--add-missing`, `--add-new`, and
+CNAME-oriented behavior remain unsupported in DKIM2 mode and fail before LDAP
+or DNS writes. Automatic DNS retirement, LDAP generation deletion, pointer
+rollback, and implicit rollback are deliberately unavailable.
 
 DKIM2 creation first publishes an inactive LDAP generation. An optional DNS
 update follows that successful publication. Activation always performs a new
 DNS lookup, and a failed proof leaves the previous current generation active.
-DNS writes retain the existing complete-TSIG and signed-success requirements
-and replace only the target TXT RRset. `--dry-run` may load and validate a
-complete candidate but performs no LDAP or DNS writes and does not expose
-private DER, public SPKI, raw handles, bind values, or TSIG material.
+DNS writes retain the complete-TSIG and signed-success requirements. Rotation
+creates an absent TXT RRset under `NXRRSET`; retirement deletes only an exact
+old TXT value under a value-aware prerequisite. Fresh authoritative and
+recursive proof uses separate, normalized `host:port` endpoints. A conflict,
+ambiguous answer, or uncertain result fails closed.
+
+`--dry-run` validates and plans without LDAP or DNS writes and without opening
+the TSIG key. A later non-resume apply creates new random keys; dry-run output
+is not a reusable key plan. Only `--resume-generation` reuses the protected key
+material of an already staged LDAP candidate. Lifecycle, status, error,
+dry-run, JSON, verbose, and metrics output never includes private DER, public
+SPKI, DNS key payloads, raw handles, LDAP DNs, configured endpoints, bind
+values, or TSIG material. The existing explicit `--print-dns` command is the
+sole public-DNS-payload output path.
+
+Automatic eligibility is based on the earliest retained root
+`createTimestamp` for each exact current selector, algorithm, public-SPKI, and
+handle lineage. The timestamp must be a single canonical UTC generalized time.
+Incomplete, truncated, ambiguous, malformed, or excessively future-dated
+history makes eligibility unknown and prevents a write. `modifyTimestamp` and
+profile validity are not key age.
+
+Bounded observation derives closed state from LDAP and DNS rather than a local
+journal. It can distinguish idle, staged, DNS pending or conflict,
+committed-but-unreachable, activated, observing, and retire-eligible states
+using only generation, phase, domain, selector, and algorithm facts. These
+source-code contracts do not assert that a deployment, runtime reload, queue
+drain, signature switchover, external verification, or backup has occurred.
+
+The exact retirement invocation is intentionally explicit:
+
+```bash
+opendkim-manage --mode dkim2 --retire-generation 7 \
+  --domain tenant.example.test --update-dns \
+  --attest-runtime-reload --attest-readiness --attest-queues \
+  --attest-emitted-signatures --attest-external-verification \
+  --attest-backup --attest-rollback-authority --yes
+```
+
+All seven attestations are boolean flags. After partial or response-uncertain
+deletion, the only continuation is the same authorized command with
+`--resume-retirement`. The program rechecks every precondition and never
+recreates an old value that authoritative DNS proves absent.
 
 There is no automatic conversion from legacy OpenDKIM objects. Tenant,
 profile use, rollout, identity, validity, and immutable history are never
@@ -200,6 +265,9 @@ Primary commands are mutually exclusive:
 - `--add-new`
 - `--print-dns`
 - `--auto`
+- `--observe`
+- `--retire-generation <G>`
+- `--rollback-from-generation <G>`
 
 The exact command subset available in `dkim2` mode is documented under
 [Operating modes](#operating-modes). Unsupported lifecycle commands fail
@@ -212,6 +280,9 @@ Common options include:
 - `--selectorname` / `-s`
 - `--keytype` (`both`, `rsa`, or `ed25519`)
 - `--update-dns`
+- `--prepare-only`
+- `--resume-generation <G>`
+- `--resume-retirement`
 - `--dry-run`
 - `--yes`
 - `--interactive`

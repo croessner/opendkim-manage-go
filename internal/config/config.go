@@ -3,8 +3,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/viper"
@@ -33,11 +36,20 @@ type GlobalConfig struct {
 
 // DKIM2Config contains the closed policy inputs needed to construct a native DKIM2 dataset.
 type DKIM2Config struct {
-	TenantID        string `mapstructure:"tenant_id" yaml:"tenant_id"`
-	ProfileUse      string `mapstructure:"profile_use" yaml:"profile_use"`
-	Rollout         string `mapstructure:"rollout" yaml:"rollout"`
-	Compatibility   string `mapstructure:"compatibility" yaml:"compatibility"`
-	FeedbackRouteID string `mapstructure:"feedback_route_id" yaml:"feedback_route_id"`
+	TenantID                    string `mapstructure:"tenant_id" yaml:"tenant_id"`
+	ProfileUse                  string `mapstructure:"profile_use" yaml:"profile_use"`
+	Rollout                     string `mapstructure:"rollout" yaml:"rollout"`
+	Compatibility               string `mapstructure:"compatibility" yaml:"compatibility"`
+	FeedbackRouteID             string `mapstructure:"feedback_route_id" yaml:"feedback_route_id"`
+	RotationEnabled             bool   `mapstructure:"rotation_enabled" yaml:"rotation_enabled"`
+	RotateAfterDays             int    `mapstructure:"rotate_after_days" yaml:"rotate_after_days"`
+	HistoryLimit                int    `mapstructure:"history_limit" yaml:"history_limit"`
+	MaxClockSkewSeconds         int    `mapstructure:"max_clock_skew_seconds" yaml:"max_clock_skew_seconds"`
+	RunTimeoutSeconds           int    `mapstructure:"run_timeout_seconds" yaml:"run_timeout_seconds"`
+	ProofPollIntervalSeconds    int    `mapstructure:"proof_poll_interval_seconds" yaml:"proof_poll_interval_seconds"`
+	ProofMaxAttempts            int    `mapstructure:"proof_max_attempts" yaml:"proof_max_attempts"`
+	DNSQueryTimeoutSeconds      int    `mapstructure:"dns_query_timeout_seconds" yaml:"dns_query_timeout_seconds"`
+	RetirementMinOverlapSeconds int    `mapstructure:"retirement_min_overlap_seconds" yaml:"retirement_min_overlap_seconds"`
 }
 
 type LDAPConfig struct {
@@ -60,12 +72,13 @@ type LDAPConfig struct {
 }
 
 type DNSConfig struct {
-	PrimaryNameserver string `mapstructure:"primary_nameserver" yaml:"primary_nameserver"`
-	TSIGKeyFile       string `mapstructure:"tsig_key_file" yaml:"tsig_key_file"`
-	TSIGKeyName       string `mapstructure:"tsig_key_name" yaml:"tsig_key_name"`
-	Algorithm         string `mapstructure:"algorithm" yaml:"algorithm"`
-	TTL               int    `mapstructure:"ttl" yaml:"ttl"`
-	CNAMEs            string `mapstructure:"cnames" yaml:"cnames"`
+	PrimaryNameserver   string `mapstructure:"primary_nameserver" yaml:"primary_nameserver"`
+	RecursiveNameserver string `mapstructure:"recursive_nameserver" yaml:"recursive_nameserver"`
+	TSIGKeyFile         string `mapstructure:"tsig_key_file" yaml:"tsig_key_file"`
+	TSIGKeyName         string `mapstructure:"tsig_key_name" yaml:"tsig_key_name"`
+	Algorithm           string `mapstructure:"algorithm" yaml:"algorithm"`
+	TTL                 int    `mapstructure:"ttl" yaml:"ttl"`
+	CNAMEs              string `mapstructure:"cnames" yaml:"cnames"`
 }
 
 type Config struct {
@@ -99,7 +112,13 @@ func defaultConfig() Config {
 			ServiceType:          "description",
 		},
 		DNS: DNSConfig{
-			Algorithm: "hmac_sha256",
+			Algorithm: "hmac_sha256", PrimaryNameserver: "127.0.0.1:53",
+			RecursiveNameserver: "127.0.0.2:53",
+		},
+		DKIM2: DKIM2Config{
+			RotateAfterDays: 365, HistoryLimit: 1024, MaxClockSkewSeconds: 300,
+			RunTimeoutSeconds: 900, ProofPollIntervalSeconds: 5, ProofMaxAttempts: 60,
+			DNSQueryTimeoutSeconds: 5, RetirementMinOverlapSeconds: 604800,
 		},
 		Scheme: types.DefaultScheme(),
 	}
@@ -320,6 +339,19 @@ func (c *Config) ValidateForMode(mode types.Mode) error {
 		if err := c.DKIM2.validate(); err != nil {
 			return err
 		}
+		primary, err := canonicalEndpoint(c.DNS.PrimaryNameserver)
+		if err != nil {
+			return fmt.Errorf("dns.primary_nameserver: %w", err)
+		}
+		recursive, err := canonicalEndpoint(c.DNS.RecursiveNameserver)
+		if err != nil {
+			return fmt.Errorf("dns.recursive_nameserver: %w", err)
+		}
+		if primary == recursive {
+			return errors.New("DKIM2 authoritative and recursive DNS endpoints must be distinct")
+		}
+		c.DNS.PrimaryNameserver = primary
+		c.DNS.RecursiveNameserver = recursive
 	}
 	return nil
 }
@@ -349,7 +381,57 @@ func (c DKIM2Config) validate() error {
 	if c.FeedbackRouteID != "" && !canonicalIdentifier(c.FeedbackRouteID) {
 		return errors.New("dkim2.feedback_route_id must be empty or a lowercase ASCII identifier of at most 128 bytes")
 	}
+	if c.RotateAfterDays < 1 || c.RotateAfterDays > 36500 {
+		return errors.New("dkim2.rotate_after_days must be between 1 and 36500")
+	}
+	if c.HistoryLimit < 2 || c.HistoryLimit > 4096 {
+		return errors.New("dkim2.history_limit must be between 2 and 4096")
+	}
+	if c.MaxClockSkewSeconds < 0 || c.MaxClockSkewSeconds > 3600 {
+		return errors.New("dkim2.max_clock_skew_seconds must be between 0 and 3600")
+	}
+	if c.RunTimeoutSeconds < 30 || c.RunTimeoutSeconds > 86400 {
+		return errors.New("dkim2.run_timeout_seconds must be between 30 and 86400")
+	}
+	if c.ProofPollIntervalSeconds < 1 || c.ProofPollIntervalSeconds > 300 {
+		return errors.New("dkim2.proof_poll_interval_seconds must be between 1 and 300")
+	}
+	if c.ProofMaxAttempts < 1 || c.ProofMaxAttempts > 3600 {
+		return errors.New("dkim2.proof_max_attempts must be between 1 and 3600")
+	}
+	if c.DNSQueryTimeoutSeconds < 1 || c.DNSQueryTimeoutSeconds > 30 {
+		return errors.New("dkim2.dns_query_timeout_seconds must be between 1 and 30")
+	}
+	if c.RetirementMinOverlapSeconds < 3600 || c.RetirementMinOverlapSeconds > 31536000 {
+		return errors.New("dkim2.retirement_min_overlap_seconds must be between 3600 and 31536000")
+	}
 	return nil
+}
+
+// canonicalEndpoint requires one normalized explicit host-or-IP and port.
+func canonicalEndpoint(value string) (string, error) {
+	if value == "" || strings.TrimSpace(value) != value {
+		return "", errors.New("must be a canonical host or IP with explicit port")
+	}
+	host, portText, err := net.SplitHostPort(value)
+	if err != nil || host == "" || portText == "" {
+		return "", errors.New("must be a canonical host or IP with explicit port")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 || strconv.Itoa(port) != portText {
+		return "", errors.New("port must be a canonical integer between 1 and 65535")
+	}
+	if address, addressErr := netip.ParseAddr(host); addressErr == nil {
+		if address.Zone() != "" || address.String() != host {
+			return "", errors.New("IP address must be canonical")
+		}
+		return net.JoinHostPort(address.String(), portText), nil
+	}
+	canonical, err := dkim2model.CanonicalDomain(host)
+	if err != nil || canonical != host {
+		return "", errors.New("host must be a canonical lowercase ASCII name")
+	}
+	return net.JoinHostPort(canonical, portText), nil
 }
 
 // canonicalIdentifier validates the bounded DKIM2 identifier grammar.

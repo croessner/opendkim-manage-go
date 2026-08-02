@@ -34,8 +34,24 @@ type RuntimeConfig struct {
 }
 
 type RunResult struct {
-	AgeMatched *bool
+	AgeMatched      *bool
+	DKIM2Outcome    DKIM2Outcome
+	ReportingFailed bool
 }
+
+// DKIM2Outcome is one closed scheduler-safe native lifecycle result.
+type DKIM2Outcome string
+
+const (
+	DKIM2OutcomeDryRun            DKIM2Outcome = "dry-run"
+	DKIM2OutcomeStaged            DKIM2Outcome = "staged"
+	DKIM2OutcomeActivated         DKIM2Outcome = "activated"
+	DKIM2OutcomeAlreadyActivated  DKIM2Outcome = "already-activated"
+	DKIM2OutcomeIdle              DKIM2Outcome = "idle"
+	DKIM2OutcomeRetired           DKIM2Outcome = "retired"
+	DKIM2OutcomeAlreadyRetired    DKIM2Outcome = "already-retired"
+	DKIM2OutcomeRetirementPending DKIM2Outcome = "retirement-pending"
+)
 
 type Manager struct {
 	cfg               *config.Config

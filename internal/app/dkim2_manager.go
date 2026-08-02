@@ -24,21 +24,67 @@ import (
 	"github.com/croessner/opendkim-manage-go/internal/types"
 )
 
+type lifecycleMutationFence struct{ token chan struct{} }
+
+func newLifecycleMutationFence() *lifecycleMutationFence {
+	fence := &lifecycleMutationFence{token: make(chan struct{}, 1)}
+	fence.token <- struct{}{}
+	return fence
+}
+
+func (f *lifecycleMutationFence) acquire(ctx context.Context) (func(), error) {
+	if f == nil || ctx == nil {
+		return nil, errors.New("DKIM2 lifecycle mutation fence is unavailable")
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-f.token:
+		return func() { f.token <- struct{}{} }, nil
+	}
+}
+
+var dkim2LifecycleMutations = newLifecycleMutationFence()
+
 type dkim2DNSUpdater interface {
 	AddDKIMKey(zone, selectorName, content, subdomain string) error
 }
 
+type dkim2RotationPublisher interface {
+	PublishIfAbsent(context.Context, string, dnsupdate.ExpectedTXT) (dnsupdate.PublishResult, error)
+}
+
+type dkim2RotationProof interface {
+	ProveAll(context.Context, []dnsupdate.ExpectedTXT) error
+}
+
+type dkim2PresenceObserver interface {
+	ObserveChannels(context.Context, dnsupdate.ExpectedTXT) (dnsupdate.PresenceObservation, error)
+}
+
+type dkim2RotationRetirer interface {
+	Observe(context.Context, dnsupdate.ExpectedTXT) (dnsupdate.PresenceState, error)
+	DeleteExact(context.Context, string, dnsupdate.ExpectedTXT) (dnsupdate.DeleteResult, error)
+}
+
 // DKIM2Manager owns one invocation of the immutable native DKIM2 mode.
 type DKIM2Manager struct {
-	cfg        *config.Config
-	opts       *cli.Options
-	repository dkim2store.GenerationRepository
-	ldap       *ldapstore.Client
-	dns        dkim2DNSUpdater
-	lookupTXT  func(string) ([]string, error)
-	random     io.Reader
-	in         io.Reader
-	out        io.Writer
+	cfg                  *config.Config
+	opts                 *cli.Options
+	repository           dkim2store.GenerationRepository
+	rotationRepository   dkim2store.RotationRepository
+	ldap                 *ldapstore.Client
+	dns                  dkim2DNSUpdater
+	lookupTXT            func(string) ([]string, error)
+	random               io.Reader
+	in                   io.Reader
+	out                  io.Writer
+	newRotationPublisher func(*config.Config) (dkim2RotationPublisher, error)
+	newRotationProof     func(*config.Config) (dkim2RotationProof, error)
+	newPresenceObserver  func(*config.Config) (dkim2PresenceObserver, error)
+	newRotationRetirer   func(*config.Config) (dkim2RotationRetirer, error)
+	now                  func() time.Time
+	newLifecycleContext  func(time.Duration) (context.Context, context.CancelFunc)
 }
 
 // NewDKIM2Manager constructs only the native DKIM2 repository and its optional DNS writer.
@@ -62,8 +108,24 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 		return nil, err
 	}
 	manager := &DKIM2Manager{
-		cfg: cfg, opts: opts, repository: repository, ldap: ldapClient,
+		cfg: cfg, opts: opts, repository: repository, rotationRepository: repository, ldap: ldapClient,
 		lookupTXT: net.LookupTXT, random: rand.Reader, in: os.Stdin, out: os.Stdout,
+		newRotationPublisher: func(cfg *config.Config) (dkim2RotationPublisher, error) {
+			return dnsupdate.NewRotationPublisher(cfg)
+		},
+		newRotationProof: func(cfg *config.Config) (dkim2RotationProof, error) {
+			return dnsupdate.NewProofClient(cfg)
+		},
+		newPresenceObserver: func(cfg *config.Config) (dkim2PresenceObserver, error) {
+			return dnsupdate.NewPresenceClient(cfg)
+		},
+		newRotationRetirer: func(cfg *config.Config) (dkim2RotationRetirer, error) {
+			return dnsupdate.NewRotationRetirer(cfg)
+		},
+		now: func() time.Time { return time.Now().UTC() },
+		newLifecycleContext: func(timeout time.Duration) (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), timeout)
+		},
 	}
 	if opts.UpdateDNS {
 		if !cfg.AuthenticatedDNSUpdatesConfigured() {
@@ -71,7 +133,8 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 			return nil, errors.New("DKIM2 DNS update requires a nameserver, positive TTL, and complete TSIG configuration")
 		}
 	}
-	if opts.UpdateDNS && !opts.DryRun {
+	deferredLifecycleDNS := opts.Rotate || opts.Auto || opts.RetireGenerationSet || opts.RollbackFromGenerationSet
+	if opts.UpdateDNS && !opts.DryRun && !deferredLifecycleDNS {
 		manager.dns, err = dnsupdate.New(cfg)
 		if err != nil {
 			_ = ldapClient.Close()
@@ -97,23 +160,66 @@ func (m *DKIM2Manager) Run() (*RunResult, error) {
 	if err := m.validateCommand(); err != nil {
 		return nil, err
 	}
-	if (m.opts.Create || m.opts.Active) && !m.opts.DryRun {
-		if err := m.authorizeWrite(); err != nil {
+	lifecycle := m.opts.Rotate || m.opts.Auto || m.opts.RetireGenerationSet || m.opts.RollbackFromGenerationSet || m.opts.Observe
+	ctx := context.Background()
+	cancel := func() {}
+	if lifecycle {
+		timeout := time.Duration(m.cfg.DKIM2.RunTimeoutSeconds) * time.Second
+		if timeout <= 0 {
+			return nil, errors.New("DKIM2 lifecycle deadline is invalid")
+		}
+		if m.newLifecycleContext != nil {
+			ctx, cancel = m.newLifecycleContext(timeout)
+		} else {
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		if ctx == nil || cancel == nil {
+			return nil, errors.New("DKIM2 lifecycle deadline is unavailable")
+		}
+	}
+	defer cancel()
+	ctx = dkim2store.WithLifecycleWorkBudget(ctx, m.cfg.DKIM2.HistoryLimit)
+	if (m.opts.Create || m.opts.Active || m.opts.Rotate || m.opts.Auto ||
+		m.opts.RetireGenerationSet || m.opts.RollbackFromGenerationSet) && !m.opts.DryRun {
+		if err := m.authorizeWrite(ctx); err != nil {
 			return nil, err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.New("DKIM2 lifecycle deadline expired")
+	}
 	result := &RunResult{}
+	if m.opts.Rotate || m.opts.Auto || m.opts.RetireGenerationSet || m.opts.RollbackFromGenerationSet {
+		release, err := dkim2LifecycleMutations.acquire(ctx)
+		if err != nil {
+			return nil, errors.New("DKIM2 lifecycle deadline expired while waiting for the mutation fence")
+		}
+		defer release()
+	}
 	switch {
 	case m.opts.List:
-		return result, m.list(context.Background())
+		return result, m.list(ctx)
 	case m.opts.Create:
-		return result, m.create(context.Background())
+		return result, m.create(ctx)
 	case m.opts.Active:
-		return result, m.activate(context.Background())
+		return result, m.activate(ctx)
 	case m.opts.TestKey:
-		return result, m.testKeys(context.Background())
+		return result, m.testKeys(ctx)
 	case m.opts.PrintDNS:
-		return result, m.printDNS(context.Background())
+		return result, m.printDNS(ctx)
+	case m.opts.Observe:
+		return result, m.observeLifecycle(ctx, result)
+	case m.opts.Rotate, m.opts.Auto, m.opts.RetireGenerationSet, m.opts.RollbackFromGenerationSet:
+		switch {
+		case m.opts.Rotate:
+			return result, m.rotate(ctx, result)
+		case m.opts.Auto:
+			return result, m.autoRotate(ctx, result)
+		case m.opts.RetireGenerationSet:
+			return result, m.retire(ctx, result)
+		default:
+			return result, m.forwardRollback(ctx, result)
+		}
 	default:
 		return result, nil
 	}
@@ -123,7 +229,7 @@ func (m *DKIM2Manager) Run() (*RunResult, error) {
 func (m *DKIM2Manager) validateCommand() error {
 	o := m.opts
 	if o.Delete || o.ForceDelete || o.Age != nil || o.AddMissing || o.AddNew ||
-		o.Rotate || o.Auto || o.MaxInitial != 0 || o.MaxRevokedSet ||
+		o.MaxInitial != 0 || o.MaxRevokedSet ||
 		o.ExpireAfter != nil || o.DeleteDelay != nil {
 		return errors.New("requested legacy lifecycle operation is unsupported in dkim2 mode")
 	}
@@ -133,8 +239,8 @@ func (m *DKIM2Manager) validateCommand() error {
 	if o.AcceptAnyDomain {
 		return errors.New("--accept-any-domain is unsupported in dkim2 mode")
 	}
-	if o.UpdateDNS && !o.Create {
-		return errors.New("--update-dns is supported only with --create in dkim2 mode")
+	if o.UpdateDNS && !o.Create && !o.Rotate && !o.Auto && !o.RetireGenerationSet && !o.RollbackFromGenerationSet {
+		return errors.New("--update-dns requires a DKIM2 DNS lifecycle command")
 	}
 	domains, err := canonicalUnique(o.Domains, dkim2model.CanonicalDomain)
 	if err != nil {
@@ -164,18 +270,46 @@ func (m *DKIM2Manager) validateCommand() error {
 			}
 		}
 	}
+	if o.Rotate {
+		if len(domains) != 1 || len(selectors) != 0 || !o.UpdateDNS || o.ForceActive || o.AcceptAnyDomain {
+			return errors.New("DKIM2 rotation requires one --domain and --update-dns and forbids selector and force scope")
+		}
+	}
+	if o.Observe {
+		if len(domains) != 1 || len(selectors) != 0 || o.UpdateDNS || o.ResumeGenerationSet || o.PrepareOnly || o.KeyType != "" {
+			return errors.New("DKIM2 observation requires one --domain and forbids DNS mutation and continuation controls")
+		}
+	}
+	if o.Auto {
+		if len(domains) != 0 || len(selectors) != 0 || !o.UpdateDNS || !m.cfg.DKIM2.RotationEnabled || o.KeyType != "" {
+			return errors.New("DKIM2 automatic rotation requires rotation_enabled and --update-dns without explicit scope")
+		}
+	}
+	if o.RetireGenerationSet {
+		if len(domains) != 1 || len(selectors) != 0 || !o.UpdateDNS || !o.AllRetirementAttestations() || o.KeyType != "" {
+			return errors.New("DKIM2 retirement requires one domain, DNS update, and every operator attestation")
+		}
+	}
+	if o.RollbackFromGenerationSet {
+		if len(domains) != 1 || len(selectors) != 0 || !o.UpdateDNS || o.KeyType != "" {
+			return errors.New("DKIM2 forward rollback requires one domain and --update-dns")
+		}
+	}
 	return nil
 }
 
 // authorizeWrite requires an explicit noninteractive grant or an affirmative prompt.
-func (m *DKIM2Manager) authorizeWrite() error {
+func (m *DKIM2Manager) authorizeWrite(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return errors.New("DKIM2 lifecycle deadline expired before authorization")
+	}
 	if m.opts.Yes {
 		return nil
 	}
 	if !m.opts.Interactive {
 		return errConfirmationRequired
 	}
-	if _, err := fmt.Fprint(m.out, "Authorize this run to publish a complete DKIM2 LDAP generation? (y/N): "); err != nil {
+	if _, err := fmt.Fprint(m.out, "Authorize this DKIM2 lifecycle mutation? (y/N): "); err != nil {
 		return fmt.Errorf("write confirmation prompt: %w", err)
 	}
 	line, err := bufio.NewReader(m.in).ReadString('\n')
@@ -183,6 +317,9 @@ func (m *DKIM2Manager) authorizeWrite() error {
 		return fmt.Errorf("read confirmation: %w", err)
 	}
 	answer := strings.ToLower(strings.TrimSpace(line))
+	if err := ctx.Err(); err != nil {
+		return errors.New("DKIM2 lifecycle deadline expired during authorization")
+	}
 	if answer != "y" && answer != "yes" {
 		return errConfirmationRequired
 	}
@@ -236,6 +373,10 @@ func (m *DKIM2Manager) create(ctx context.Context) error {
 	}
 	if current != nil {
 		defer func() { _ = current.Close() }()
+	}
+	history, err := m.loadMutationHistory(ctx, current)
+	if err != nil {
+		return err
 	}
 	expected := uint64(0)
 	if current != nil {
@@ -304,7 +445,7 @@ func (m *DKIM2Manager) create(ctx context.Context) error {
 			if len(m.opts.Selectors) > 0 {
 				selectorName, err = exactCanonical(m.opts.Selectors[index], dkim2model.CanonicalSelector)
 			} else {
-				selectorName, err = m.uniqueSelector(usedSelectors)
+				selectorName, err = m.uniqueSelector(usedSelectors, history)
 			}
 			if err != nil {
 				closeMaterials(materials)
@@ -314,8 +455,13 @@ func (m *DKIM2Manager) create(ctx context.Context) error {
 				closeMaterials(materials)
 				return fmt.Errorf("DKIM2 selector %q already exists", selectorName)
 			}
+			historicalSelector, historyErr := history.SelectorUsed(selectorName)
+			if historyErr != nil || historicalSelector {
+				closeMaterials(materials)
+				return errors.New("DKIM2 selector conflicts with retained history")
+			}
 			usedSelectors[selectorName] = struct{}{}
-			handleID, identifierErr := m.uniqueIdentifier("key", usedIDs)
+			handleID, identifierErr := m.uniqueHistoricalIdentifier("key", usedIDs, history.HandleUsed)
 			if identifierErr != nil {
 				closeMaterials(materials)
 				return identifierErr
@@ -409,6 +555,9 @@ func (m *DKIM2Manager) activate(ctx context.Context) error {
 		return errors.New("DKIM2 dataset is empty")
 	}
 	defer func() { _ = current.Close() }()
+	if _, err := m.loadMutationHistory(ctx, current); err != nil {
+		return err
+	}
 	credential, found := current.CredentialByDomainSelector(domain, selectorName)
 	if !found {
 		return errors.New("exact DKIM2 credential was not found")
@@ -593,17 +742,104 @@ func (m *DKIM2Manager) uniqueIdentifier(prefix string, used map[string]struct{})
 	return "", errors.New("could not allocate a unique DKIM2 identifier")
 }
 
-func (m *DKIM2Manager) uniqueSelector(used map[string]struct{}) (string, error) {
+func (m *DKIM2Manager) uniqueSelector(used map[string]struct{}, history dkim2store.RetainedHistory) (string, error) {
 	for range 16 {
 		candidate, err := m.uniqueIdentifier("dkim2", map[string]struct{}{})
 		if err != nil {
 			return "", err
 		}
-		if _, exists := used[candidate]; !exists {
+		historical, historyErr := history.SelectorUsed(candidate)
+		if historyErr != nil {
+			return "", historyErr
+		}
+		if _, exists := used[candidate]; !exists && !historical {
 			return candidate, nil
 		}
 	}
 	return "", errors.New("could not allocate a unique DKIM2 selector")
+}
+
+func (m *DKIM2Manager) uniqueHistoricalIdentifier(prefix string, used map[string]struct{}, historical func(string) (bool, error)) (string, error) {
+	for range 16 {
+		candidate, err := m.uniqueIdentifier(prefix, map[string]struct{}{})
+		if err != nil {
+			return "", err
+		}
+		seen, historyErr := historical(candidate)
+		if historyErr != nil {
+			return "", historyErr
+		}
+		if _, exists := used[candidate]; !exists && !seen {
+			used[candidate] = struct{}{}
+			return candidate, nil
+		}
+	}
+	return "", errors.New("could not allocate a unique historical DKIM2 identifier")
+}
+
+func (m *DKIM2Manager) loadMutationHistory(ctx context.Context, current *dkim2model.Generation) (dkim2store.RetainedHistory, error) {
+	history, err := m.repository.LoadRetainedHistory(ctx, m.cfg.DKIM2.HistoryLimit)
+	if err != nil {
+		return dkim2store.RetainedHistory{}, err
+	}
+	if !history.Complete {
+		return dkim2store.RetainedHistory{}, errors.New("DKIM2 retained history is incomplete")
+	}
+	if current == nil {
+		if len(history.Roots) != 0 {
+			return dkim2store.RetainedHistory{}, errors.New("DKIM2 empty dataset has retained generation roots")
+		}
+		return history, nil
+	}
+	if !retainedRootsContiguous(history.Roots) {
+		return dkim2store.RetainedHistory{}, errors.New("DKIM2 retained history roots are not contiguous")
+	}
+	currentFound := false
+	for _, root := range history.Roots {
+		if root.Number > current.Number() {
+			return dkim2store.RetainedHistory{}, errors.New("DKIM2 non-current higher generation requires repair")
+		}
+		if root.State != dkim2model.DatasetStateCommitted {
+			return dkim2store.RetainedHistory{}, errors.New("DKIM2 non-committed retained generation requires repair")
+		}
+		if root.Number == current.Number() {
+			currentFound = true
+		}
+	}
+	if !currentFound {
+		return dkim2store.RetainedHistory{}, errors.New("DKIM2 current generation is absent from retained history")
+	}
+	return history, nil
+}
+
+// retainedRootsContiguous validates an order-independent complete 1..maximum root set.
+func retainedRootsContiguous(roots []dkim2store.GenerationRoot) bool {
+	if len(roots) == 0 {
+		return false
+	}
+	seen := make(map[uint64]struct{}, len(roots))
+	maximum := uint64(0)
+	for _, root := range roots {
+		if root.Number == 0 {
+			return false
+		}
+		if _, duplicate := seen[root.Number]; duplicate {
+			return false
+		}
+		seen[root.Number] = struct{}{}
+		if root.Number > maximum {
+			maximum = root.Number
+		}
+	}
+	if maximum != uint64(len(roots)) {
+		return false
+	}
+	for number := uint64(1); number <= maximum; number++ {
+		if _, found := seen[number]; !found {
+			return false
+		}
+	}
+	return true
 }
 
 func canonicalUnique(values []string, canonicalize func(string) (string, error)) ([]string, error) {

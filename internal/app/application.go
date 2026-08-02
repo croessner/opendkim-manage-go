@@ -45,6 +45,9 @@ func (f applicationFactory) newApplication(cfg *config.Config, opts *cli.Options
 	}
 
 	mode := opts.EffectiveMode(cfg.Global.Mode)
+	if err := opts.ValidateForMode(mode); err != nil {
+		return nil, err
+	}
 	if err := cfg.ValidateForMode(mode); err != nil {
 		return nil, err
 	}

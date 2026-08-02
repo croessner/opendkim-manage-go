@@ -1,0 +1,231 @@
+# Native DKIM2 Rotation
+
+Status: source-code implementation contract. This document does not claim a
+deployment, runtime reload, queue drain, mail-flow verification, backup, or
+external signature switchover.
+
+This specification extends only `mode: dkim2`. The OpenDKIM mode, its default
+selection, mutable selector lifecycle, and command semantics remain unchanged.
+The native key model is compatible with `dkim2-datasource-v2`; the rotation
+contract is pinned to DKIM2 commit
+`75e2bb2ba6a71fc4f017201da021b5509acbfb4f`, including its empty-v2 layout,
+native LDAP key custody, immutable generation trees, exact readback, and
+critical publication fences. The obsolete v1 pre-created-current layout is not
+accepted.
+
+## Security Invariants
+
+- The current committed generation remains active until every new DNS record
+  passes fresh authoritative and recursive proof.
+- A candidate is a complete all-domain snapshot. Rotation replaces every
+  credential, handle, and key-material record in exactly one active binding;
+  unrelated records and all profile and policy facts remain logically equal.
+- Selectors and handles are allocated with bounded cryptographic randomness
+  and may not collide with any retained generation.
+- Private PKCS#8 material is stored only in an unreachable LDAP candidate. It
+  is never written to a local plan, command line, log, error, metric, report,
+  or generic formatter.
+- Incomplete history, ambiguous bindings, unexpected higher roots, arithmetic
+  exhaustion, algorithm-set changes, uncertain LDAP results, and DNS conflicts
+  fail closed before the next write.
+- `cn=current` moves only forward under a critical exact-current assertion.
+  A staging root becomes committed only under a critical exact-staging
+  assertion. Committed generation contents are never edited.
+- Automatic rotation handles at most one binding and never retires DNS or
+  deletes LDAP history. Retirement is a separate explicit operation.
+
+## Configuration
+
+The rotation fields and defaults are:
+
+```yaml
+dkim2:
+  rotation_enabled: false
+  rotate_after_days: 365
+  history_limit: 1024
+  max_clock_skew_seconds: 300
+  run_timeout_seconds: 900
+  proof_poll_interval_seconds: 5
+  proof_max_attempts: 60
+  dns_query_timeout_seconds: 5
+  retirement_min_overlap_seconds: 604800
+dns:
+  primary_nameserver: "127.0.0.1:53"
+  recursive_nameserver: "127.0.0.2:53"
+```
+
+The integer ranges are respectively `1..36500`, `2..4096`, `0..3600`,
+`30..86400`, `1..300`, `1..3600`, `1..30`, and `3600..31536000`.
+Both DNS endpoints require a canonical host or IP plus explicit port and must
+be distinct after normalization.
+
+One top-level run context covers the complete lifecycle command. Before every
+LDAP search, add, or modify, cancellation is checked again. A shared cumulative
+work frame derived from `history_limit` bounds request count, response and
+request bytes, and retained-root visits across all repeated readback and
+recovery phases; crossing any bound fails closed instead of starting another
+LDAP operation.
+
+Automatic eligibility uses the earliest retained root `createTimestamp` for
+the exact selector, algorithm, public-SPKI, and handle lineage of every current
+credential. Only canonical UTC generalized time (`YYYYmmddHHMMSSZ`) is valid.
+Missing, duplicate, truncated, ambiguous, or excessively future-dated evidence
+makes eligibility unknown. `modifyTimestamp` and profile validity are not key
+age.
+
+## Commands And Authorization
+
+Manual rotation uses:
+
+```text
+--mode dkim2 --rotate --domain example.test --update-dns
+```
+
+It accepts exactly one canonical domain, no selector or wildcard scope, no
+CNAME behavior, and no force option. A `--keytype` override is valid only when
+it exactly equals the binding's current RSA, Ed25519, or dual algorithm set.
+`--prepare-only` stages and exactly reads back the candidate, then stops before
+TSIG access or DNS activity. `--resume-generation <G>` accepts one canonical
+nonzero decimal and resumes only the protected stored candidate.
+
+Rotation, automatic rotation, retirement, and forward rollback are mutually
+exclusive. Every production mutation requires `--yes` or affirmative
+interaction before random-key generation, TSIG loading, or a write.
+
+`--auto --update-dns` additionally requires `rotation_enabled: true` and no
+explicit domain, selector, or lifecycle subcommand. It first resumes the one
+exact pending candidate if present. Resume, automatic selection, and
+observation carry the full tenant, domain, and profile-use identity; a domain
+alone is never a binding. Otherwise it chooses at most one due binding
+deterministically from trustworthy lineage evidence and runs the same
+prepare, publish, prove, commit, and pointer-switch path as manual rotation.
+It never retires DNS records and never deletes LDAP history.
+
+## Prepare, Publish, Prove, And Activate
+
+The normal candidate number is exactly current plus one, and current must be
+the maximum retained root. The empty dataset may allocate only generation 1.
+At most one higher non-current candidate may exist. A partial, malformed, or
+additional candidate requires explicit repair.
+
+The repository stages the complete candidate and reads it back without moving
+the current pointer. New DNS owners are created only with an RFC 2136
+`NXRRSET` prerequisite. An exact existing value is resumable; a different,
+multiple, malformed, revoked, CNAME, or uncertain value is a conflict.
+
+Immediately before activation, the authoritative endpoint is queried directly
+over TCP with recursion disabled and must answer authoritatively. The recursive
+endpoint is queried directly over TCP with recursion desired. Both must return
+exactly one logical TXT RR with the exact owner, algorithm, and public-key
+bytes, without CNAME, referral, truncation, or error RCODE. Polling and every
+exchange are bounded by the configured attempt, interval, query, and run
+deadlines.
+
+After proof, the root is committed under its critical staging assertion and
+`cn=current` is advanced under the critical expected-current assertion. Lost
+responses are classified by fresh authoritative readback; they are never
+blindly retried. Resume reuses the candidate's exact LDAP key material and
+never generates replacement keys.
+
+Dry-run validates and builds an in-memory candidate but performs no LDAP or
+DNS write and does not open the TSIG key. Except for a protected
+`--resume-generation`, a later apply creates new random keys; dry-run output is
+not persistent recovery state.
+
+## Observation, Retirement, And Forward Rollback
+
+Observation derives state from bounded LDAP and DNS reads; no local journal is
+authoritative. Its closed state vocabulary distinguishes:
+
+- `idle`: one complete current generation and no higher candidate;
+- `staged`: one complete unreachable staging candidate;
+- `dns-pending`: at least one required candidate RRset is authoritatively
+  absent or not yet recursively proven;
+- `dns-conflict`: a required owner has different, multiple, malformed,
+  revoked, aliased, or otherwise ambiguous DNS data;
+- `committed-unreachable`: the candidate root is committed but `cn=current`
+  still names its exact predecessor;
+- `activated`: the candidate is the exact current generation;
+- `observing`: the new generation is current while predecessor DNS remains
+  available or recursive caches still retain retired values;
+- `retire-eligible`: the exact current-pointer activation clock proves the
+  configured minimum overlap and all other static retirement prerequisites
+  are unambiguous.
+
+Partial/malformed staging, uncertain commit or activation, ambiguous history,
+and untrusted clocks remain closed error states, not success variants.
+Observation reports only bounded generation, phase, domain, selector, and
+algorithm facts. It does not expose handles, DNs, private or public DER, DNS
+key payloads, fingerprints, digests, endpoints, or secret material.
+
+Read-only observation is invoked for exactly one binding with:
+
+```text
+--mode dkim2 --observe --domain example.test
+```
+
+Retirement names one retained predecessor and is invoked only with:
+
+```text
+--mode dkim2 --retire-generation <G-old> --domain example.test --update-dns \
+  --attest-runtime-reload --attest-readiness --attest-queues \
+  --attest-emitted-signatures --attest-external-verification \
+  --attest-backup --attest-rollback-authority --yes
+```
+
+All seven attestation flags are mandatory booleans and are legal only with
+`--retire-generation`; interactive confirmation does not replace one. They
+assert that runtime reload, repeated readiness, queue, emitted-signature,
+external-verification, backup, and rollback-authority checks were completed
+outside this program. The program does not perform or infer those checks.
+
+The current pointer's canonical operational `modifyTimestamp` is overlap
+evidence only when read atomically with the exact current generation. Missing,
+duplicate, malformed, fractional, offset, or excessively future-dated evidence
+fails closed; `modifyTimestamp` is not key age. Every old TXT deletion has an
+exact value prerequisite. Partial or response-uncertain deletion continues
+only through the same command plus `--resume-retirement`, after all
+attestations and preconditions are revalidated and authoritative state is read
+back. An absent old record is success-so-far and is never recreated. This is
+cardinality-neutral for RSA-only, Ed25519-only, and dual bindings. Recursive
+cache retention is an observing condition, not a reason to repeat deletion.
+Automatic retirement and LDAP deletion are forbidden.
+
+Lifecycle mutations are mutually exclusive within one process. Retirement
+also reloads complete contiguous history and the exact current activation
+facts immediately before every DNS delete. Any staging or committed successor
+blocks retirement. These checks deliberately do not claim cross-host atomicity
+between LDAP and DNS: operators must preserve the documented single-writer
+authority, and a concurrently appearing successor causes the observable
+retirement path to fail closed as soon as it is visible.
+
+Rollback never moves the pointer backward. It rebases an explicitly selected
+retained committed generation, including its protected key material, into a
+new generation higher than every retained root and repeats the normal DNS,
+staging, proof, commit, and pointer fences. Continuation names the exact new
+candidate with `--resume-generation`:
+
+```text
+--mode dkim2 --rollback-from-generation <G-source> \
+  --domain example.test --update-dns --yes
+```
+
+After staging, explicit continuation adds `--resume-generation <G-new>` to the
+same rollback command. The stored candidate must be the exact rebase of the
+named source. Partial DNS, a lost DNS response, an uncertain root commit, an
+uncertain pointer switch, and already-current success are classified through
+fresh readback; transport errors are never blindly retried and rollback never
+triggers automatically.
+
+## Verification Boundary
+
+The source verification contract covers exact algorithm preservation,
+whole-binding replacement, unrelated-domain preservation, clone isolation,
+complete retained-history prerequisites, canonical lineage and activation
+clocks, deterministic batch-one automation, strict CLI/configuration
+isolation, LDAP staging and crash reconciliation, NXRRSET publication,
+dual-channel proof, explicit value-aware retirement, forward-only rollback,
+dry-run no-write behavior, and protected formatting. Integration fixtures must
+remain synthetic and isolated from production LDAP and DNS. Passing source
+tests proves these code contracts; it does not prove deployment, runtime,
+mail-flow, backup, or external operational state.

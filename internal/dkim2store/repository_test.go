@@ -285,6 +285,99 @@ func TestLDAPRepositoryCancellationDuringReadbackStopsBeforeCommit(t *testing.T)
 	}
 }
 
+func TestLDAPRepositoryChecksCancellationBetweenEveryOperationClass(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	repository := mustRepository(t, executor)
+	first := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+	defer func() { _ = first.Close() }()
+	if err := repository.Publish(context.Background(), 0, first); err != nil {
+		t.Fatal(err)
+	}
+	second := successorGeneration(t, first, 2)
+	defer func() { _ = second.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	baselineAdds := len(executor.adds)
+	executor.afterAdd = cancel
+	if _, err := repository.Stage(ctx, second, 8); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Stage() cancellation = %v", err)
+	}
+	if len(executor.adds) != baselineAdds+1 {
+		t.Fatalf("cancellation allowed multiple adds: %d", len(executor.adds)-baselineAdds)
+	}
+	executor.afterAdd = nil
+
+	ctx, cancel = context.WithCancel(context.Background())
+	executor.afterModify = cancel
+	baselineModifies := len(executor.modifies)
+	if err := repository.commitGeneration(ctx, 2); !errors.Is(err, context.Canceled) {
+		t.Fatalf("commit cancellation = %v", err)
+	}
+	if len(executor.modifies) != baselineModifies+1 {
+		t.Fatalf("cancellation allowed another modify: %d", len(executor.modifies)-baselineModifies)
+	}
+}
+
+func TestLDAPRepositoryCumulativeWorkBudgetBoundsRequestsBytesAndHistory(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	repository := mustRepository(t, executor)
+	first := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+	defer func() { _ = first.Close() }()
+	if err := repository.Publish(context.Background(), 0, first); err != nil {
+		t.Fatal(err)
+	}
+
+	requestBudget := &ldapWorkBudget{maximumRequests: 2, maximumBytes: maximumDatasetBytes, maximumHistories: 8}
+	ctx := context.WithValue(context.Background(), ldapWorkBudgetKey{}, requestBudget)
+	searchStart := len(executor.searches)
+	if _, err := repository.LoadCurrent(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("request budget error = %v", err)
+	}
+	if got := len(executor.searches) - searchStart; got != 2 {
+		t.Fatalf("request budget executed %d searches, want 2", got)
+	}
+
+	byteBudget := &ldapWorkBudget{maximumRequests: 8, maximumBytes: 1, maximumHistories: 8}
+	ctx = context.WithValue(context.Background(), ldapWorkBudgetKey{}, byteBudget)
+	searchStart = len(executor.searches)
+	if _, err := repository.LoadCurrent(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("byte budget error = %v", err)
+	}
+	if got := len(executor.searches) - searchStart; got != 1 {
+		t.Fatalf("byte budget executed %d searches, want 1", got)
+	}
+
+	historyBudget := &ldapWorkBudget{maximumRequests: 64, maximumBytes: maximumDatasetBytes, maximumHistories: 0}
+	ctx = context.WithValue(context.Background(), ldapWorkBudgetKey{}, historyBudget)
+	searchStart = len(executor.searches)
+	if _, err := repository.LoadRetainedHistory(ctx, 8); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("history budget error = %v", err)
+	}
+	if got := len(executor.searches) - searchStart; got != 1 {
+		t.Fatalf("history budget executed %d searches, want 1", got)
+	}
+}
+
+func TestLDAPRepositoryPublicProjectionsPreservePreCanceledContext(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	repository := mustRepository(t, executor)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := repository.LoadGenerationCreatedAt(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadGenerationCreatedAt() cancellation = %v", err)
+	}
+	if _, err := repository.LoadCurrentActivation(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadCurrentActivation() cancellation = %v", err)
+	}
+	if _, err := repository.LoadRetainedHistory(ctx, 8); !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadRetainedHistory() cancellation = %v", err)
+	}
+	if len(executor.searches) != 0 || len(executor.adds) != 0 || len(executor.modifies) != 0 {
+		t.Fatal("pre-canceled public projection reached the LDAP executor")
+	}
+}
+
 func TestLDAPRepositoryPreservesCompleteMultiDomainSuccessor(t *testing.T) {
 	executor := newFakeExecutor(testBaseDN)
 	repository := mustRepository(t, executor)
@@ -407,6 +500,141 @@ func TestLDAPRepositoryFixedDNAndFilterInputs(t *testing.T) {
 	}
 }
 
+func TestLDAPRepositoryLoadsCompleteRetainedHistoryWithoutPrivateProjection(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	repository := mustRepository(t, executor)
+	candidate := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+	defer func() { _ = candidate.Close() }()
+	if err := repository.Publish(context.Background(), 0, candidate); err != nil {
+		t.Fatal(err)
+	}
+	searchStart := len(executor.searches)
+	history, err := repository.LoadRetainedHistory(context.Background(), 8)
+	if err != nil {
+		t.Fatalf("LoadRetainedHistory() error = %v", err)
+	}
+	if !history.Complete || len(history.Roots) != 1 || history.Roots[0].Number != 1 ||
+		history.Roots[0].State != dkim2model.DatasetStateCommitted {
+		t.Fatalf("unexpected retained history: %v", history)
+	}
+	if used, err := history.SelectorUsed("selector-1"); err != nil || !used {
+		t.Fatalf("selector occurrence = %t, %v", used, err)
+	}
+	if used, err := history.HandleUsed("handle-1"); err != nil || !used {
+		t.Fatalf("handle occurrence = %t, %v", used, err)
+	}
+	for _, request := range executor.searches[searchStart:] {
+		for _, attribute := range request.Attributes {
+			if strings.EqualFold(attribute, attributePrivatePKCS8) || attribute == "*" || attribute == "+" {
+				t.Fatalf("history requested protected or broad attribute %q", attribute)
+			}
+		}
+	}
+}
+
+func TestLDAPRepositoryHistoryLimitIsExplicitlyIncomplete(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	for _, generation := range []uint64{1, 2} {
+		executor.put(metadataEntry(
+			attributeGeneration+"="+fmt.Sprint(generation)+",ou=generations,"+testBaseDN,
+			generation, datasetStateCommitted,
+		))
+	}
+	history, err := mustRepository(t, executor).LoadRetainedHistory(context.Background(), 2)
+	if err != nil {
+		t.Fatalf("LoadRetainedHistory() error = %v", err)
+	}
+	if history.Complete {
+		t.Fatal("history reaching the configured root limit was reported complete")
+	}
+	if _, err := history.SelectorUsed("selector"); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("incomplete history lookup error = %v", err)
+	}
+}
+
+func TestLDAPRepositoryHistoryRejectsMalformedAndReferralResults(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*ldap.SearchRequest, *ldap.SearchResult) error
+	}{
+		{name: "malformed root", mutate: func(request *ldap.SearchRequest, result *ldap.SearchResult) error {
+			if sameDN(request.BaseDN, "ou=generations,"+testBaseDN) && len(result.Entries) > 0 {
+				setEntryAttribute(result.Entries[0], attributeDatasetState, []string{"unknown"})
+			}
+			return nil
+		}},
+		{name: "referral", mutate: func(request *ldap.SearchRequest, result *ldap.SearchResult) error {
+			if sameDN(request.BaseDN, "ou=generations,"+testBaseDN) {
+				result.Referrals = []string{"ldaps://referral.example/"}
+			}
+			return nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor := newFakeExecutor(testBaseDN)
+			executor.put(metadataEntry(attributeGeneration+"=1,ou=generations,"+testBaseDN, 1, datasetStateCommitted))
+			executor.mutateSearch = test.mutate
+			if _, err := mustRepository(t, executor).LoadRetainedHistory(context.Background(), 8); err == nil {
+				t.Fatal("malformed or referred history was accepted")
+			}
+		})
+	}
+}
+
+func TestLDAPRepositoryHistoryRejectsDuplicateSelectorsAndHandles(t *testing.T) {
+	for _, test := range []struct {
+		class             string
+		acrossGenerations bool
+	}{
+		{class: classCredential}, {class: classHandle},
+		{class: classCredential, acrossGenerations: true}, {class: classHandle, acrossGenerations: true},
+	} {
+		name := test.class + "-same-generation"
+		if test.acrossGenerations {
+			name = test.class + "-across-generations"
+		}
+		t.Run(name, func(t *testing.T) {
+			executor := newFakeExecutor(testBaseDN)
+			repository := mustRepository(t, executor)
+			candidate := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+			defer func() { _ = candidate.Close() }()
+			if err := repository.Publish(context.Background(), 0, candidate); err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range executor.entries {
+				if !hasObjectClass(entry, test.class) {
+					continue
+				}
+				duplicate := cloneEntry(entry)
+				if test.acrossGenerations {
+					duplicate.DN = strings.Replace(duplicate.DN,
+						attributeGeneration+"=1,ou=generations", attributeGeneration+"=2,ou=generations", 1)
+					setEntryAttribute(duplicate, attributeGeneration, []string{"2"})
+					executor.put(metadataEntry(attributeGeneration+"=2,ou=generations,"+testBaseDN, 2, datasetStateStaging))
+				} else {
+					comma := strings.IndexByte(duplicate.DN, ',')
+					duplicate.DN = "cn=999," + duplicate.DN[comma+1:]
+				}
+				setEntryAttribute(duplicate, attributeCN, []string{"999"})
+				executor.put(duplicate)
+				break
+			}
+			if _, err := repository.LoadRetainedHistory(context.Background(), 8); !errors.Is(err, ErrMalformed) {
+				t.Fatalf("duplicate %s error = %v", test.class, err)
+			}
+		})
+	}
+}
+
+func TestLDAPRepositoryHistoryRejectsPartialHigherOrphanRoot(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	executor.put(metadataEntry(attributeGeneration+"=1,ou=generations,"+testBaseDN, 1, datasetStateCommitted))
+	executor.put(metadataEntry(attributeGeneration+"=3,ou=generations,"+testBaseDN, 3, datasetStateStaging))
+	if _, err := mustRepository(t, executor).LoadRetainedHistory(context.Background(), 8); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("partial higher orphan error = %v", err)
+	}
+}
+
 func mustRepository(t *testing.T, executor *fakeExecutor) *LDAPRepository {
 	t.Helper()
 	repository, err := NewLDAPRepository(executor)
@@ -499,8 +727,14 @@ type fakeExecutor struct {
 	failModifyAt         int
 	addError             error
 	modifyError          error
+	applyModifyOnFailure bool
+	nilModifyResultAt    int
+	referralResultAt     int
 	mutateGenerationRead func(*ldap.SearchResult)
 	lastGenerationResult *ldap.SearchResult
+	mutateSearch         func(*ldap.SearchRequest, *ldap.SearchResult) error
+	afterAdd             func()
+	afterModify          func()
 }
 
 func newFakeExecutor(baseDN string) *fakeExecutor {
@@ -517,13 +751,13 @@ func (f *fakeExecutor) SearchRequest(request *ldap.SearchRequest) (*ldap.SearchR
 		if entry == nil {
 			return nil, ldap.NewError(ldap.LDAPResultNoSuchObject, errors.New("absent"))
 		}
-		result.Entries = []*ldap.Entry{cloneEntry(entry)}
+		result.Entries = []*ldap.Entry{projectEntry(entry, request.Attributes)}
 		return result, nil
 	}
 	for _, entry := range f.entries {
 		if request.Scope == ldap.ScopeSingleLevel && isDirectChild(entry.DN, request.BaseDN) ||
 			request.Scope == ldap.ScopeWholeSubtree && isAtOrBelow(entry.DN, request.BaseDN) {
-			result.Entries = append(result.Entries, cloneEntry(entry))
+			result.Entries = append(result.Entries, projectEntry(entry, request.Attributes))
 		}
 	}
 	if request.Scope == ldap.ScopeWholeSubtree && f.mutateGenerationRead != nil {
@@ -532,7 +766,31 @@ func (f *fakeExecutor) SearchRequest(request *ldap.SearchRequest) (*ldap.SearchR
 	if request.Scope == ldap.ScopeWholeSubtree {
 		f.lastGenerationResult = result
 	}
+	if f.mutateSearch != nil {
+		if err := f.mutateSearch(request, result); err != nil {
+			return nil, err
+		}
+	}
 	return result, nil
+}
+
+func projectEntry(entry *ldap.Entry, attributes []string) *ldap.Entry {
+	result := &ldap.Entry{DN: entry.DN}
+	requested := make(map[string]struct{}, len(attributes))
+	for _, name := range attributes {
+		requested[strings.ToLower(name)] = struct{}{}
+	}
+	for _, attribute := range entry.Attributes {
+		if _, found := requested[strings.ToLower(attribute.Name)]; !found {
+			continue
+		}
+		cloned := &ldap.EntryAttribute{Name: attribute.Name, Values: append([]string(nil), attribute.Values...), ByteValues: make([][]byte, len(attribute.ByteValues))}
+		for index, value := range attribute.ByteValues {
+			cloned.ByteValues[index] = append([]byte(nil), value...)
+		}
+		result.Attributes = append(result.Attributes, cloned)
+	}
+	return result
 }
 
 func (f *fakeExecutor) AddRequest(request *ldap.AddRequest) error {
@@ -549,13 +807,17 @@ func (f *fakeExecutor) AddRequest(request *ldap.AddRequest) error {
 		attributes[attribute.Type] = append([]string(nil), attribute.Vals...)
 	}
 	f.put(ldap.NewEntry(copyRequest.DN, attributes))
+	if f.afterAdd != nil {
+		f.afterAdd()
+	}
 	return nil
 }
 
 func (f *fakeExecutor) ModifyRequest(request *ldap.ModifyRequest) (*ldap.ModifyResult, error) {
 	copyRequest := cloneModifyRequest(request)
 	f.modifies = append(f.modifies, copyRequest)
-	if f.failModifyAt > 0 && len(f.modifies) == f.failModifyAt {
+	failing := f.failModifyAt > 0 && len(f.modifies) == f.failModifyAt
+	if failing && !f.applyModifyOnFailure {
 		return &ldap.ModifyResult{}, f.modifyError
 	}
 	entry := f.entries[dnKey(request.DN)]
@@ -568,10 +830,32 @@ func (f *fakeExecutor) ModifyRequest(request *ldap.ModifyRequest) (*ldap.ModifyR
 		}
 		setEntryAttribute(entry, change.Modification.Type, change.Modification.Vals)
 	}
+	setEntryAttribute(entry, attributeModifyTimestamp, []string{"20250801000000Z"})
+	if f.afterModify != nil {
+		f.afterModify()
+	}
+	if failing {
+		return nil, f.modifyError
+	}
+	if len(f.modifies) == f.nilModifyResultAt {
+		return nil, nil
+	}
+	if len(f.modifies) == f.referralResultAt {
+		return &ldap.ModifyResult{Referral: "ldaps://referral.example/"}, nil
+	}
 	return &ldap.ModifyResult{}, nil
 }
 
-func (f *fakeExecutor) put(entry *ldap.Entry) { f.entries[dnKey(entry.DN)] = cloneEntry(entry) }
+func (f *fakeExecutor) put(entry *ldap.Entry) {
+	copy := cloneEntry(entry)
+	if len(copy.GetEqualFoldAttributeValues(attributeCreateTimestamp)) == 0 {
+		setEntryAttribute(copy, attributeCreateTimestamp, []string{"20250701000000Z"})
+	}
+	if len(copy.GetEqualFoldAttributeValues(attributeModifyTimestamp)) == 0 {
+		setEntryAttribute(copy, attributeModifyTimestamp, []string{"20250701000000Z"})
+	}
+	f.entries[dnKey(entry.DN)] = copy
+}
 
 func metadataEntry(dn string, generation uint64, state string) *ldap.Entry {
 	cn := "current"

@@ -22,6 +22,8 @@ const (
 	attributeCompatibility   = "dkim2Compatibility"
 	attributeFeedbackRouteID = "dkim2FeedbackRouteID"
 	attributePrivatePKCS8    = "dkim2PrivateKeyPKCS8"
+	attributeCreateTimestamp = "createTimestamp"
+	attributeModifyTimestamp = "modifyTimestamp"
 )
 
 const (
