@@ -287,6 +287,34 @@ func TestDKIM2CreatePreservesUnrelatedCurrentProfiles(t *testing.T) {
 	}
 }
 
+func TestDKIM2CreateAddsDeliveryStatusBesideOriginatorForSameDomain(t *testing.T) {
+	current := testGeneration(t, dkim2model.RecordStatusActive, dkim2model.RolloutEnforce)
+	repository := &fakeGenerationRepository{current: current}
+	defer repository.close()
+	manager := testDKIM2Manager(repository, &cli.Options{
+		Create: true, Domains: []string{"example.test"},
+		Selectors: []string{"dsn-selector"}, KeyType: "ed25519", Size: 2048, Yes: true,
+	})
+	manager.cfg.DKIM2.ProfileUse = "delivery_status"
+	if _, err := manager.Run(); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if repository.published == nil || len(repository.published.Profiles()) != 2 ||
+		len(repository.published.Credentials()) != 3 {
+		t.Fatal("delivery-status successor did not preserve the originator binding")
+	}
+	if _, found := exactPolicy(
+		repository.published, "tenant-test", "example.test", dkim2model.ProfileUseDeliveryStatus,
+	); !found {
+		t.Fatal("delivery-status policy was not added")
+	}
+	if _, found := exactPolicy(
+		repository.published, "tenant-test", "example.test", dkim2model.ProfileUseOriginator,
+	); !found {
+		t.Fatal("originator policy was not preserved")
+	}
+}
+
 func TestDKIM2CreatePublishesLDAPBeforeOptionalDNS(t *testing.T) {
 	repository := &fakeGenerationRepository{}
 	defer repository.close()

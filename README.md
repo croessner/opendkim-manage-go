@@ -133,8 +133,8 @@ dkim2:
   feedback_route_id: ""
 ```
 
-`profile_use` accepts `originator` or `ordinary_transit` for native key
-custody; `rollout` accepts `enforce`, `observe`, or `off`; and
+`profile_use` accepts `originator`, `ordinary_transit`, or `delivery_status`
+for native key custody; `rollout` accepts `enforce`, `observe`, or `off`; and
 `compatibility` accepts only `strict`. DKIM2 identifiers are lowercase ASCII,
 start with an alphanumeric character, contain only letters, digits, `.`, `_`,
 or `-`, and are limited to 128 bytes.

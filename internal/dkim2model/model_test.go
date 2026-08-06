@@ -44,6 +44,20 @@ func TestClosedValuesAndCanonicalNames(t *testing.T) {
 	if _, err := ParseAlgorithm("RSA-SHA256"); err == nil {
 		t.Fatal("ParseAlgorithm accepted a noncanonical value")
 	}
+	for _, value := range []string{"originator", "ordinary_transit", "next_domain_transit", "delivery_status"} {
+		use, err := ParseProfileUse(value)
+		if err != nil || !use.Known() {
+			t.Fatalf("ParseProfileUse(%q) = %q, %v", value, use, err)
+		}
+	}
+	for _, value := range []ProfileUse{ProfileUseOriginator, ProfileUseOrdinaryTransit, ProfileUseDeliveryStatus} {
+		if !value.SupportsNativeKeyCustody() {
+			t.Fatalf("profile use %q unexpectedly rejects native key custody", value)
+		}
+	}
+	if ProfileUseNextDomainTransit.SupportsNativeKeyCustody() {
+		t.Fatal("next-domain transit unexpectedly accepts native key custody")
+	}
 }
 
 func TestValidateDomainSelectorRejectsOversizedCompositeOwner(t *testing.T) {

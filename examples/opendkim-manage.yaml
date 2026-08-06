@@ -44,8 +44,8 @@ dkim2:
   # Lowercase ASCII identifier: [a-z0-9][a-z0-9._-]*, at most 128 bytes.
   tenant_id: tenant-example
 
-  # originator|ordinary_transit; the bound native signing bridge does not
-  # project private keys for next_domain_transit.
+  # originator|ordinary_transit|delivery_status; the bound native signing
+  # bridge does not project private keys for next_domain_transit.
   profile_use: originator
 
   # enforce|observe|off

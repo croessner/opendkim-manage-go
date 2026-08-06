@@ -45,8 +45,9 @@ The DKIM2 test matrix must cover:
 
 - exact `opendkim` default, exact `--mode` override, invalid-mode rejection,
   and proof that either dispatch path constructs only its selected manager;
-- closed `tenant_id`, `profile_use`, `rollout`, `compatibility`, and optional
-  `feedback_route_id` validation, including bounded canonical identifiers;
+- closed `tenant_id`, native-key `profile_use` including `delivery_status`,
+  `rollout`, `compatibility`, and optional `feedback_route_id` validation,
+  including bounded canonical identifiers;
 - RSA PKCS#8 private, SPKI LDAP/new-DNS public payloads, and proof compatibility
   with canonical SPKI or PKCS#1 for the same key, plus Ed25519 PKCS#8 private,
   SPKI public, and raw 32-byte DNS public-key separation;

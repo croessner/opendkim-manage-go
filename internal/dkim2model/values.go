@@ -54,6 +54,8 @@ const (
 	ProfileUseOrdinaryTransit ProfileUse = "ordinary_transit"
 	// ProfileUseNextDomainTransit selects next-domain-transit signing.
 	ProfileUseNextDomainTransit ProfileUse = "next_domain_transit"
+	// ProfileUseDeliveryStatus selects delivery-status signing.
+	ProfileUseDeliveryStatus ProfileUse = "delivery_status"
 )
 
 // ParseProfileUse parses one exact closed profile-use value.
@@ -68,13 +70,14 @@ func ParseProfileUse(value string) (ProfileUse, error) {
 // Known reports whether the profile use belongs to the closed vocabulary.
 func (u ProfileUse) Known() bool {
 	return u == ProfileUseOriginator || u == ProfileUseOrdinaryTransit ||
-		u == ProfileUseNextDomainTransit
+		u == ProfileUseNextDomainTransit || u == ProfileUseDeliveryStatus
 }
 
 // SupportsNativeKeyCustody reports whether the bound DKIM2 signing bridge can
 // project private-key material for this administrative profile use.
 func (u ProfileUse) SupportsNativeKeyCustody() bool {
-	return u == ProfileUseOriginator || u == ProfileUseOrdinaryTransit
+	return u == ProfileUseOriginator || u == ProfileUseOrdinaryTransit ||
+		u == ProfileUseDeliveryStatus
 }
 
 // RecordStatus identifies one exact administrative record state.

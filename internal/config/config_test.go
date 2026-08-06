@@ -170,6 +170,27 @@ dkim2:
 	}
 }
 
+func TestLoadDKIM2DeliveryStatusNativeKeyConfiguration(t *testing.T) {
+	path := writeTemp(t, `
+global:
+  mode: dkim2
+ldap:
+  uri: "ldaps://ldap.example.org/ou=dkim,dc=example"
+dkim2:
+  tenant_id: tenant-example
+  profile_use: delivery_status
+  rollout: enforce
+  compatibility: strict
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load delivery-status config: %v", err)
+	}
+	if cfg.DKIM2.ProfileUse != "delivery_status" {
+		t.Fatalf("profile use = %q, want delivery_status", cfg.DKIM2.ProfileUse)
+	}
+}
+
 func TestValidateRejectsUnknownAndEmptyExplicitModes(t *testing.T) {
 	for _, mode := range []types.Mode{"", "DKIM2", " dkim2", "future"} {
 		cfg := defaultConfig()

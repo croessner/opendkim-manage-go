@@ -368,7 +368,7 @@ func (c DKIM2Config) validate() error {
 	}
 	use, err := dkim2model.ParseProfileUse(c.ProfileUse)
 	if err != nil || !use.SupportsNativeKeyCustody() {
-		return errors.New("dkim2.profile_use must be originator or ordinary_transit for native key custody")
+		return errors.New("dkim2.profile_use must be originator, ordinary_transit, or delivery_status for native key custody")
 	}
 	switch c.Rollout {
 	case "enforce", "observe", "off":
