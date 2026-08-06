@@ -700,7 +700,7 @@ func (m *DKIM2Manager) verifyCredential(credential dkim2model.Credential, domain
 	}
 	algorithm, public, err := parseDNSRecord(records[0])
 	if err != nil || algorithm != credential.Algorithm() ||
-		!equalBytes(public, credential.DNSPublicKeyBytes()) {
+		!credential.MatchesDNSPublicKeyBytes(public) {
 		return fmt.Errorf("DKIM2 DNS proof for %s does not match LDAP", name)
 	}
 	return nil
@@ -1060,15 +1060,4 @@ func closeMaterials(materials []*dkim2model.KeyMaterial) {
 	for _, material := range materials {
 		_ = material.Close()
 	}
-}
-
-func equalBytes(left, right []byte) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	difference := byte(0)
-	for index := range left {
-		difference |= left[index] ^ right[index]
-	}
-	return difference == 0
 }

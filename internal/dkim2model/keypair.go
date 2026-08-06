@@ -151,7 +151,7 @@ func validateKeyRelationship(algorithm Algorithm, private, public any) ([]byte, 
 			typedPrivate.E != typedPublic.E {
 			return nil, ErrInvalid
 		}
-		return x509.MarshalPKCS1PublicKey(typedPublic), nil
+		return x509.MarshalPKIXPublicKey(typedPublic)
 	case ed25519.PrivateKey:
 		typedPublic, ok := public.(ed25519.PublicKey)
 		if algorithm != AlgorithmEd25519SHA256 || !ok ||

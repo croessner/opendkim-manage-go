@@ -74,11 +74,19 @@ func TestKeyPairEncodingsCloneAndRedaction(t *testing.T) {
 	if !ok {
 		t.Fatalf("private key type = %T", privateAny)
 	}
-	if !bytes.Equal(rsaDNS, x509.MarshalPKCS1PublicKey(&private.PublicKey)) {
-		t.Fatal("RSA DNS bytes are not PKCS#1 RSAPublicKey DER")
+	if !bytes.Equal(rsaDNS, rsaPublic) {
+		t.Fatal("RSA DNS bytes are not SubjectPublicKeyInfo DER")
 	}
-	if bytes.Equal(rsaDNS, rsaPublic) {
-		t.Fatal("RSA DNS and SPKI encodings were conflated")
+	pkcs1RSA := x509.MarshalPKCS1PublicKey(&private.PublicKey)
+	if bytes.Equal(rsaDNS, pkcs1RSA) {
+		t.Fatal("RSA DNS bytes unexpectedly use PKCS#1 RSAPublicKey DER")
+	}
+	if !DNSPublicKeyMatchesSPKI(AlgorithmRSASHA256, rsaPublic, rsaDNS) ||
+		!DNSPublicKeyMatchesSPKI(AlgorithmRSASHA256, rsaPublic, pkcs1RSA) {
+		t.Fatal("RSA DNS compatibility does not accept both canonical encodings")
+	}
+	if DNSPublicKeyMatchesSPKI(AlgorithmRSASHA256, rsaPublic, append(bytes.Clone(pkcs1RSA), 0)) {
+		t.Fatal("RSA DNS compatibility accepted noncanonical PKCS#1 DER")
 	}
 
 	edPair, err := GenerateEd25519KeyPair(nil)
@@ -96,6 +104,10 @@ func TestKeyPairEncodingsCloneAndRedaction(t *testing.T) {
 	}
 	if bytes.Equal(edPair.DNSPublicKeyBytes(), edPair.PublicSPKIDER()) {
 		t.Fatal("Ed25519 DNS and SPKI encodings were conflated")
+	}
+	if !DNSPublicKeyMatchesSPKI(AlgorithmEd25519SHA256, edPair.PublicSPKIDER(), edPublic) ||
+		DNSPublicKeyMatchesSPKI(AlgorithmEd25519SHA256, edPair.PublicSPKIDER(), edPair.PublicSPKIDER()) {
+		t.Fatal("Ed25519 DNS compatibility accepted a non-raw encoding")
 	}
 
 	clone, err := rsaPair.Clone()

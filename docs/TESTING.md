@@ -47,8 +47,9 @@ The DKIM2 test matrix must cover:
   and proof that either dispatch path constructs only its selected manager;
 - closed `tenant_id`, `profile_use`, `rollout`, `compatibility`, and optional
   `feedback_route_id` validation, including bounded canonical identifiers;
-- RSA PKCS#8 private, SPKI public, and DNS PKCS#1 separation, plus Ed25519
-  PKCS#8 private, SPKI public, and raw 32-byte DNS public-key separation;
+- RSA PKCS#8 private, SPKI LDAP/new-DNS public payloads, and proof compatibility
+  with canonical SPKI or PKCS#1 for the same key, plus Ed25519 PKCS#8 private,
+  SPKI public, and raw 32-byte DNS public-key separation;
 - rejection of noncanonical DER, private/public/algorithm mismatches, unsafe
   RSA sizes, duplicate selectors or handles, and duplicate profile algorithms;
 - complete preservation of unrelated domains when a single-domain mutation

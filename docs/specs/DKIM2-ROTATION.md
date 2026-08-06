@@ -118,7 +118,13 @@ additional candidate requires explicit repair.
 The repository stages the complete candidate and reads it back without moving
 the current pointer. New DNS owners are created only with an RFC 2136
 `NXRRSET` prerequisite. An exact existing value is resumable; a different,
-multiple, malformed, revoked, CNAME, or uncertain value is a conflict.
+multiple, malformed, revoked, CNAME, or uncertain value is a conflict. RSA
+`p=` values contain the canonical SubjectPublicKeyInfo DER stored in LDAP,
+matching OpenDKIM-mode DNS publication. Proof, presence checks, resumable
+publication, and value-aware retirement also accept canonical PKCS#1
+`RSAPublicKey` DER when it represents the exact same key. Ed25519 `p=` values
+remain the raw 32-byte public key. Other encodings and key mismatches fail
+closed.
 
 Immediately before activation, the authoritative endpoint is queried directly
 over TCP with recursion disabled and must answer authoritatively. The recursive

@@ -14,9 +14,10 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/croessner/opendkim-manage-go/internal/config"
+	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
 )
 
-// ExpectedTXT identifies one exact absolute DKIM TXT owner and its canonical content.
+// ExpectedTXT identifies one absolute DKIM TXT owner and its preferred canonical content.
 type ExpectedTXT struct {
 	Owner   string
 	Content string
@@ -44,7 +45,7 @@ const (
 	ProofRecursive
 )
 
-// ProofState is a closed classification of one direct DNS readback.
+// ProofState is a closed key-equivalent classification of one direct DNS readback.
 type ProofState uint8
 
 const (
@@ -347,7 +348,7 @@ func classifyProofResponse(response *dns.Msg, expected ExpectedTXT, channel Proo
 		return 0, errors.New("DKIM2 DNS answer is conflicting")
 	}
 	content := strings.Join(txt.Txt, "")
-	if content != expected.Content || validateDKIMContent(content) != nil {
+	if !matchingDKIMContent(expected.Content, content) {
 		return 0, errors.New("DKIM2 DNS answer does not match the staged credential")
 	}
 	return ProofExact, nil
@@ -404,34 +405,64 @@ func absoluteCanonicalName(value string) bool {
 }
 
 func validateDKIMContent(content string) error {
+	_, _, err := parseDKIMContent(content)
+	return err
+}
+
+// matchingDKIMContent accepts exact records and equivalent canonical RSA encodings.
+func matchingDKIMContent(expected, observed string) bool {
+	if expected == observed {
+		return validateDKIMContent(expected) == nil
+	}
+	expectedAlgorithm, expectedPublic, err := parseDKIMContent(expected)
+	if err != nil {
+		return false
+	}
+	defer clear(expectedPublic)
+	observedAlgorithm, observedPublic, err := parseDKIMContent(observed)
+	if err != nil || observedAlgorithm != expectedAlgorithm {
+		clear(observedPublic)
+		return false
+	}
+	defer clear(observedPublic)
+	return dkim2model.DNSPublicKeyMatchesSPKI(expectedAlgorithm, expectedPublic, observedPublic) ||
+		dkim2model.DNSPublicKeyMatchesSPKI(expectedAlgorithm, observedPublic, expectedPublic)
+}
+
+// parseDKIMContent validates the closed key-record shape and returns detached public bytes.
+func parseDKIMContent(content string) (dkim2model.Algorithm, []byte, error) {
 	parts := strings.Split(content, ";")
 	values := make(map[string]string, len(parts))
 	for index, raw := range parts {
 		part := strings.TrimSpace(raw)
 		if part == "" {
-			return errors.New("empty DKIM tag")
+			return "", nil, errors.New("empty DKIM tag")
 		}
 		pair := strings.SplitN(part, "=", 2)
 		if len(pair) != 2 || pair[0] == "" {
-			return errors.New("malformed DKIM tag")
+			return "", nil, errors.New("malformed DKIM tag")
 		}
 		if _, duplicate := values[pair[0]]; duplicate {
-			return errors.New("duplicate DKIM tag")
+			return "", nil, errors.New("duplicate DKIM tag")
 		}
 		if index == 0 && (pair[0] != "v" || pair[1] != "DKIM1") {
-			return errors.New("invalid DKIM version")
+			return "", nil, errors.New("invalid DKIM version")
 		}
 		values[pair[0]] = pair[1]
 	}
 	if len(values) != 4 || values["h"] != "sha256" || values["p"] == "" || (values["k"] != "rsa" && values["k"] != "ed25519") {
-		return errors.New("invalid DKIM key record")
+		return "", nil, errors.New("invalid DKIM key record")
 	}
 	public, err := base64.StdEncoding.Strict().DecodeString(values["p"])
 	if err != nil || len(public) == 0 {
-		return errors.New("invalid DKIM public key")
+		clear(public)
+		return "", nil, errors.New("invalid DKIM public key")
 	}
-	clear(public)
-	return nil
+	algorithm := dkim2model.AlgorithmRSASHA256
+	if values["k"] == "ed25519" {
+		algorithm = dkim2model.AlgorithmEd25519SHA256
+	}
+	return algorithm, public, nil
 }
 
 func readTSIGBytes(path string) (result []byte, resultErr error) {

@@ -168,6 +168,7 @@ type RotationRetirer struct {
 	exchange      dnsExchange
 	loadTSIG      func(string) ([]byte, error)
 	observe       func(context.Context, ExpectedTXT) (PresenceState, error)
+	resolve       func(context.Context, ExpectedTXT) (PresenceState, string, error)
 }
 
 const rotationRetirerRedacted = "<redacted DKIM2 DNS rotation retirer>"
@@ -188,8 +189,12 @@ func NewRotationRetirer(cfg *config.Config) (*RotationRetirer, error) {
 		exchange:      exchangeDNS,
 		loadTSIG:      readTSIGBytes,
 	}
+	r.resolve = func(ctx context.Context, expected ExpectedTXT) (PresenceState, string, error) {
+		return observeChannelContent(ctx, expected, ProofAuthoritative, r.primary, r.queryTimeout, r.exchange)
+	}
 	r.observe = func(ctx context.Context, expected ExpectedTXT) (PresenceState, error) {
-		return observeAuthoritative(ctx, expected, r.primary, r.queryTimeout, r.exchange)
+		state, _, err := observeChannelContent(ctx, expected, ProofAuthoritative, r.primary, r.queryTimeout, r.exchange)
+		return state, err
 	}
 	return r, nil
 }
@@ -210,7 +215,7 @@ func (r *RotationRetirer) DeleteExact(ctx context.Context, zone string, expected
 	if err := validateZoneOwner(zone, expected); err != nil {
 		return 0, errors.New("invalid DKIM2 DNS retirement request")
 	}
-	state, err := r.observe(ctx, expected)
+	state, observedContent, err := r.resolveExisting(ctx, expected)
 	if err != nil {
 		return 0, mapDeletePresenceError(state, err)
 	}
@@ -228,7 +233,14 @@ func (r *RotationRetirer) DeleteExact(ctx context.Context, zone string, expected
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	message, err := buildDeleteExactMessage(zone, expected)
+	deleteExpected := expected
+	if observedContent != "" {
+		if !matchingDKIMContent(expected.Content, observedContent) {
+			return 0, ErrDeleteConflict
+		}
+		deleteExpected.Content = observedContent
+	}
+	message, err := buildDeleteExactMessage(zone, deleteExpected)
 	if err != nil {
 		return 0, err
 	}
@@ -257,6 +269,18 @@ func (r *RotationRetirer) DeleteExact(ctx context.Context, zone string, expected
 	authenticatedResponse := exchangeErr == nil && validateRotationUpdateAuthentication(response, message) == nil
 	lostResponse := response == nil
 	return r.reconcileDelete(ctx, expected, authenticatedResponse, lostResponse)
+}
+
+// resolveExisting returns the exact observed value used by value-aware deletion.
+func (r *RotationRetirer) resolveExisting(ctx context.Context, expected ExpectedTXT) (PresenceState, string, error) {
+	if r.resolve != nil {
+		return r.resolve(ctx, expected)
+	}
+	state, err := r.observe(ctx, expected)
+	if state == PresenceExact && err == nil {
+		return state, expected.Content, nil
+	}
+	return state, "", err
 }
 
 // reconcileDelete classifies one fresh authoritative readback and never retries a write.
@@ -318,12 +342,18 @@ func observeAuthoritative(ctx context.Context, expected ExpectedTXT, primary str
 
 // observeChannel performs one bounded direct read with the channel's exact recursion contract.
 func observeChannel(ctx context.Context, expected ExpectedTXT, channel ProofChannel, address string, timeout time.Duration, exchange dnsExchange) (PresenceState, error) {
+	state, _, err := observeChannelContent(ctx, expected, channel, address, timeout, exchange)
+	return state, err
+}
+
+// observeChannelContent returns bounded state plus the exact compatible TXT value.
+func observeChannelContent(ctx context.Context, expected ExpectedTXT, channel ProofChannel, address string, timeout time.Duration, exchange dnsExchange) (PresenceState, string, error) {
 	if err := validateExpectedTXT(expected); err != nil || strings.TrimSpace(address) == "" || timeout <= 0 || exchange == nil ||
 		(channel != ProofAuthoritative && channel != ProofRecursive) {
-		return PresenceUncertain, ErrPresenceUncertain
+		return PresenceUncertain, "", ErrPresenceUncertain
 	}
 	if err := ctx.Err(); err != nil {
-		return PresenceUncertain, err
+		return PresenceUncertain, "", err
 	}
 	query := new(dns.Msg)
 	query.SetQuestion(expected.Owner, dns.TypeTXT)
@@ -333,17 +363,17 @@ func observeChannel(ctx context.Context, expected ExpectedTXT, channel ProofChan
 	response, err := exchange(queryCtx, &dns.Client{Net: "tcp", Timeout: timeout}, query, address)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return PresenceUncertain, ctxErr
+			return PresenceUncertain, "", ctxErr
 		}
 		if queryErr := queryCtx.Err(); queryErr != nil {
-			return PresenceUncertain, queryErr
+			return PresenceUncertain, "", queryErr
 		}
-		return PresenceUncertain, ErrPresenceUncertain
+		return PresenceUncertain, "", ErrPresenceUncertain
 	}
 	if response != nil && response.Id != query.Id {
-		return PresenceUncertain, ErrPresenceUncertain
+		return PresenceUncertain, "", ErrPresenceUncertain
 	}
-	return classifyChannelPresence(response, expected, channel)
+	return classifyChannelPresenceContent(response, expected, channel)
 }
 
 // classifyObservedPresence maps authoritative evidence into one closed presence state.
@@ -353,47 +383,56 @@ func classifyObservedPresence(response *dns.Msg, expected ExpectedTXT) (Presence
 
 // classifyChannelPresence maps one direct response under the selected channel contract.
 func classifyChannelPresence(response *dns.Msg, expected ExpectedTXT, channel ProofChannel) (PresenceState, error) {
+	state, _, err := classifyChannelPresenceContent(response, expected, channel)
+	return state, err
+}
+
+// classifyChannelPresenceContent preserves an exact compatible value for safe deletion.
+func classifyChannelPresenceContent(response *dns.Msg, expected ExpectedTXT, channel ProofChannel) (PresenceState, string, error) {
 	if response == nil || !response.Response || response.Truncated ||
 		len(response.Question) != 1 || response.Question[0].Name != expected.Owner ||
 		response.Question[0].Qtype != dns.TypeTXT || response.Question[0].Qclass != dns.ClassINET {
-		return PresenceUncertain, ErrPresenceUncertain
+		return PresenceUncertain, "", ErrPresenceUncertain
 	}
 	switch channel {
 	case ProofAuthoritative:
 		if !response.Authoritative {
-			return PresenceUncertain, ErrPresenceUncertain
+			return PresenceUncertain, "", ErrPresenceUncertain
 		}
 	case ProofRecursive:
 		if response.Authoritative || !response.RecursionAvailable {
-			return PresenceUncertain, ErrPresenceUncertain
+			return PresenceUncertain, "", ErrPresenceUncertain
 		}
 	default:
-		return PresenceUncertain, ErrPresenceUncertain
+		return PresenceUncertain, "", ErrPresenceUncertain
 	}
 	if response.Rcode == dns.RcodeNameError {
 		if negativeSOA(response, expected) && len(response.Answer) == 0 {
-			return PresenceAbsent, nil
+			return PresenceAbsent, "", nil
 		}
-		return PresenceUncertain, ErrPresenceUncertain
+		return PresenceUncertain, "", ErrPresenceUncertain
 	}
 	if response.Rcode != dns.RcodeSuccess {
-		return PresenceUncertain, ErrPresenceUncertain
+		return PresenceUncertain, "", ErrPresenceUncertain
 	}
 	if len(response.Answer) == 0 {
 		if negativeSOA(response, expected) {
-			return PresenceAbsent, nil
+			return PresenceAbsent, "", nil
 		}
-		return PresenceUncertain, ErrPresenceUncertain
+		return PresenceUncertain, "", ErrPresenceUncertain
 	}
 	if len(response.Ns) != 0 || len(response.Answer) != 1 {
-		return PresenceConflict, ErrPresenceConflict
+		return PresenceConflict, "", ErrPresenceConflict
 	}
 	txt, ok := response.Answer[0].(*dns.TXT)
-	if !ok || txt.Hdr.Name != expected.Owner || txt.Hdr.Class != dns.ClassINET ||
-		strings.Join(txt.Txt, "") != expected.Content || validateDKIMContent(strings.Join(txt.Txt, "")) != nil {
-		return PresenceConflict, ErrPresenceConflict
+	if !ok || txt.Hdr.Name != expected.Owner || txt.Hdr.Class != dns.ClassINET {
+		return PresenceConflict, "", ErrPresenceConflict
 	}
-	return PresenceExact, nil
+	content := strings.Join(txt.Txt, "")
+	if !matchingDKIMContent(expected.Content, content) {
+		return PresenceConflict, "", ErrPresenceConflict
+	}
+	return PresenceExact, content, nil
 }
 
 // negativeSOA requires one canonical enclosing SOA as reliable negative evidence.

@@ -143,6 +143,11 @@ func (c Credential) DNSPublicKeyBytes() []byte {
 	return result
 }
 
+// MatchesDNSPublicKeyBytes accepts every canonical DNS encoding of this exact public key.
+func (c Credential) MatchesDNSPublicKeyBytes(candidate []byte) bool {
+	return DNSPublicKeyMatchesSPKI(c.algorithm, c.publicSPKI, candidate)
+}
+
 // HandleID returns the exact provider-neutral handle identifier.
 func (c Credential) HandleID() string { return c.handleID }
 
@@ -240,7 +245,7 @@ func canonicalDNSPublicBytes(algorithm Algorithm, publicSPKI []byte) ([]byte, er
 			public.E != requiredRSAExponent {
 			return nil, ErrInvalid
 		}
-		return x509.MarshalPKCS1PublicKey(public), nil
+		return bytes.Clone(publicSPKI), nil
 	case ed25519.PublicKey:
 		if algorithm != AlgorithmEd25519SHA256 || len(public) != ed25519.PublicKeySize {
 			return nil, ErrInvalid
@@ -249,6 +254,32 @@ func canonicalDNSPublicBytes(algorithm Algorithm, publicSPKI []byte) ([]byte, er
 	default:
 		return nil, ErrInvalid
 	}
+}
+
+// DNSPublicKeyMatchesSPKI compares a DNS payload with canonical LDAP SPKI.
+func DNSPublicKeyMatchesSPKI(algorithm Algorithm, publicSPKI, candidate []byte) bool {
+	primary, err := canonicalDNSPublicBytes(algorithm, publicSPKI)
+	if err != nil {
+		return false
+	}
+	defer clear(primary)
+	if bytes.Equal(primary, candidate) {
+		return true
+	}
+	if algorithm != AlgorithmRSASHA256 {
+		return false
+	}
+	parsed, err := x509.ParsePKIXPublicKey(publicSPKI)
+	if err != nil {
+		return false
+	}
+	public, ok := parsed.(*rsa.PublicKey)
+	if !ok {
+		return false
+	}
+	pkcs1 := x509.MarshalPKCS1PublicKey(public)
+	defer clear(pkcs1)
+	return bytes.Equal(pkcs1, candidate)
 }
 
 // cloneCredential returns one detached immutable credential.

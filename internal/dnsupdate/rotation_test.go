@@ -2,6 +2,9 @@ package dnsupdate
 
 import (
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -10,6 +13,7 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/croessner/opendkim-manage-go/internal/config"
+	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
 )
 
 const testDKIMRecord = "v=DKIM1; k=ed25519; h=sha256; p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
@@ -25,6 +29,49 @@ func TestBuildCreateIfAbsentUsesNXRRSET(t *testing.T) {
 	if len(msg.Ns) != 1 || msg.Ns[0].Header().Class != dns.ClassINET {
 		t.Fatalf("unexpected update section: %#v", msg.Ns)
 	}
+}
+
+func TestDNSProofAcceptsEquivalentCanonicalRSAEncodings(t *testing.T) {
+	expected, pkcs1Content := rsaDNSCompatibilityRecords(t)
+	observed := ExpectedTXT{Owner: expected.Owner, Content: pkcs1Content}
+	response := answerFor(observed, true, true)
+	if state, err := classifyProofResponse(response, expected, ProofAuthoritative); err != nil || state != ProofExact {
+		t.Fatalf("equivalent PKCS#1 proof rejected: state=%v err=%v", state, err)
+	}
+	if state, err := classifyChannelPresence(response, expected, ProofAuthoritative); err != nil || state != PresenceExact {
+		t.Fatalf("equivalent PKCS#1 presence rejected: state=%v err=%v", state, err)
+	}
+	otherExpected, otherPKCS1Content := rsaDNSCompatibilityRecords(t)
+	otherResponse := answerFor(ExpectedTXT{Owner: expected.Owner, Content: otherPKCS1Content}, true, true)
+	if otherExpected.Content == expected.Content {
+		t.Fatal("independent RSA test keys unexpectedly match")
+	}
+	if _, err := classifyProofResponse(otherResponse, expected, ProofAuthoritative); err == nil {
+		t.Fatal("proof accepted a different RSA key")
+	}
+}
+
+// rsaDNSCompatibilityRecords returns SPKI publication and equivalent PKCS#1 proof content.
+func rsaDNSCompatibilityRecords(t *testing.T) (ExpectedTXT, string) {
+	t.Helper()
+	pair, err := dkim2model.GenerateRSAKeyPair(dkim2model.DefaultRSABits, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pair.Close() }()
+	spki := pair.PublicSPKIDER()
+	publicAny, err := x509.ParsePKIXPublicKey(spki)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, ok := publicAny.(*rsa.PublicKey)
+	if !ok {
+		t.Fatalf("public key type = %T", publicAny)
+	}
+	owner := "selector._domainkey.example.test."
+	prefix := "v=DKIM1; k=rsa; h=sha256; p="
+	return ExpectedTXT{Owner: owner, Content: prefix + base64.StdEncoding.EncodeToString(spki)},
+		prefix + base64.StdEncoding.EncodeToString(x509.MarshalPKCS1PublicKey(public))
 }
 
 func TestClassifyProofResponseRejectsClosedDNSStates(t *testing.T) {

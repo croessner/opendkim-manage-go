@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"strings"
 	"testing"
@@ -12,6 +15,7 @@ import (
 
 	"github.com/croessner/opendkim-manage-go/internal/cli"
 	"github.com/croessner/opendkim-manage-go/internal/config"
+	"github.com/croessner/opendkim-manage-go/internal/dkim"
 	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
 	"github.com/croessner/opendkim-manage-go/internal/dkim2store"
 	"github.com/croessner/opendkim-manage-go/internal/types"
@@ -419,6 +423,73 @@ func TestDKIM2DNSProofUsesAbsoluteQueryName(t *testing.T) {
 	}
 	if _, err := manager.Run(); err != nil {
 		t.Fatalf("Run() error = %v", err)
+	}
+}
+
+func TestDKIM2RSADNSUsesSPKIAndAcceptsEquivalentPKCS1Proof(t *testing.T) {
+	pair, err := dkim2model.GenerateRSAKeyPair(dkim2model.DefaultRSABits, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pair.Close() }()
+	spki := pair.PublicSPKIDER()
+	credential, err := dkim2model.NewCredential(
+		1, "profile-test", "selector-rsa", dkim2model.AlgorithmRSASHA256, spki, "handle-test",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	algorithm, published, err := parseDNSRecord(dnsRecord(credential))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if algorithm != dkim2model.AlgorithmRSASHA256 || !bytes.Equal(published, spki) {
+		t.Fatal("DKIM2 RSA DNS record does not preserve the canonical SPKI payload")
+	}
+	privateDER := pair.PrivatePKCS8DER()
+	defer clear(privateDER)
+	classic := dkim.NewKeys()
+	if err := classic.GeneratePublicRSA(string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privateDER}))); err != nil {
+		t.Fatal(err)
+	}
+	if base64.StdEncoding.EncodeToString(published) != classic.RSAPublicKey() {
+		t.Fatal("DKIM2 and OpenDKIM modes produce different RSA DNS payloads")
+	}
+	publicAny, err := x509.ParsePKIXPublicKey(spki)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, ok := publicAny.(*rsa.PublicKey)
+	if !ok {
+		t.Fatalf("public key type = %T", publicAny)
+	}
+	pkcs1Record := "v=DKIM1; k=rsa; h=sha256; p=" +
+		base64.StdEncoding.EncodeToString(x509.MarshalPKCS1PublicKey(public))
+	manager := &DKIM2Manager{lookupTXT: func(string) ([]string, error) {
+		return []string{pkcs1Record}, nil
+	}}
+	if err := manager.verifyCredential(credential, "example.test"); err != nil {
+		t.Fatalf("DKIM2 DNS proof rejected the equivalent PKCS#1 RSA payload: %v", err)
+	}
+	otherPair, err := dkim2model.GenerateRSAKeyPair(dkim2model.DefaultRSABits, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = otherPair.Close() }()
+	otherPublicAny, err := x509.ParsePKIXPublicKey(otherPair.PublicSPKIDER())
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPublic, ok := otherPublicAny.(*rsa.PublicKey)
+	if !ok {
+		t.Fatalf("other public key type = %T", otherPublicAny)
+	}
+	manager.lookupTXT = func(string) ([]string, error) {
+		return []string{"v=DKIM1; k=rsa; h=sha256; p=" +
+			base64.StdEncoding.EncodeToString(x509.MarshalPKCS1PublicKey(otherPublic))}, nil
+	}
+	if err := manager.verifyCredential(credential, "example.test"); err == nil {
+		t.Fatal("DKIM2 DNS proof accepted PKCS#1 material for a different RSA key")
 	}
 }
 

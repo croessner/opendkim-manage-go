@@ -34,6 +34,35 @@ func TestBuildDeleteExactUsesValuePrerequisiteAndTXTRRsetDelete(t *testing.T) {
 	}
 }
 
+func TestRotationRetirerDeletesObservedCompatibleRSAEncodingExactly(t *testing.T) {
+	expected, pkcs1Content := rsaDNSCompatibilityRecords(t)
+	retirer := newTestRetirer(t)
+	retirer.resolve = func(context.Context, ExpectedTXT) (PresenceState, string, error) {
+		return PresenceExact, pkcs1Content, nil
+	}
+	retirer.observe = func(context.Context, ExpectedTXT) (PresenceState, error) {
+		return PresenceAbsent, nil
+	}
+	retirer.loadTSIG = func(string) ([]byte, error) { return []byte("c3ludGhldGlj"), nil }
+	retirer.exchange = func(_ context.Context, _ *dns.Client, message *dns.Msg, _ string) (*dns.Msg, error) {
+		if len(message.Answer) != 1 {
+			t.Fatalf("prerequisites=%d want=1", len(message.Answer))
+		}
+		prerequisite, ok := message.Answer[0].(*dns.TXT)
+		if !ok || strings.Join(prerequisite.Txt, "") != pkcs1Content {
+			t.Fatal("delete prerequisite did not preserve the observed compatible encoding")
+		}
+		response := new(dns.Msg)
+		response.SetReply(message)
+		response.SetTsig("synthetic-key.", dns.HmacSHA256, 300, 0)
+		return response, nil
+	}
+	result, err := retirer.DeleteExact(context.Background(), "example.test.", expected)
+	if err != nil || result != DeleteRemoved {
+		t.Fatalf("result=%v err=%v", result, err)
+	}
+}
+
 func TestClassifyObservedPresenceIsClosed(t *testing.T) {
 	expected := ExpectedTXT{Owner: "old._domainkey.example.test.", Content: testDKIMRecord}
 	exact := answerFor(expected, true, false)
@@ -573,6 +602,7 @@ func newTestRetirer(t *testing.T) *RotationRetirer {
 	if err != nil {
 		t.Fatal(err)
 	}
+	retirer.resolve = nil
 	return retirer
 }
 

@@ -150,7 +150,8 @@ Native key material uses distinct canonical encodings:
 
 - LDAP private material is unencrypted PKCS#8 DER.
 - LDAP public material is SubjectPublicKeyInfo DER.
-- RSA DNS `p=` data is PKCS#1 `RSAPublicKey` DER.
+- New RSA DNS `p=` data is SubjectPublicKeyInfo DER, matching OpenDKIM mode;
+  proof also accepts canonical PKCS#1 `RSAPublicKey` DER for the same key.
 - Ed25519 DNS `p=` data is the raw 32-byte public key.
 
 The stored DKIM2 algorithms are exactly `rsa-sha256` and
@@ -169,8 +170,9 @@ DKIM2 mode supports only these commands:
   before publishing an enabled profile and policy.
 - `--testkey` requires exactly one logical TXT RR whose algorithm and public
   key match the LDAP credential exactly.
-- `--print-dns` emits DNS-04-compatible `v=DKIM1` records with the algorithm's
-  correct RSA PKCS#1 or Ed25519 raw public-key encoding.
+- `--print-dns` emits DNS-04-compatible `v=DKIM1` records with RSA
+  SubjectPublicKeyInfo or Ed25519 raw public-key encoding. RSA proof accepts
+  both canonical SPKI and PKCS#1 representations of the exact stored key.
 - `--rotate --domain ... --update-dns` rotates exactly one active native
   binding while preserving its RSA-only, Ed25519-only, or dual algorithm set.
   `--prepare-only` stops after exact LDAP staging and readback, before TSIG or
