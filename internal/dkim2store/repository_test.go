@@ -224,6 +224,30 @@ func TestLDAPRepositoryReadbackMismatchAndReferralFailBeforeCommit(t *testing.T)
 	}
 }
 
+func TestLDAPRepositoryRetriesTransientlyIncompleteReadback(t *testing.T) {
+	executor := newFakeExecutor(testBaseDN)
+	reads := 0
+	executor.mutateGenerationRead = func(result *ldap.SearchResult) {
+		reads++
+		if reads == 1 {
+			result.Entries = result.Entries[:len(result.Entries)-1]
+		}
+	}
+	repository := mustRepository(t, executor)
+	candidate := testGeneration(t, 1, dkim2model.DatasetStateStaging, "one.example")
+	defer func() { _ = candidate.Close() }()
+
+	if err := repository.Publish(context.Background(), 0, candidate); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if reads < 2 {
+		t.Fatalf("generation read count = %d, want at least 2", reads)
+	}
+	if len(executor.modifies) != 2 {
+		t.Fatalf("modify count = %d, want commit and pointer switch", len(executor.modifies))
+	}
+}
+
 func TestLDAPRepositoryCommitAndPointerFailuresNeverReportSuccess(t *testing.T) {
 	for failure := 1; failure <= 2; failure++ {
 		t.Run(fmt.Sprintf("modify-%d", failure), func(t *testing.T) {

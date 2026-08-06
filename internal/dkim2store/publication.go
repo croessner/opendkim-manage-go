@@ -11,6 +11,11 @@ import (
 	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
 )
 
+const (
+	readbackMaximumAttempts = 8
+	readbackRetryDelay      = 250 * time.Millisecond
+)
+
 // addCandidate creates one complete staging generation without editing committed data.
 func (r *LDAPRepository) addCandidate(ctx context.Context, candidate *dkim2model.Generation) error {
 	generation := strconv.FormatUint(candidate.Number(), 10)
@@ -128,8 +133,35 @@ func (r *LDAPRepository) addCandidate(ctx context.Context, candidate *dkim2model
 	return nil
 }
 
-// validateReadback proves that staged LDAP data is valid and exactly equivalent to the candidate.
+// validateReadback tolerates bounded transiently incomplete LDAP views after
+// successful adds, while every accepted result must still be complete and
+// exactly equivalent to the candidate.
 func (r *LDAPRepository) validateReadback(ctx context.Context, candidate *dkim2model.Generation) error {
+	var err error
+	for attempt := 0; attempt < readbackMaximumAttempts; attempt++ {
+		if err = r.validateReadbackOnce(ctx, candidate); err == nil {
+			return nil
+		}
+		if contextErr := validContext(ctx); contextErr != nil {
+			return contextErr
+		}
+		if attempt+1 == readbackMaximumAttempts {
+			break
+		}
+		timer := time.NewTimer(readbackRetryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func (r *LDAPRepository) validateReadbackOnce(ctx context.Context, candidate *dkim2model.Generation) error {
 	entries, err := r.readGeneration(ctx, candidate.Number())
 	if err != nil {
 		return err
