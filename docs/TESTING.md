@@ -35,7 +35,7 @@ non-root runtime user and absence of `/bin/sh`.
 ## DKIM2 prerequisites and focused contracts
 
 Integration tests for `dkim2` mode require an isolated LDAP directory with the
-immutable `dkim2-datasource-v2` schema installed. The configured LDAP URI base
+versioned v2/v3 DKIM2 schema installed. The configured LDAP URI base
 DN is the dataset base, and the fixture must pre-create that base and its fixed
 `ou=generations` child. Fixtures must use synthetic `example.*` names and
 placeholder credentials, and must not reuse a production directory or import
@@ -55,7 +55,7 @@ The DKIM2 test matrix must cover:
   RSA sizes, duplicate selectors or handles, and duplicate profile algorithms;
 - complete preservation of unrelated domains when a single-domain mutation
   creates a new immutable generation;
-- exact `dkim2-datasource-v2` validation, monotonic generation numbers,
+- exact v2 compatibility and operation-bound v3 candidate validation, monotonic generation numbers,
   bootstrap conflicts, staged readback mismatches, and concurrent
   `cn=current` assertion failures;
 - bounded and escaped LDAP searches, with referrals, aliases, mixed
@@ -74,15 +74,17 @@ The DKIM2 test matrix must cover:
   key generation, including partial DNS, lost-response, committed-unreachable,
   pointer-switch, and already-current recovery classifications;
 - default-off `--auto`, exact complete selector/algorithm/SPKI/handle lineage,
-  canonical root `createTimestamp`, injected-clock age decisions,
-  deterministic batch limit one, and pending-candidate-first behavior;
+  canonical root `createTimestamp`, injected-clock age decisions, all-due
+  bindings in exactly one v3 successor, non-due preservation, and
+  pending-candidate-first behavior;
 - bounded observation states for idle, staged, DNS pending/conflict,
   committed-unreachable, activated, observing, and retire-eligible results
   without protected values;
 - all seven retirement attestations, exact `cn=current` generation plus
   canonical `modifyTimestamp` overlap evidence, value-aware TXT delete CAS,
   partial RSA-only/Ed25519-only/dual resume, and current-change rejection;
-- permanent denial of automatic DNS retirement and LDAP generation deletion;
+- permanent denial of automatic DNS retirement plus bounded v3 retention that
+  preserves current, pending, malformed, legacy, and configured rollback roots;
 - forward-only rollback into a generation higher than every retained root,
   with exact-source rebasing and explicit stored-candidate resume;
 - unchanged legacy OpenDKIM manager and lifecycle regressions.

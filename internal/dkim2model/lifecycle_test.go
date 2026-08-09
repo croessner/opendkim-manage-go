@@ -453,7 +453,7 @@ func rotatedStagingGeneration(t *testing.T, predecessor *Generation, number uint
 	t.Helper()
 	staging, err := PlanRotation(RotationPlan{
 		Current: predecessor, NextGeneration: number, TenantID: tenant, Domain: domain, Use: use,
-		RSABits: DefaultRSABits, Random: &sequenceReader{}, History: collisionSet{},
+		RSABits: DefaultRSABits, AllocationAttempts: 16, Random: &sequenceReader{}, History: collisionSet{},
 	})
 	if err != nil {
 		t.Fatalf("PlanRotation() fixture error = %v", err)

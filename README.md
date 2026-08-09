@@ -20,8 +20,8 @@ The current prerelease is `v1.0.0-beta.1`.
 - List, create, delete, revoke, activate, rotate, and reorder OpenDKIM selectors
 - Create and activate complete immutable DKIM2 datasource generations with
   crash-resumable rotation
-- Run default-off, bounded DKIM2 automatic rotation and explicitly authorized
-  DNS retirement
+- Run default-off, bounded autonomous DKIM2 campaigns that rotate every due
+  binding in one generation and retain a configured finite history
 - Recover by rebasing a retained DKIM2 generation forward without moving the
   current pointer backward
 - Verify published DNS keys before activation
@@ -113,8 +113,10 @@ The modes use structurally separate LDAP managers:
 
 - `opendkim` retains the existing mutable selector-object lifecycle, including
   rotation, revocation, deletion, retention, and CNAME slot reconciliation.
-- `dkim2` manages complete, immutable `dkim2-datasource-v2` generations. The
-  configured LDAP URI base DN is the dataset base, and the schema must already
+- `dkim2` autonomously manages complete immutable native generations. It reads
+  retained v2 compatibility state and writes operation-bound v3 campaign
+  candidates without importing, executing, or packaging another DKIM project.
+  The configured LDAP URI base DN is the dataset base, and the schema must already
   be installed before this mode is used. The dataset base and its fixed
   `ou=generations` child are directory prerequisites; this application creates
   generation-local records and `cn=current`, not those administrative parents.
@@ -179,16 +181,20 @@ DKIM2 mode supports only these commands:
   DNS access. `--resume-generation <G>` continues only the exact protected
   candidate already stored in LDAP and never generates replacement keys.
 - `--auto --update-dns` is available only when `dkim2.rotation_enabled: true`.
-  It resumes one pending candidate first or rotates at most one deterministically
-  selected due binding from an exact, complete historical-lineage clock. It
-  never retires DNS records or deletes LDAP history.
+  It resumes one pending candidate first or freezes every binding and rotates
+  every due binding in one complete generation. The default age is 30 days.
+  After activation or an idle run it applies the configured bounded v3
+  retention policy; current, staging, malformed, legacy, and rollback-reserve
+  generations are never deleted. Automatic LDAP access uses distinct snapshot,
+  staging, activation, and purge identities. A canonical owner-only journal
+  resumes the exact purge plan after partial leaf-first deletion or restart.
 - `--observe --domain ...` reports the bounded LDAP/DNS lifecycle phase for
   exactly one native binding without performing a write or opening TSIG
   material.
 - `--retire-generation <G-old> --domain ... --update-dns` removes only the
   exact predecessor TXT values after the minimum overlap and all seven external
   operator attestations have been revalidated. Partial progress continues only
-  through `--resume-retirement`; LDAP generations are never deleted.
+  through `--resume-retirement`.
 - `--rollback-from-generation <G-source> --domain ... --update-dns` rebases
   retained approved content and protected key material into a new generation
   higher than every retained root. It never moves `cn=current` backward and
@@ -196,8 +202,9 @@ DKIM2 mode supports only these commands:
 
 `--delete`, `--force-delete`, `--age`, `--add-missing`, `--add-new`, and
 CNAME-oriented behavior remain unsupported in DKIM2 mode and fail before LDAP
-or DNS writes. Automatic DNS retirement, LDAP generation deletion, pointer
-rollback, and implicit rollback are deliberately unavailable.
+or DNS writes. Automatic DNS retirement, pointer rollback, and implicit
+rollback remain unavailable. Automatic LDAP deletion is limited to the strict
+configured v3 retention contract.
 
 DKIM2 creation first publishes an inactive LDAP generation. An optional DNS
 update follows that successful publication. Activation always performs a new

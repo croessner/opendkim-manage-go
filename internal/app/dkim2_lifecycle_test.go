@@ -67,6 +67,12 @@ func TestDKIM2AutoResumesExactPendingCandidateBeforeEligibilityOrRandomness(t *t
 	manager, repository, events := newRotationHarness(t, current, &cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
 	defer repository.close()
 	repository.pending, repository.observed = candidate, current.Number()
+	operation, operationErr := dkim2model.GenerateOperationID(bytes.NewReader(bytes.Repeat([]byte{1}, 16)))
+	metadata, metadataErr := dkim2model.NewCandidateMetadataForOperation(operation, current.Number(), candidate)
+	if operationErr != nil || metadataErr != nil {
+		t.Fatal(errors.Join(operationErr, metadataErr))
+	}
+	repository.campaignMetadata = &metadata
 	manager.cfg.DKIM2.RotationEnabled = true
 	random := &forbiddenRandom{}
 	manager.random = random
@@ -84,6 +90,33 @@ func TestDKIM2AutoResumesExactPendingCandidateBeforeEligibilityOrRandomness(t *t
 	}
 }
 
+func TestDKIM2AutomaticPendingDryRunPerformsNoDNSOrLDAPMutation(t *testing.T) {
+	current, candidate := rotationSuccessorPair(t, []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256})
+	manager, repository, _ := newRotationHarness(t, current, &cli.Options{
+		Auto: true, UpdateDNS: true, DryRun: true, Yes: true, Size: 2048,
+	})
+	defer repository.close()
+	repository.pending, repository.observed = candidate, current.Number()
+	operation, err := dkim2model.GenerateOperationID(bytes.NewReader(bytes.Repeat([]byte{3}, 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := dkim2model.NewCandidateMetadataForOperation(operation, current.Number(), candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository.campaignMetadata = &metadata
+	manager.cfg.DKIM2.RotationEnabled = true
+	manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) {
+		t.Fatal("dry-run opened DNS publisher")
+		return nil, errors.New("unreachable")
+	}
+	result, err := manager.Run()
+	if err != nil || result.DKIM2Outcome != DKIM2OutcomeDryRun || repository.commitCalls != 0 || len(repository.deleteCalls) != 0 {
+		t.Fatalf("result=%#v commits=%d deletes=%v err=%v", result, repository.commitCalls, repository.deleteCalls, err)
+	}
+}
+
 func TestDKIM2AutoPreservesRetainedHistoryFailureClass(t *testing.T) {
 	current := rotationGeneration(t, []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256})
 	manager, repository, _ := newRotationHarness(t, current, &cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
@@ -97,7 +130,7 @@ func TestDKIM2AutoPreservesRetainedHistoryFailureClass(t *testing.T) {
 	}
 }
 
-func TestDKIM2AutoSelectsAtMostOneDueBindingDeterministicallyAndNeverRetires(t *testing.T) {
+func TestDKIM2AutoRotatesAllDueBindingsInOneGenerationAndNeverRetires(t *testing.T) {
 	current := rotationGenerationBindings(t, []rotationBindingSpec{
 		{domain: "other.example", suffix: "other", algorithms: []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256}},
 		{domain: "example.test", suffix: "target", algorithms: []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256}},
@@ -113,17 +146,16 @@ func TestDKIM2AutoSelectsAtMostOneDueBindingDeterministicallyAndNeverRetires(t *
 		t.Fatal("automatic rotation constructed retirement dependency")
 		return nil, nil
 	}
-	beforeOther, found := current.CredentialByDomainSelector("other.example", "selector-other-0")
+	_, found := current.CredentialByDomainSelector("other.example", "selector-other-0")
 	if !found {
 		t.Fatal("other binding fixture missing")
 	}
 	result, err := manager.Run()
-	if err != nil || result.DKIM2Outcome != DKIM2OutcomeActivated || publisher.calls != 1 {
+	if err != nil || result.DKIM2Outcome != DKIM2OutcomeActivated || publisher.calls != 2 || repository.stageCalls != 1 || repository.commitCalls != 1 {
 		t.Fatalf("result=%#v publications=%d err=%v", result, publisher.calls, err)
 	}
-	afterOther, found := repository.pending.CredentialByDomainSelector("other.example", "selector-other-0")
-	if !found || afterOther.HandleID() != beforeOther.HandleID() || afterOther.Selector() != beforeOther.Selector() {
-		t.Fatal("deterministic batch-one automation changed the non-selected binding")
+	if _, found := repository.pending.CredentialByDomainSelector("other.example", "selector-other-0"); found {
+		t.Fatal("global campaign retained an old selector from a due binding")
 	}
 }
 
@@ -148,10 +180,11 @@ func TestDKIM2AutoRotatesTheDeterministicallySelectedFullBinding(t *testing.T) {
 	if err != nil || result.DKIM2Outcome != DKIM2OutcomeActivated {
 		t.Fatalf("auto result=%#v err=%v", result, err)
 	}
-	configuredAfter, found := repository.pending.CredentialByDomainSelector("example.test", "selector-configured-0")
-	if !found || configuredAfter.HandleID() != configuredBefore.HandleID() {
-		t.Fatal("auto rotated the configured same-domain binding instead of the selected full binding")
+	_, found = repository.pending.CredentialByDomainSelector("example.test", "selector-configured-0")
+	if found {
+		t.Fatal("global campaign retained an old selector from a second due same-domain binding")
 	}
+	_ = configuredBefore
 	if _, found := repository.pending.CredentialByDomainSelector("example.test", "selector-selected-0"); found {
 		t.Fatal("deterministically selected binding retained its old selector")
 	}
@@ -271,7 +304,7 @@ func TestDKIM2ObservationRejectsSameDomainCandidateForDifferentBinding(t *testin
 	history, _ := repository.LoadRetainedHistory(context.Background(), 8)
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{Current: current, NextGeneration: 2,
 		TenantID: "other-tenant", Domain: "example.test", Use: dkim2model.ProfileUseOriginator,
-		RSABits: 2048, Random: rand.Reader, History: history})
+		RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +519,7 @@ func TestDKIM2RollbackResumeRejectsStoredFreshRotationIntent(t *testing.T) {
 	history := publicHistoryForGeneration(current)
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{
 		Current: current, NextGeneration: current.Number() + 1, TenantID: "tenant-test", Domain: "example.test",
-		Use: dkim2model.ProfileUseOriginator, RSABits: 2048, Random: rand.Reader, History: history,
+		Use: dkim2model.ProfileUseOriginator, RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -627,7 +660,7 @@ func TestDKIM2RetirementFailsClosedWhenSuccessorExists(t *testing.T) {
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{
 		Current: repository.current, NextGeneration: repository.current.Number() + 1,
 		TenantID: "tenant-test", Domain: "example.test", Use: dkim2model.ProfileUseOriginator,
-		RSABits: 2048, Random: rand.Reader, History: history,
+		RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -775,7 +808,7 @@ func rotationSuccessorPair(t *testing.T, algorithms []dkim2model.Algorithm) (*dk
 	history := publicHistoryForGeneration(current)
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{
 		Current: current, NextGeneration: current.Number() + 1, TenantID: "tenant-test", Domain: "example.test",
-		Use: dkim2model.ProfileUseOriginator, RSABits: 2048, Random: rand.Reader, History: history,
+		Use: dkim2model.ProfileUseOriginator, RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history,
 	})
 	if err != nil {
 		_ = current.Close()

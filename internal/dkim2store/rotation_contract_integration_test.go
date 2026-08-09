@@ -199,7 +199,7 @@ func loadPinnedSchemaNames(t *testing.T) (map[string]struct{}, map[string]struct
 	for _, match := range classPattern.FindAllSubmatch(raw, -1) {
 		classes[strings.ToLower(string(match[1]))] = struct{}{}
 	}
-	if len(attributes) != 21 || len(classes) != 8 || !bytes.Contains(raw, []byte("dkim2-datasource-v2")) {
+	if len(attributes) != 25 || len(classes) != 9 || !bytes.Contains(raw, []byte("dkim2-datasource-v3")) {
 		t.Fatal("pinned schema fixture is incomplete")
 	}
 	return attributes, classes

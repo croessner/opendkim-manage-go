@@ -73,7 +73,8 @@ type DKIM2Manager struct {
 	opts                 *cli.Options
 	repository           dkim2store.GenerationRepository
 	rotationRepository   dkim2store.RotationRepository
-	ldap                 *ldapstore.Client
+	campaignRepository   dkim2store.CampaignRepository
+	ldap                 []*ldapstore.Client
 	dns                  dkim2DNSUpdater
 	lookupTXT            func(string) ([]string, error)
 	random               io.Reader
@@ -102,13 +103,14 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 	if err != nil {
 		return nil, err
 	}
-	repository, err := dkim2store.NewLDAPRepository(ldapClient)
+	repository, err := dkim2store.NewLDAPRepository(ldapClient, configuredDKIM2StoreLimits(cfg.DKIM2))
 	if err != nil {
 		_ = ldapClient.Close()
 		return nil, err
 	}
 	manager := &DKIM2Manager{
-		cfg: cfg, opts: opts, repository: repository, rotationRepository: repository, ldap: ldapClient,
+		cfg: cfg, opts: opts, repository: repository, rotationRepository: repository,
+		campaignRepository: repository, ldap: []*ldapstore.Client{ldapClient},
 		lookupTXT: net.LookupTXT, random: rand.Reader, in: os.Stdin, out: os.Stdout,
 		newRotationPublisher: func(cfg *config.Config) (dkim2RotationPublisher, error) {
 			return dnsupdate.NewRotationPublisher(cfg)
@@ -127,9 +129,43 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 			return context.WithTimeout(context.Background(), timeout)
 		},
 	}
+	if cfg.DKIM2.RotationEnabled {
+		limits := configuredDKIM2StoreLimits(cfg.DKIM2)
+		authorities := []config.DKIM2LDAPAuthority{
+			cfg.DKIM2.LDAPAuthorities.Snapshot, cfg.DKIM2.LDAPAuthorities.Staging,
+			cfg.DKIM2.LDAPAuthorities.Activation, cfg.DKIM2.LDAPAuthorities.Purge,
+		}
+		purposes := []ldapstore.AuthorityPurpose{
+			ldapstore.AuthoritySnapshot, ldapstore.AuthorityStaging,
+			ldapstore.AuthorityActivation, ldapstore.AuthorityPurge,
+		}
+		roleRepositories := make([]*dkim2store.LDAPRepository, 0, len(authorities))
+		for index, authority := range authorities {
+			client, clientErr := ldapstore.NewAuthorityClient(cfg, authority, purposes[index])
+			if clientErr != nil {
+				_ = manager.Close()
+				return nil, clientErr
+			}
+			manager.ldap = append(manager.ldap, client)
+			roleRepository, repositoryErr := dkim2store.NewLDAPRepository(client, limits)
+			if repositoryErr != nil {
+				_ = manager.Close()
+				return nil, repositoryErr
+			}
+			roleRepositories = append(roleRepositories, roleRepository)
+		}
+		campaignRepository, roleErr := dkim2store.NewRoleRepository(
+			roleRepositories[0], roleRepositories[1], roleRepositories[2], roleRepositories[3],
+		)
+		if roleErr != nil {
+			_ = manager.Close()
+			return nil, roleErr
+		}
+		manager.campaignRepository = campaignRepository
+	}
 	if opts.UpdateDNS {
 		if !cfg.AuthenticatedDNSUpdatesConfigured() {
-			_ = ldapClient.Close()
+			_ = manager.Close()
 			return nil, errors.New("DKIM2 DNS update requires a nameserver, positive TTL, and complete TSIG configuration")
 		}
 	}
@@ -137,7 +173,7 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 	if opts.UpdateDNS && !opts.DryRun && !deferredLifecycleDNS {
 		manager.dns, err = dnsupdate.New(cfg)
 		if err != nil {
-			_ = ldapClient.Close()
+			_ = manager.Close()
 			return nil, err
 		}
 	}
@@ -146,10 +182,17 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 
 // Close releases the selected LDAP transport without retaining protected material.
 func (m *DKIM2Manager) Close() error {
-	if m == nil || m.ldap == nil {
+	if m == nil {
 		return nil
 	}
-	return m.ldap.Close()
+	var result error
+	for _, client := range m.ldap {
+		if client != nil {
+			result = errors.Join(result, client.Close())
+		}
+	}
+	m.ldap = nil
+	return result
 }
 
 // Run rejects legacy lifecycle semantics before dispatching one native command.
@@ -178,7 +221,7 @@ func (m *DKIM2Manager) Run() (*RunResult, error) {
 		}
 	}
 	defer cancel()
-	ctx = dkim2store.WithLifecycleWorkBudget(ctx, m.cfg.DKIM2.HistoryLimit)
+	ctx = dkim2store.WithLifecycleWorkBudget(ctx, configuredDKIM2StoreLimits(m.cfg.DKIM2))
 	if (m.opts.Create || m.opts.Active || m.opts.Rotate || m.opts.Auto ||
 		m.opts.RetireGenerationSet || m.opts.RollbackFromGenerationSet) && !m.opts.DryRun {
 		if err := m.authorizeWrite(ctx); err != nil {
@@ -812,13 +855,13 @@ func (m *DKIM2Manager) loadMutationHistory(ctx context.Context, current *dkim2mo
 	return history, nil
 }
 
-// retainedRootsContiguous validates an order-independent complete 1..maximum root set.
+// retainedRootsContiguous validates an order-independent complete retained suffix.
 func retainedRootsContiguous(roots []dkim2store.GenerationRoot) bool {
 	if len(roots) == 0 {
 		return false
 	}
 	seen := make(map[uint64]struct{}, len(roots))
-	maximum := uint64(0)
+	minimum, maximum := ^uint64(0), uint64(0)
 	for _, root := range roots {
 		if root.Number == 0 {
 			return false
@@ -827,14 +870,17 @@ func retainedRootsContiguous(roots []dkim2store.GenerationRoot) bool {
 			return false
 		}
 		seen[root.Number] = struct{}{}
+		if root.Number < minimum {
+			minimum = root.Number
+		}
 		if root.Number > maximum {
 			maximum = root.Number
 		}
 	}
-	if maximum != uint64(len(roots)) {
+	if maximum-minimum+1 != uint64(len(roots)) {
 		return false
 	}
-	for number := uint64(1); number <= maximum; number++ {
+	for number := minimum; number <= maximum; number++ {
 		if _, found := seen[number]; !found {
 			return false
 		}

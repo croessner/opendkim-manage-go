@@ -232,7 +232,8 @@ func (m *DKIM2Manager) prepareRotation(ctx context.Context, binding lifecycleBin
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{
 		Current: current, NextGeneration: current.Number() + 1,
 		TenantID: binding.tenant, Domain: binding.domain, Use: binding.use,
-		Algorithms: algorithms, RSABits: m.opts.Size, Random: m.random, History: history,
+		Algorithms: algorithms, RSABits: m.opts.Size,
+		AllocationAttempts: m.cfg.DKIM2.IdentifierAllocationAttempts, Random: m.random, History: history,
 	})
 	if err != nil {
 		return nil, errors.New("DKIM2 rotation candidate cannot be built safely")

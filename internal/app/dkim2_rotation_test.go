@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +40,10 @@ type fakeRotationRepository struct {
 	failAfterCommit   bool
 	stageCalls        int
 	commitCalls       int
+	campaignMetadata  *dkim2model.CandidateMetadata
+	deleteCalls       []uint64
+	deleteFailures    int
+	inventoryOverride *dkim2store.GenerationInventory
 }
 
 func (f *fakeRotationRepository) event(name string) error {
@@ -196,7 +202,29 @@ func (f *fakeRotationRepository) LoadPending(_ context.Context, number uint64, _
 	if f.pending == nil || f.pending.Number() != number {
 		return nil, dkim2store.ErrMalformed
 	}
-	return dkim2store.NewPreparedGeneration(number-1, f.observed, f.pending)
+	if f.campaignMetadata == nil {
+		return dkim2store.NewPreparedGeneration(number-1, f.observed, f.pending)
+	}
+	return dkim2store.NewCampaignPreparedGeneration(number-1, f.observed, f.pending, *f.campaignMetadata)
+}
+
+func (f *fakeRotationRepository) StageCampaign(_ context.Context, candidate *dkim2model.Generation, metadata dkim2model.CandidateMetadata) (*dkim2store.PreparedGeneration, error) {
+	f.stageCalls++
+	if err := f.event("stage"); err != nil && !f.stageLost {
+		return nil, err
+	}
+	if f.pending != nil {
+		_ = f.pending.Close()
+	}
+	owned, err := candidate.Clone()
+	if err != nil {
+		return nil, err
+	}
+	f.pending, f.observed, f.campaignMetadata = owned, candidate.Number()-1, &metadata
+	if f.stageLost {
+		return nil, dkim2store.ErrUnavailable
+	}
+	return dkim2store.NewCampaignPreparedGeneration(candidate.Number()-1, f.observed, candidate, metadata)
 }
 
 func (f *fakeRotationRepository) CommitAndSwitch(_ context.Context, number uint64, _ int) error {
@@ -220,6 +248,64 @@ func (f *fakeRotationRepository) CommitAndSwitch(_ context.Context, number uint6
 	if f.activationLost {
 		return dkim2store.ErrUnavailable
 	}
+	return nil
+}
+
+func (f *fakeRotationRepository) CommitCampaignAndSwitch(_ context.Context, prepared *dkim2store.PreparedGeneration) error {
+	if prepared == nil {
+		return dkim2store.ErrMalformed
+	}
+	return f.CommitAndSwitch(context.Background(), prepared.CandidateNumber(), 0)
+}
+
+func (f *fakeRotationRepository) InventoryGenerations(context.Context) (dkim2store.GenerationInventory, error) {
+	if f.inventoryOverride != nil {
+		return dkim2store.GenerationInventory{Current: f.inventoryOverride.Current,
+			Roots: append([]dkim2store.GenerationInventoryRoot(nil), f.inventoryOverride.Roots...)}, nil
+	}
+	current := f.observed
+	if current == 0 && f.current != nil {
+		current = f.current.Number()
+	}
+	roots := make([]dkim2store.GenerationInventoryRoot, 0, len(f.retained)+2)
+	seen := map[uint64]struct{}{}
+	for _, generation := range f.retained {
+		if generation != nil {
+			roots = append(roots, dkim2store.GenerationInventoryRoot{Number: generation.Number(), Schema: dkim2model.SchemaVersionV3,
+				State: generation.State(), WasActive: true, Complete: true})
+			seen[generation.Number()] = struct{}{}
+		}
+	}
+	for _, generation := range []*dkim2model.Generation{f.current, f.pending} {
+		if generation == nil {
+			continue
+		}
+		if _, found := seen[generation.Number()]; found {
+			continue
+		}
+		roots = append(roots, dkim2store.GenerationInventoryRoot{Number: generation.Number(), Schema: dkim2model.SchemaVersionV3,
+			State: generation.State(), WasActive: true, Complete: true})
+	}
+	sort.Slice(roots, func(i, j int) bool { return roots[i].Number < roots[j].Number })
+	return dkim2store.GenerationInventory{Current: current, Roots: roots}, nil
+}
+
+func (f *fakeRotationRepository) DeleteGeneration(_ context.Context, plan dkim2store.GenerationPurgePlan) error {
+	generation := plan.Generation()
+	f.deleteCalls = append(f.deleteCalls, generation)
+	if f.deleteFailures > 0 {
+		f.deleteFailures--
+		return dkim2store.ErrOutcomeUncertain
+	}
+	if f.inventoryOverride != nil {
+		for index, root := range f.inventoryOverride.Roots {
+			if root.Number == generation {
+				f.inventoryOverride.Roots = append(f.inventoryOverride.Roots[:index], f.inventoryOverride.Roots[index+1:]...)
+				break
+			}
+		}
+	}
+	delete(f.retained, generation)
 	return nil
 }
 
@@ -458,7 +544,7 @@ func TestDKIM2ResumeUsesStoredCandidateWithoutRandomnessAndReconcilesPartialDNS(
 	history, _ := repository.LoadRetainedHistory(context.Background(), 8)
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{Current: current, NextGeneration: 2,
 		TenantID: "tenant-test", Domain: "example.test", Use: dkim2model.ProfileUseOriginator,
-		RSABits: 2048, Random: rand.Reader, History: history})
+		RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -491,7 +577,7 @@ func TestDKIM2ResumeDryRunTruthfullyReportsStoredCandidate(t *testing.T) {
 	history, _ := repository.LoadRetainedHistory(context.Background(), 8)
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{Current: current, NextGeneration: 2,
 		TenantID: "tenant-test", Domain: "example.test", Use: dkim2model.ProfileUseOriginator,
-		RSABits: 2048, Random: rand.Reader, History: history})
+		RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +607,7 @@ func TestDKIM2ResumeRejectsMismatchedExplicitKeyTypeBeforeDNSOrMutation(t *testi
 	history, _ := repository.LoadRetainedHistory(context.Background(), 8)
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{Current: current, NextGeneration: 2,
 		TenantID: "tenant-test", Domain: "example.test", Use: dkim2model.ProfileUseOriginator,
-		RSABits: 2048, Random: rand.Reader, History: history})
+		RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -551,7 +637,7 @@ func TestDKIM2ResumeRejectsSameDomainDifferentBindingIdentity(t *testing.T) {
 	history, _ := repository.LoadRetainedHistory(context.Background(), 8)
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{Current: current, NextGeneration: 2,
 		TenantID: "other-tenant", Domain: "example.test", Use: dkim2model.ProfileUseOriginator,
-		RSABits: 2048, Random: rand.Reader, History: history})
+		RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +656,7 @@ func TestDKIM2AlreadyActivatedResumeValidatesRequestedBindingBeforeSuccess(t *te
 	history, _ := repository.LoadRetainedHistory(context.Background(), 8)
 	candidate, err := dkim2model.PlanRotation(dkim2model.RotationPlan{Current: current, NextGeneration: 2,
 		TenantID: "tenant-test", Domain: "example.test", Use: dkim2model.ProfileUseOriginator,
-		RSABits: 2048, Random: rand.Reader, History: history})
+		RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -657,7 +743,7 @@ func TestDKIM2LostStageResponseNeverAdoptsConcurrentForeignCandidate(t *testing.
 	history, _ := repository.LoadRetainedHistory(context.Background(), 8)
 	foreign, err := dkim2model.PlanRotation(dkim2model.RotationPlan{Current: current, NextGeneration: 2,
 		TenantID: "tenant-test", Domain: "example.test", Use: dkim2model.ProfileUseOriginator,
-		RSABits: 2048, Random: rand.Reader, History: history})
+		RSABits: 2048, AllocationAttempts: 16, Random: rand.Reader, History: history})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -814,16 +900,28 @@ func TestDKIM2RotationErrorsDoNotPropagateProtectedBackendMarkers(t *testing.T) 
 
 func newRotationHarness(t *testing.T, current *dkim2model.Generation, opts *cli.Options) (*DKIM2Manager, *fakeRotationRepository, *[]string) {
 	t.Helper()
+	journalDirectory := t.TempDir()
+	if err := os.Chmod(journalDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	events := &[]string{}
 	repository := &fakeRotationRepository{current: current, observed: current.Number(), events: events, fail: map[string]error{}, retained: map[uint64]*dkim2model.Generation{}}
 	cfg := &config.Config{Global: config.GlobalConfig{Mode: types.ModeDKIM2, KeyType: "both"},
 		DKIM2: config.DKIM2Config{TenantID: "tenant-test", ProfileUse: "originator", Rollout: "enforce", Compatibility: "strict",
-			HistoryLimit: 8, RotateAfterDays: 365, RunTimeoutSeconds: 30, DNSQueryTimeoutSeconds: 1,
-			ProofPollIntervalSeconds: 1, ProofMaxAttempts: 2, RetirementMinOverlapSeconds: 7 * 24 * 60 * 60},
+			HistoryLimit: 8, MaxCampaignBindings: 16, MaxGenerationEntries: 1024,
+			MaxAttributeBytes: 64 << 10, MaxDatasetBytes: 4 << 20, MaxLDAPRequests: 4096,
+			MaxLDAPBytes: 8 << 20, MaxRetainedRootVisits: 32, IdentifierAllocationAttempts: 32,
+			PublicationReadbackAttempts: 8, PublicationReadbackIntervalMillis: 1, LDAPSearchTimeLimitSeconds: 30,
+			LDAPOperationTimeoutSeconds: 30, AuthorityPasswordMaxBytes: 1024,
+			RotateAfterDays: 365, MaxClockSkewSeconds: 300, RunTimeoutSeconds: 30, DNSQueryTimeoutSeconds: 1,
+			ProofPollIntervalSeconds: 1, ProofMaxAttempts: 2, RetirementMinOverlapSeconds: 7 * 24 * 60 * 60,
+			Retention: config.DKIM2RetentionConfig{Enabled: true, MaxGenerations: 6, MinRollbackGenerations: 2,
+				MaxDeleteBatch: 2, JournalFile: journalDirectory + "/retention-plan.json", MaxJournalBytes: 4096}},
 		DNS: config.DNSConfig{PrimaryNameserver: "127.0.0.1:53", RecursiveNameserver: "127.0.0.2:53", TTL: 300,
 			TSIGKeyName: "synthetic-key", TSIGKeyFile: "/synthetic/key", Algorithm: "hmac_sha256"}, KeyType: types.DKIMKeyTypeBoth}
 	manager := &DKIM2Manager{cfg: cfg, opts: opts, repository: repository, rotationRepository: repository,
-		random: rand.Reader, in: strings.NewReader("yes\n"), out: io.Discard, now: func() time.Time { return time.Now().UTC() }}
+		campaignRepository: repository,
+		random:             rand.Reader, in: strings.NewReader("yes\n"), out: io.Discard, now: func() time.Time { return time.Now().UTC() }}
 	return manager, repository, events
 }
 

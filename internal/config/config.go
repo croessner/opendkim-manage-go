@@ -7,9 +7,11 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/go-ldap/ldap/v3"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 
@@ -36,20 +38,59 @@ type GlobalConfig struct {
 
 // DKIM2Config contains the closed policy inputs needed to construct a native DKIM2 dataset.
 type DKIM2Config struct {
-	TenantID                    string `mapstructure:"tenant_id" yaml:"tenant_id"`
-	ProfileUse                  string `mapstructure:"profile_use" yaml:"profile_use"`
-	Rollout                     string `mapstructure:"rollout" yaml:"rollout"`
-	Compatibility               string `mapstructure:"compatibility" yaml:"compatibility"`
-	FeedbackRouteID             string `mapstructure:"feedback_route_id" yaml:"feedback_route_id"`
-	RotationEnabled             bool   `mapstructure:"rotation_enabled" yaml:"rotation_enabled"`
-	RotateAfterDays             int    `mapstructure:"rotate_after_days" yaml:"rotate_after_days"`
-	HistoryLimit                int    `mapstructure:"history_limit" yaml:"history_limit"`
-	MaxClockSkewSeconds         int    `mapstructure:"max_clock_skew_seconds" yaml:"max_clock_skew_seconds"`
-	RunTimeoutSeconds           int    `mapstructure:"run_timeout_seconds" yaml:"run_timeout_seconds"`
-	ProofPollIntervalSeconds    int    `mapstructure:"proof_poll_interval_seconds" yaml:"proof_poll_interval_seconds"`
-	ProofMaxAttempts            int    `mapstructure:"proof_max_attempts" yaml:"proof_max_attempts"`
-	DNSQueryTimeoutSeconds      int    `mapstructure:"dns_query_timeout_seconds" yaml:"dns_query_timeout_seconds"`
-	RetirementMinOverlapSeconds int    `mapstructure:"retirement_min_overlap_seconds" yaml:"retirement_min_overlap_seconds"`
+	TenantID                          string               `mapstructure:"tenant_id" yaml:"tenant_id"`
+	ProfileUse                        string               `mapstructure:"profile_use" yaml:"profile_use"`
+	Rollout                           string               `mapstructure:"rollout" yaml:"rollout"`
+	Compatibility                     string               `mapstructure:"compatibility" yaml:"compatibility"`
+	FeedbackRouteID                   string               `mapstructure:"feedback_route_id" yaml:"feedback_route_id"`
+	RotationEnabled                   bool                 `mapstructure:"rotation_enabled" yaml:"rotation_enabled"`
+	RotateAfterDays                   int                  `mapstructure:"rotate_after_days" yaml:"rotate_after_days"`
+	HistoryLimit                      int                  `mapstructure:"history_limit" yaml:"history_limit"`
+	MaxCampaignBindings               int                  `mapstructure:"max_campaign_bindings" yaml:"max_campaign_bindings"`
+	MaxGenerationEntries              int                  `mapstructure:"max_generation_entries" yaml:"max_generation_entries"`
+	MaxAttributeBytes                 int                  `mapstructure:"max_attribute_bytes" yaml:"max_attribute_bytes"`
+	MaxDatasetBytes                   int                  `mapstructure:"max_dataset_bytes" yaml:"max_dataset_bytes"`
+	MaxLDAPRequests                   int                  `mapstructure:"max_ldap_requests" yaml:"max_ldap_requests"`
+	MaxLDAPBytes                      int                  `mapstructure:"max_ldap_bytes" yaml:"max_ldap_bytes"`
+	MaxRetainedRootVisits             int                  `mapstructure:"max_retained_root_visits" yaml:"max_retained_root_visits"`
+	IdentifierAllocationAttempts      int                  `mapstructure:"identifier_allocation_attempts" yaml:"identifier_allocation_attempts"`
+	PublicationReadbackAttempts       int                  `mapstructure:"publication_readback_attempts" yaml:"publication_readback_attempts"`
+	PublicationReadbackIntervalMillis int                  `mapstructure:"publication_readback_interval_millis" yaml:"publication_readback_interval_millis"`
+	LDAPSearchTimeLimitSeconds        int                  `mapstructure:"ldap_search_time_limit_seconds" yaml:"ldap_search_time_limit_seconds"`
+	LDAPOperationTimeoutSeconds       int                  `mapstructure:"ldap_operation_timeout_seconds" yaml:"ldap_operation_timeout_seconds"`
+	AuthorityPasswordMaxBytes         int                  `mapstructure:"authority_password_max_bytes" yaml:"authority_password_max_bytes"`
+	MaxClockSkewSeconds               int                  `mapstructure:"max_clock_skew_seconds" yaml:"max_clock_skew_seconds"`
+	RunTimeoutSeconds                 int                  `mapstructure:"run_timeout_seconds" yaml:"run_timeout_seconds"`
+	ProofPollIntervalSeconds          int                  `mapstructure:"proof_poll_interval_seconds" yaml:"proof_poll_interval_seconds"`
+	ProofMaxAttempts                  int                  `mapstructure:"proof_max_attempts" yaml:"proof_max_attempts"`
+	DNSQueryTimeoutSeconds            int                  `mapstructure:"dns_query_timeout_seconds" yaml:"dns_query_timeout_seconds"`
+	RetirementMinOverlapSeconds       int                  `mapstructure:"retirement_min_overlap_seconds" yaml:"retirement_min_overlap_seconds"`
+	Retention                         DKIM2RetentionConfig `mapstructure:"retention" yaml:"retention"`
+	LDAPAuthorities                   DKIM2LDAPAuthorities `mapstructure:"ldap_authorities" yaml:"ldap_authorities"`
+}
+
+// DKIM2RetentionConfig contains every bounded automatic history-deletion policy.
+type DKIM2RetentionConfig struct {
+	Enabled                bool   `mapstructure:"enabled" yaml:"enabled"`
+	MaxGenerations         int    `mapstructure:"max_generations" yaml:"max_generations"`
+	MinRollbackGenerations int    `mapstructure:"min_rollback_generations" yaml:"min_rollback_generations"`
+	MaxDeleteBatch         int    `mapstructure:"max_delete_batch" yaml:"max_delete_batch"`
+	JournalFile            string `mapstructure:"journal_file" yaml:"journal_file"`
+	MaxJournalBytes        int    `mapstructure:"max_journal_bytes" yaml:"max_journal_bytes"`
+}
+
+// DKIM2LDAPAuthority identifies one least-privilege simple-bind role.
+type DKIM2LDAPAuthority struct {
+	BindDN       string `mapstructure:"bind_dn" yaml:"bind_dn"`
+	PasswordFile string `mapstructure:"password_file" yaml:"password_file"`
+}
+
+// DKIM2LDAPAuthorities separates automatic campaign read and write ownership.
+type DKIM2LDAPAuthorities struct {
+	Snapshot   DKIM2LDAPAuthority `mapstructure:"snapshot" yaml:"snapshot"`
+	Staging    DKIM2LDAPAuthority `mapstructure:"staging" yaml:"staging"`
+	Activation DKIM2LDAPAuthority `mapstructure:"activation" yaml:"activation"`
+	Purge      DKIM2LDAPAuthority `mapstructure:"purge" yaml:"purge"`
 }
 
 type LDAPConfig struct {
@@ -116,9 +157,17 @@ func defaultConfig() Config {
 			RecursiveNameserver: "127.0.0.2:53",
 		},
 		DKIM2: DKIM2Config{
-			RotateAfterDays: 365, HistoryLimit: 1024, MaxClockSkewSeconds: 300,
-			RunTimeoutSeconds: 900, ProofPollIntervalSeconds: 5, ProofMaxAttempts: 60,
+			RotateAfterDays: 30, HistoryLimit: 16384, MaxCampaignBindings: 16384,
+			MaxGenerationEntries: 131072, MaxAttributeBytes: 64 << 10, MaxDatasetBytes: 1 << 30,
+			MaxLDAPRequests: 262144, MaxLDAPBytes: 1 << 30, MaxRetainedRootVisits: 32768,
+			IdentifierAllocationAttempts: 32, PublicationReadbackAttempts: 8,
+			PublicationReadbackIntervalMillis: 25, LDAPSearchTimeLimitSeconds: 30,
+			LDAPOperationTimeoutSeconds: 60, AuthorityPasswordMaxBytes: 16 << 10,
+			MaxClockSkewSeconds: 300, RunTimeoutSeconds: 86400,
+			ProofPollIntervalSeconds: 5, ProofMaxAttempts: 3600,
 			DNSQueryTimeoutSeconds: 5, RetirementMinOverlapSeconds: 604800,
+			Retention: DKIM2RetentionConfig{Enabled: true, MaxGenerations: 12, MinRollbackGenerations: 2, MaxDeleteBatch: 64,
+				JournalFile: "/var/lib/opendkim-manage-go/dkim2-retention-plan.json", MaxJournalBytes: 4096},
 		},
 		Scheme: types.DefaultScheme(),
 	}
@@ -339,6 +388,11 @@ func (c *Config) ValidateForMode(mode types.Mode) error {
 		if err := c.DKIM2.validate(); err != nil {
 			return err
 		}
+		if c.DKIM2.RotationEnabled {
+			if method := strings.ToLower(strings.TrimSpace(c.LDAP.BindMethod)); method != "" && method != "simple" {
+				return errors.New("DKIM2 automatic rotation requires simple-bind role authorities")
+			}
+		}
 		primary, err := canonicalEndpoint(c.DNS.PrimaryNameserver)
 		if err != nil {
 			return fmt.Errorf("dns.primary_nameserver: %w", err)
@@ -384,8 +438,47 @@ func (c DKIM2Config) validate() error {
 	if c.RotateAfterDays < 1 || c.RotateAfterDays > 36500 {
 		return errors.New("dkim2.rotate_after_days must be between 1 and 36500")
 	}
-	if c.HistoryLimit < 2 || c.HistoryLimit > 4096 {
-		return errors.New("dkim2.history_limit must be between 2 and 4096")
+	if c.HistoryLimit < 2 || c.HistoryLimit > 16384 {
+		return errors.New("dkim2.history_limit must be between 2 and 16384")
+	}
+	if c.MaxCampaignBindings < 1 || c.MaxCampaignBindings > 1000000 {
+		return errors.New("dkim2.max_campaign_bindings must be between 1 and 1000000")
+	}
+	if c.MaxGenerationEntries < 6 || c.MaxGenerationEntries > 1000000 {
+		return errors.New("dkim2.max_generation_entries must be between 6 and 1000000")
+	}
+	if c.MaxAttributeBytes < 1024 || c.MaxAttributeBytes > 1<<20 {
+		return errors.New("dkim2.max_attribute_bytes must be between 1024 and 1048576")
+	}
+	if c.MaxDatasetBytes < 1<<20 || c.MaxDatasetBytes > 1<<30 {
+		return errors.New("dkim2.max_dataset_bytes must be between 1048576 and 1073741824")
+	}
+	if c.MaxLDAPRequests < 32 || c.MaxLDAPRequests > 1000000 {
+		return errors.New("dkim2.max_ldap_requests must be between 32 and 1000000")
+	}
+	if c.MaxLDAPBytes < c.MaxDatasetBytes || c.MaxLDAPBytes > 1<<30 {
+		return errors.New("dkim2.max_ldap_bytes must be at least max_dataset_bytes and at most 1073741824")
+	}
+	if c.MaxRetainedRootVisits < c.HistoryLimit || c.MaxRetainedRootVisits > 1000000 {
+		return errors.New("dkim2.max_retained_root_visits must be at least history_limit and at most 1000000")
+	}
+	if c.IdentifierAllocationAttempts < 1 || c.IdentifierAllocationAttempts > 1024 {
+		return errors.New("dkim2.identifier_allocation_attempts must be between 1 and 1024")
+	}
+	if c.PublicationReadbackAttempts < 1 || c.PublicationReadbackAttempts > 128 {
+		return errors.New("dkim2.publication_readback_attempts must be between 1 and 128")
+	}
+	if c.PublicationReadbackIntervalMillis < 1 || c.PublicationReadbackIntervalMillis > 10000 {
+		return errors.New("dkim2.publication_readback_interval_millis must be between 1 and 10000")
+	}
+	if c.LDAPSearchTimeLimitSeconds < 1 || c.LDAPSearchTimeLimitSeconds > 300 {
+		return errors.New("dkim2.ldap_search_time_limit_seconds must be between 1 and 300")
+	}
+	if c.LDAPOperationTimeoutSeconds < 1 || c.LDAPOperationTimeoutSeconds > 3600 {
+		return errors.New("dkim2.ldap_operation_timeout_seconds must be between 1 and 3600")
+	}
+	if c.AuthorityPasswordMaxBytes < 1 || c.AuthorityPasswordMaxBytes > 1<<20 {
+		return errors.New("dkim2.authority_password_max_bytes must be between 1 and 1048576")
 	}
 	if c.MaxClockSkewSeconds < 0 || c.MaxClockSkewSeconds > 3600 {
 		return errors.New("dkim2.max_clock_skew_seconds must be between 0 and 3600")
@@ -404,6 +497,62 @@ func (c DKIM2Config) validate() error {
 	}
 	if c.RetirementMinOverlapSeconds < 3600 || c.RetirementMinOverlapSeconds > 31536000 {
 		return errors.New("dkim2.retirement_min_overlap_seconds must be between 3600 and 31536000")
+	}
+	if c.Retention.MaxGenerations < 1 || c.Retention.MaxGenerations > c.HistoryLimit {
+		return errors.New("dkim2.retention.max_generations must be between 1 and history_limit")
+	}
+	if c.Retention.MinRollbackGenerations < 0 || c.Retention.MinRollbackGenerations >= c.Retention.MaxGenerations {
+		return errors.New("dkim2.retention.min_rollback_generations must be at least 0 and less than max_generations")
+	}
+	if c.Retention.MaxDeleteBatch < 1 || c.Retention.MaxDeleteBatch > c.HistoryLimit {
+		return errors.New("dkim2.retention.max_delete_batch must be between 1 and history_limit")
+	}
+	if c.Retention.MaxJournalBytes < 512 || c.Retention.MaxJournalBytes > 1<<20 {
+		return errors.New("dkim2.retention.max_journal_bytes must be between 512 and 1048576")
+	}
+	if (c.RotationEnabled && c.Retention.Enabled || c.Retention.JournalFile != "") &&
+		(c.Retention.JournalFile == "" || !filepath.IsAbs(c.Retention.JournalFile) ||
+			filepath.Clean(c.Retention.JournalFile) != c.Retention.JournalFile) {
+		return errors.New("dkim2.retention.journal_file must be one clean absolute path")
+	}
+	if c.RotationEnabled {
+		if strings.EqualFold(strings.TrimSpace(c.LDAPAuthorities.Snapshot.BindDN), strings.TrimSpace(c.LDAPAuthorities.Staging.BindDN)) ||
+			strings.EqualFold(strings.TrimSpace(c.LDAPAuthorities.Snapshot.BindDN), strings.TrimSpace(c.LDAPAuthorities.Activation.BindDN)) ||
+			strings.EqualFold(strings.TrimSpace(c.LDAPAuthorities.Snapshot.BindDN), strings.TrimSpace(c.LDAPAuthorities.Purge.BindDN)) ||
+			strings.EqualFold(strings.TrimSpace(c.LDAPAuthorities.Staging.BindDN), strings.TrimSpace(c.LDAPAuthorities.Activation.BindDN)) ||
+			strings.EqualFold(strings.TrimSpace(c.LDAPAuthorities.Staging.BindDN), strings.TrimSpace(c.LDAPAuthorities.Purge.BindDN)) ||
+			strings.EqualFold(strings.TrimSpace(c.LDAPAuthorities.Activation.BindDN), strings.TrimSpace(c.LDAPAuthorities.Purge.BindDN)) {
+			return errors.New("dkim2.ldap_authorities bind DNs must be distinct")
+		}
+		paths := make(map[string]struct{}, 4)
+		for name, authority := range map[string]DKIM2LDAPAuthority{
+			"snapshot": c.LDAPAuthorities.Snapshot, "staging": c.LDAPAuthorities.Staging,
+			"activation": c.LDAPAuthorities.Activation, "purge": c.LDAPAuthorities.Purge,
+		} {
+			if err := validateDKIM2LDAPAuthority(authority); err != nil {
+				return fmt.Errorf("dkim2.ldap_authorities.%s: %w", name, err)
+			}
+			if _, duplicate := paths[authority.PasswordFile]; duplicate {
+				return errors.New("dkim2.ldap_authorities password files must be distinct")
+			}
+			paths[authority.PasswordFile] = struct{}{}
+			if authority.PasswordFile == c.Retention.JournalFile {
+				return errors.New("dkim2 retention journal and authority password files must be distinct")
+			}
+		}
+	}
+	return nil
+}
+
+func validateDKIM2LDAPAuthority(authority DKIM2LDAPAuthority) error {
+	bindDN := strings.TrimSpace(authority.BindDN)
+	parsed, err := ldap.ParseDN(bindDN)
+	if err != nil || bindDN == "" || parsed.String() != bindDN {
+		return errors.New("bind_dn must be one canonical non-empty LDAP DN")
+	}
+	if authority.PasswordFile == "" || !filepath.IsAbs(authority.PasswordFile) ||
+		filepath.Clean(authority.PasswordFile) != authority.PasswordFile {
+		return errors.New("password_file must be one clean absolute path")
 	}
 	return nil
 }

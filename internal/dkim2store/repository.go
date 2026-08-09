@@ -49,6 +49,15 @@ type RotationRepository interface {
 	CommitAndSwitch(context.Context, uint64, int) error
 }
 
+// CampaignRepository owns autonomous operation-bound v3 campaign staging and retention.
+type CampaignRepository interface {
+	RotationRepository
+	StageCampaign(context.Context, *dkim2model.Generation, dkim2model.CandidateMetadata) (*PreparedGeneration, error)
+	CommitCampaignAndSwitch(context.Context, *PreparedGeneration) error
+	InventoryGenerations(context.Context) (GenerationInventory, error)
+	DeleteGeneration(context.Context, GenerationPurgePlan) error
+}
+
 const preparedGenerationRedacted = "dkim2store.PreparedGeneration{redacted}"
 
 // PreparedGeneration owns one exact staged or committed-but-unreachable readback.
@@ -56,6 +65,15 @@ type PreparedGeneration struct {
 	expectedCurrent uint64
 	observedCurrent uint64
 	candidate       *dkim2model.Generation
+	metadata        *dkim2model.CandidateMetadata
+}
+
+// CampaignMetadata returns exact protected v3 metadata only for campaign candidates.
+func (p *PreparedGeneration) CampaignMetadata() (dkim2model.CandidateMetadata, bool) {
+	if p == nil || p.metadata == nil {
+		return dkim2model.CandidateMetadata{}, false
+	}
+	return *p.metadata, true
 }
 
 func newPreparedGeneration(expected, observed uint64, candidate *dkim2model.Generation) (*PreparedGeneration, error) {
@@ -79,6 +97,30 @@ func NewPreparedGeneration(expected, observed uint64, candidate *dkim2model.Gene
 		return nil, ErrMalformed
 	}
 	return newPreparedGeneration(expected, observed, owned)
+}
+
+// NewCampaignPreparedGeneration constructs detached exact v3 evidence for repository implementations and tests.
+func NewCampaignPreparedGeneration(
+	expected, observed uint64,
+	candidate *dkim2model.Generation,
+	metadata dkim2model.CandidateMetadata,
+) (*PreparedGeneration, error) {
+	prepared, err := NewPreparedGeneration(expected, observed, candidate)
+	if err != nil {
+		return nil, err
+	}
+	owned, err := prepared.Generation()
+	if err != nil || metadata.SourceGeneration() != expected || metadata.Generation() != prepared.CandidateNumber() ||
+		metadata.ValidateCandidate(owned) != nil {
+		if owned != nil {
+			_ = owned.Close()
+		}
+		_ = prepared.Close()
+		return nil, ErrMalformed
+	}
+	_ = owned.Close()
+	prepared.metadata = &metadata
+	return prepared, nil
 }
 
 func (p *PreparedGeneration) ExpectedCurrent() uint64 {
@@ -118,7 +160,24 @@ func (p *PreparedGeneration) Close() error {
 	p.candidate = nil
 	p.expectedCurrent = 0
 	p.observedCurrent = 0
+	p.metadata = nil
 	return err
+}
+
+// GenerationInventory is one complete, current-fenced bounded retention snapshot.
+type GenerationInventory struct {
+	Current uint64
+	Roots   []GenerationInventoryRoot
+}
+
+// GenerationInventoryRoot contains only deletion-classification facts proven by full readback.
+type GenerationInventoryRoot struct {
+	Number    uint64
+	Schema    string
+	State     dkim2model.DatasetState
+	WasActive bool
+	Complete  bool
+	Metadata  dkim2model.CandidateMetadata
 }
 
 func (*PreparedGeneration) String() string   { return preparedGenerationRedacted }

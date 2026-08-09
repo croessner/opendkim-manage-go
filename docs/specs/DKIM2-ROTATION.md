@@ -1,4 +1,4 @@
-# Native DKIM2 Rotation
+# Autonomous Native DKIM2 Rotation And Retention
 
 Status: source-code implementation contract. This document does not claim a
 deployment, runtime reload, queue drain, mail-flow verification, backup, or
@@ -6,20 +6,23 @@ external signature switchover.
 
 This specification extends only `mode: dkim2`. The OpenDKIM mode, its default
 selection, mutable selector lifecycle, and command semantics remain unchanged.
-The native key model is compatible with `dkim2-datasource-v2`; the rotation
-contract is pinned to DKIM2 commit
-`75e2bb2ba6a71fc4f017201da021b5509acbfb4f`, including its empty-v2 layout,
-native LDAP key custody, immutable generation trees, exact readback, and
-critical publication fences. The obsolete v1 pre-created-current layout is not
-accepted.
+The implementation is an autonomous lifecycle owner. It neither imports nor
+executes another DKIM implementation and it does not require another project's
+binary, image, command line, journal, report, or private API. Interoperability
+is limited to the independently implemented, versioned LDAP and DNS wire
+contracts. Manual compatibility operations may read retained
+`dkim2-datasource-v2` generations. Every new automatic campaign candidate uses
+the complete operation-bound `dkim2-datasource-v3` wire format.
 
 ## Security Invariants
 
 - The current committed generation remains active until every new DNS record
   passes fresh authoritative and recursive proof.
-- A candidate is a complete all-domain snapshot. Rotation replaces every
-  credential, handle, and key-material record in exactly one active binding;
-  unrelated records and all profile and policy facts remain logically equal.
+- A candidate is one complete frozen all-domain snapshot. One automatic run
+  determines every due active binding before key generation, replaces all of
+  those bindings in the same candidate, preserves every non-due binding, and
+  creates at most one generation. `cn=current` moves at most once, and only
+  after every candidate DNS record has passed fresh proof.
 - Selectors and handles are allocated with bounded cryptographic randomness
   and may not collide with any retained generation.
 - Private PKCS#8 material is stored only in an unreachable LDAP candidate. It
@@ -38,8 +41,23 @@ accepted.
 - `cn=current` moves only forward under a critical exact-current assertion.
   A staging root becomes committed only under a critical exact-staging
   assertion. Committed generation contents are never edited.
-- Automatic rotation handles at most one binding and never retires DNS or
-  deletes LDAP history. Retirement is a separate explicit operation.
+- Automatic retention is a separate phase after activation or an idle run. It
+  never deletes current, staging, committed-but-unreachable, malformed,
+  incomplete, foreign, or rollback-reserve generations. Each deletion is
+  leaf-first/root-last, bounded, exact-readback verified, and fenced by a fresh
+  unchanged current pointer.
+- Automatic snapshot, staging, activation, and purge operations use four
+  distinct LDAP identities. Passwords are read only from distinct owner-only
+  files. A single omnibus automatic bind is invalid configuration.
+- Before its first destructive LDAP request, retention durably creates one
+  canonical key-free purge journal. A restart resumes that exact current-,
+  operation-, source-, generation-, and candidate-digest-bound plan. Partial
+  leaf deletion therefore cannot strand later inventory forever; the root is
+  still deleted last, and the journal is removed only after exact absence.
+- Protocol grammar and cryptographic constraints are constants. Every
+  operational time, count, byte, request, history, batch, retry, and retention
+  limit is supplied by the strict configuration and validated before LDAP,
+  random, key, or DNS work begins.
 
 ## Configuration
 
@@ -48,30 +66,68 @@ The rotation fields and defaults are:
 ```yaml
 dkim2:
   rotation_enabled: false
-  rotate_after_days: 365
-  history_limit: 1024
+  rotate_after_days: 30
+  history_limit: 16384
+  max_campaign_bindings: 16384
+  max_generation_entries: 131072
+  max_attribute_bytes: 65536
+  max_dataset_bytes: 1073741824
+  max_ldap_requests: 262144
+  max_ldap_bytes: 1073741824
+  max_retained_root_visits: 32768
+  identifier_allocation_attempts: 32
+  publication_readback_attempts: 8
+  publication_readback_interval_millis: 25
+  ldap_search_time_limit_seconds: 30
+  ldap_operation_timeout_seconds: 60
+  authority_password_max_bytes: 16384
+  ldap_authorities:
+    snapshot:
+      bind_dn: "cn=dkim2-snapshot,o=company"
+      password_file: "/run/secrets/dkim2-snapshot-password"
+    staging:
+      bind_dn: "cn=dkim2-staging,o=company"
+      password_file: "/run/secrets/dkim2-staging-password"
+    activation:
+      bind_dn: "cn=dkim2-activation,o=company"
+      password_file: "/run/secrets/dkim2-activation-password"
+    purge:
+      bind_dn: "cn=dkim2-purge,o=company"
+      password_file: "/run/secrets/dkim2-purge-password"
   max_clock_skew_seconds: 300
-  run_timeout_seconds: 900
+  run_timeout_seconds: 86400
   proof_poll_interval_seconds: 5
-  proof_max_attempts: 60
+  proof_max_attempts: 3600
   dns_query_timeout_seconds: 5
   retirement_min_overlap_seconds: 604800
+  retention:
+    enabled: true
+    max_generations: 12
+    min_rollback_generations: 2
+    max_delete_batch: 64
+    journal_file: "/var/lib/opendkim-manage-go/dkim2-retention-plan.json"
+    max_journal_bytes: 4096
 dns:
   primary_nameserver: "127.0.0.1:53"
   recursive_nameserver: "127.0.0.2:53"
 ```
 
-The integer ranges are respectively `1..36500`, `2..4096`, `0..3600`,
-`30..86400`, `1..300`, `1..3600`, `1..30`, and `3600..31536000`.
+All displayed values are centralized, documented defaults and every one is
+overrideable. Validation applies finite lower and upper bounds before use.
+Explicit zero is accepted only where zero has a documented safe meaning; an
+omitted value receives the displayed default, while an invalid explicit value
+is never replaced silently. `retention.max_generations` must be greater than
+`retention.min_rollback_generations`, and `max_delete_batch` may not exceed the
+maximum recoverable history.
 Both DNS endpoints require a canonical host or IP plus explicit port and must
 be distinct after normalization.
 
 One top-level run context covers the complete lifecycle command. Before every
-LDAP search, add, or modify, cancellation is checked again. A shared cumulative
-work frame derived from `history_limit` bounds request count, response and
-request bytes, and retained-root visits across all repeated readback and
-recovery phases; crossing any bound fails closed instead of starting another
-LDAP operation.
+LDAP search, add, modify, or delete, cancellation is checked again. A shared
+cumulative work frame uses the explicit `max_ldap_requests`, `max_ldap_bytes`,
+and `max_retained_root_visits` values across all repeated readback and recovery
+phases; crossing any bound fails closed instead of starting another LDAP
+operation.
 
 Automatic eligibility uses the earliest retained root `createTimestamp` for
 the exact selector, algorithm, public-SPKI, and handle lineage of every current
@@ -101,12 +157,24 @@ interaction before random-key generation, TSIG loading, or a write.
 
 `--auto --update-dns` additionally requires `rotation_enabled: true` and no
 explicit domain, selector, or lifecycle subcommand. It first resumes the one
-exact pending candidate if present. Resume, automatic selection, and
-observation carry the full tenant, domain, and profile-use identity; a domain
-alone is never a binding. Otherwise it chooses at most one due binding
-deterministically from trustworthy lineage evidence and runs the same
-prepare, publish, prove, commit, and pointer-switch path as manual rotation.
-It never retires DNS records and never deletes LDAP history.
+exact pending candidate if present. Otherwise it freezes every active binding,
+selects all due bindings deterministically from trustworthy lineage evidence,
+and builds one successor. Publication and proof cover the union of every new
+record before the single commit-and-current operation. A timer invocation with
+no due binding creates no generation. With the default configuration, a
+binding becomes due after 30 days.
+
+When retention is enabled, automatic execution also inventories the complete
+bounded history and deletes at most `max_delete_batch` oldest eligible
+generations until no more than `max_generations` remain. The newest
+`min_rollback_generations` non-current committed generations are always
+retained. Retention policy and inventory are recomputed immediately before
+each destructive batch; any current-pointer or inventory drift stops the run.
+Legacy v1/v2 roots are retained automatically. In particular, the first
+v2-to-v3 campaign never adds v3 activation metadata to its immutable v2 source.
+Old legacy cleanup remains an explicit migration operation, not automatic
+retention. A retained legacy root does not block deletion of a separately
+eligible older v3 root; it remains counted toward `max_generations`.
 
 ## Prepare, Publish, Prove, And Activate
 
@@ -202,7 +270,8 @@ attestations and preconditions are revalidated and authoritative state is read
 back. An absent old record is success-so-far and is never recreated. This is
 cardinality-neutral for RSA-only, Ed25519-only, and dual bindings. Recursive
 cache retention is an observing condition, not a reason to repeat deletion.
-Automatic retirement and LDAP deletion are forbidden.
+Automatic DNS retirement remains forbidden. LDAP deletion occurs only through
+the separate bounded v3 retention phase and its durable purge journal.
 
 Lifecycle mutations are mutually exclusive within one process. Retirement
 also reloads complete contiguous history and the exact current activation
@@ -232,12 +301,14 @@ triggers automatically.
 
 ## Verification Boundary
 
-The source verification contract covers exact algorithm preservation,
-whole-binding replacement, unrelated-domain preservation, clone isolation,
-complete retained-history prerequisites, canonical lineage and activation
-clocks, deterministic batch-one automation, strict CLI/configuration
-isolation, LDAP staging and crash reconciliation, NXRRSET publication,
-dual-channel proof, explicit value-aware retirement, forward-only rollback,
+The source verification contract covers autonomous operation without another
+DKIM executable, exact algorithm preservation, all-due-binding replacement in
+one generation, unrelated-binding preservation, clone isolation, complete
+retained-history prerequisites, v3 operation/source/content commitments,
+canonical lineage and activation clocks, strict configuration propagation to
+every operational bound, LDAP staging and crash reconciliation, NXRRSET
+publication, all-record dual-channel proof, bounded retention with current and
+rollback fences, explicit value-aware retirement, forward-only rollback,
 dry-run no-write behavior, and protected formatting. Integration fixtures must
 remain synthetic and isolated from production LDAP and DNS. Passing source
 tests proves these code contracts; it does not prove deployment, runtime,

@@ -80,7 +80,7 @@ func TestLDAPRepositoryBootstrapPublishesCompleteGenerationWithCriticalFence(t *
 
 func TestNewLDAPRepositoryRejectsTypedNilExecutor(t *testing.T) {
 	var executor *fakeExecutor
-	if _, err := NewLDAPRepository(executor); !errors.Is(err, ErrUnavailable) {
+	if _, err := NewLDAPRepository(executor, testLimits()); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("NewLDAPRepository() error = %v, want unavailable", err)
 	}
 }
@@ -351,7 +351,7 @@ func TestLDAPRepositoryCumulativeWorkBudgetBoundsRequestsBytesAndHistory(t *test
 		t.Fatal(err)
 	}
 
-	requestBudget := &ldapWorkBudget{maximumRequests: 2, maximumBytes: maximumDatasetBytes, maximumHistories: 8}
+	requestBudget := &ldapWorkBudget{maximumRequests: 2, maximumBytes: testLimits().MaxDatasetBytes, maximumHistories: 8}
 	ctx := context.WithValue(context.Background(), ldapWorkBudgetKey{}, requestBudget)
 	searchStart := len(executor.searches)
 	if _, err := repository.LoadCurrent(ctx); !errors.Is(err, ErrUnavailable) {
@@ -371,7 +371,7 @@ func TestLDAPRepositoryCumulativeWorkBudgetBoundsRequestsBytesAndHistory(t *test
 		t.Fatalf("byte budget executed %d searches, want 1", got)
 	}
 
-	historyBudget := &ldapWorkBudget{maximumRequests: 64, maximumBytes: maximumDatasetBytes, maximumHistories: 0}
+	historyBudget := &ldapWorkBudget{maximumRequests: 64, maximumBytes: testLimits().MaxDatasetBytes, maximumHistories: 0}
 	ctx = context.WithValue(context.Background(), ldapWorkBudgetKey{}, historyBudget)
 	searchStart = len(executor.searches)
 	if _, err := repository.LoadRetainedHistory(ctx, 8); !errors.Is(err, ErrUnavailable) {
@@ -501,7 +501,7 @@ func TestLDAPRepositoryRejectsMixedAndSurplusLDAPRecords(t *testing.T) {
 
 func TestLDAPRepositoryFixedDNAndFilterInputs(t *testing.T) {
 	malicious := newFakeExecutor("ou=dkim2,not-a-dn")
-	if _, err := NewLDAPRepository(malicious); err == nil {
+	if _, err := NewLDAPRepository(malicious, testLimits()); err == nil {
 		t.Fatal("NewLDAPRepository() accepted an injected base DN")
 	}
 
@@ -558,7 +558,7 @@ func TestLDAPRepositoryLoadsCompleteRetainedHistoryWithoutPrivateProjection(t *t
 
 func TestLDAPRepositoryHistoryLimitIsExplicitlyIncomplete(t *testing.T) {
 	executor := newFakeExecutor(testBaseDN)
-	for _, generation := range []uint64{1, 2} {
+	for _, generation := range []uint64{1, 2, 3} {
 		executor.put(metadataEntry(
 			attributeGeneration+"="+fmt.Sprint(generation)+",ou=generations,"+testBaseDN,
 			generation, datasetStateCommitted,
@@ -569,7 +569,7 @@ func TestLDAPRepositoryHistoryLimitIsExplicitlyIncomplete(t *testing.T) {
 		t.Fatalf("LoadRetainedHistory() error = %v", err)
 	}
 	if history.Complete {
-		t.Fatal("history reaching the configured root limit was reported complete")
+		t.Fatal("history exceeding the configured root limit was reported complete")
 	}
 	if _, err := history.SelectorUsed("selector"); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("incomplete history lookup error = %v", err)
@@ -661,11 +661,18 @@ func TestLDAPRepositoryHistoryRejectsPartialHigherOrphanRoot(t *testing.T) {
 
 func mustRepository(t *testing.T, executor *fakeExecutor) *LDAPRepository {
 	t.Helper()
-	repository, err := NewLDAPRepository(executor)
+	repository, err := NewLDAPRepository(executor, testLimits())
 	if err != nil {
 		t.Fatalf("NewLDAPRepository() error = %v", err)
 	}
 	return repository
+}
+
+func testLimits() Limits {
+	return Limits{HistoryLimit: 8, MaxGenerationEntries: 128, MaxAttributeBytes: 64 << 10,
+		MaxDatasetBytes: 32 << 20, MaxLDAPRequests: 1024, MaxLDAPBytes: 64 << 20,
+		MaxRetainedRootVisits: 128, PublicationReadbackAttempts: 8, PublicationReadbackInterval: time.Millisecond,
+		SearchTimeLimitSeconds: 30}
 }
 
 func testGeneration(
@@ -747,6 +754,7 @@ type fakeExecutor struct {
 	searches             []*ldap.SearchRequest
 	adds                 []*ldap.AddRequest
 	modifies             []*ldap.ModifyRequest
+	deletes              []*ldap.DelRequest
 	failAddAt            int
 	failModifyAt         int
 	addError             error
@@ -754,6 +762,8 @@ type fakeExecutor struct {
 	applyModifyOnFailure bool
 	nilModifyResultAt    int
 	referralResultAt     int
+	failDeleteAt         int
+	deleteError          error
 	mutateGenerationRead func(*ldap.SearchResult)
 	lastGenerationResult *ldap.SearchResult
 	mutateSearch         func(*ldap.SearchRequest, *ldap.SearchResult) error
@@ -849,10 +859,16 @@ func (f *fakeExecutor) ModifyRequest(request *ldap.ModifyRequest) (*ldap.ModifyR
 		return nil, ldap.NewError(ldap.LDAPResultNoSuchObject, errors.New("absent"))
 	}
 	for _, change := range copyRequest.Changes {
-		if change.Operation != ldap.ReplaceAttribute {
+		switch change.Operation {
+		case ldap.ReplaceAttribute:
+			setEntryAttribute(entry, change.Modification.Type, change.Modification.Vals)
+		case ldap.AddAttribute:
+			values := entry.GetEqualFoldAttributeValues(change.Modification.Type)
+			values = append(values, change.Modification.Vals...)
+			setEntryAttribute(entry, change.Modification.Type, values)
+		default:
 			return nil, errors.New("unsupported fake change")
 		}
-		setEntryAttribute(entry, change.Modification.Type, change.Modification.Vals)
 	}
 	setEntryAttribute(entry, attributeModifyTimestamp, []string{"20250801000000Z"})
 	if f.afterModify != nil {
@@ -868,6 +884,26 @@ func (f *fakeExecutor) ModifyRequest(request *ldap.ModifyRequest) (*ldap.ModifyR
 		return &ldap.ModifyResult{Referral: "ldaps://referral.example/"}, nil
 	}
 	return &ldap.ModifyResult{}, nil
+}
+
+func (f *fakeExecutor) DeleteRequest(request *ldap.DelRequest) error {
+	if request == nil || len(request.Controls) != 0 {
+		return errors.New("purge delete contains caller-selected controls")
+	}
+	f.deletes = append(f.deletes, &ldap.DelRequest{DN: request.DN, Controls: append([]ldap.Control(nil), request.Controls...)})
+	if f.failDeleteAt > 0 && len(f.deletes) == f.failDeleteAt {
+		return f.deleteError
+	}
+	if _, found := f.entries[dnKey(request.DN)]; !found {
+		return ldap.NewError(ldap.LDAPResultNoSuchObject, errors.New("absent"))
+	}
+	for _, entry := range f.entries {
+		if !sameDN(entry.DN, request.DN) && isAtOrBelow(entry.DN, request.DN) {
+			return ldap.NewError(ldap.LDAPResultNotAllowedOnNonLeaf, errors.New("not leaf"))
+		}
+	}
+	delete(f.entries, dnKey(request.DN))
+	return nil
 }
 
 func (f *fakeExecutor) put(entry *ldap.Entry) {

@@ -97,7 +97,7 @@ func FuzzRotationPreservesUnselectedBinding(f *testing.F) {
 		}
 		candidate, err := PlanRotation(RotationPlan{
 			Current: current, NextGeneration: 2, TenantID: "tenant", Domain: target,
-			Use: ProfileUseOriginator, RSABits: DefaultRSABits, Random: &sequenceReader{value: choice},
+			Use: ProfileUseOriginator, RSABits: DefaultRSABits, AllocationAttempts: 16, Random: &sequenceReader{value: choice},
 			History: collisionSet{}, Generate: func(Algorithm, int, io.Reader) (*KeyPair, error) {
 				privateDER, publicDER := fixedEd25519DER(t)
 				defer clear(privateDER)
@@ -152,12 +152,12 @@ func TestRotationCollisionExhaustionProperty(t *testing.T) {
 	history := &alwaysCollisionHistory{}
 	candidate, err := PlanRotation(RotationPlan{
 		Current: current, NextGeneration: 2, TenantID: "tenant", Domain: "one.example",
-		Use: ProfileUseOriginator, RSABits: DefaultRSABits, Random: &sequenceReader{}, History: history,
+		Use: ProfileUseOriginator, RSABits: DefaultRSABits, AllocationAttempts: 16, Random: &sequenceReader{}, History: history,
 	})
 	if err == nil || candidate != nil {
 		t.Fatal("unbounded identifier collisions were accepted")
 	}
-	if history.selectorChecks != rotationAllocationAttempts || history.handleChecks != 0 {
+	if history.selectorChecks != 16 || history.handleChecks != 0 {
 		t.Fatalf("collision checks = selectors %d handles %d", history.selectorChecks, history.handleChecks)
 	}
 }

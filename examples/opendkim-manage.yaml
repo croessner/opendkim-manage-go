@@ -38,8 +38,8 @@ global:
     - "example.org"
 
 # Required when global.mode is dkim2 or --mode dkim2 is used. DKIM2 manages
-# complete immutable dkim2-datasource-v2 generations and does not convert
-# legacy OpenDKIM selector objects.
+# complete immutable generations, writes autonomous dkim2-datasource-v3
+# campaigns, and does not convert legacy OpenDKIM selector objects.
 dkim2:
   # Lowercase ASCII identifier: [a-z0-9][a-z0-9._-]*, at most 128 bytes.
   tenant_id: tenant-example
@@ -62,25 +62,66 @@ dkim2:
   rotation_enabled: false
 
   # Exact retained-lineage age threshold for automatic rotation.
-  rotate_after_days: 365
+  rotate_after_days: 30
 
   # Bounded retained-generation scan. Reaching this limit fails closed.
-  history_limit: 1024
+  history_limit: 16384
+  max_campaign_bindings: 16384
+
+  # Every effective LDAP/model safety bound is explicit and overrideable.
+  max_generation_entries: 131072
+  max_attribute_bytes: 65536
+  max_dataset_bytes: 1073741824
+  max_ldap_requests: 262144
+  max_ldap_bytes: 1073741824
+  max_retained_root_visits: 32768
+  identifier_allocation_attempts: 32
+  publication_readback_attempts: 8
+  publication_readback_interval_millis: 25
+  ldap_search_time_limit_seconds: 30
+  ldap_operation_timeout_seconds: 60
+  authority_password_max_bytes: 16384
+
+  # Required when rotation_enabled is true. Each role uses the common verified
+  # LDAP transport below, but a distinct DN and owner-only password file.
+  ldap_authorities:
+    snapshot:
+      bind_dn: "cn=dkim2-snapshot,o=company"
+      password_file: "/run/secrets/dkim2-snapshot-password"
+    staging:
+      bind_dn: "cn=dkim2-staging,o=company"
+      password_file: "/run/secrets/dkim2-staging-password"
+    activation:
+      bind_dn: "cn=dkim2-activation,o=company"
+      password_file: "/run/secrets/dkim2-activation-password"
+    purge:
+      bind_dn: "cn=dkim2-purge,o=company"
+      password_file: "/run/secrets/dkim2-purge-password"
 
   # Maximum accepted future skew for canonical LDAP operational timestamps.
   max_clock_skew_seconds: 300
 
   # One deadline bounds the complete native lifecycle run.
-  run_timeout_seconds: 900
+  run_timeout_seconds: 86400
 
   # Fresh authoritative and recursive proof polling bounds.
   proof_poll_interval_seconds: 5
-  proof_max_attempts: 60
+  proof_max_attempts: 3600
   dns_query_timeout_seconds: 5
 
   # Minimum overlap after the exact cn=current activation timestamp before
   # explicitly attested DNS retirement can become eligible.
   retirement_min_overlap_seconds: 604800
+
+  # Automatic history deletion retains current plus the configured rollback
+  # reserve and deletes only complete, independently verified v3 generations.
+  retention:
+    enabled: true
+    max_generations: 12
+    min_rollback_generations: 2
+    max_delete_batch: 64
+    journal_file: "/var/lib/opendkim-manage-go/dkim2-retention-plan.json"
+    max_journal_bytes: 4096
 
 ldap:
   # LDAP URL format: ldap://host:port/base??scope?filter

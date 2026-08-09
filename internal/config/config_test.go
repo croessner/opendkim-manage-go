@@ -222,15 +222,10 @@ func TestValidateDKIM2RequiresClosedConfiguration(t *testing.T) {
 	valid := defaultConfig()
 	valid.Global.Mode = types.ModeDKIM2
 	valid.LDAP.URI = "ldaps://ldap.example.org/ou=dkim,dc=example"
-	valid.DKIM2 = DKIM2Config{
-		TenantID:        "tenant-example",
-		ProfileUse:      "originator",
-		Rollout:         "enforce",
-		Compatibility:   "strict",
-		RotateAfterDays: 365, HistoryLimit: 1024, MaxClockSkewSeconds: 300,
-		RunTimeoutSeconds: 900, ProofPollIntervalSeconds: 5, ProofMaxAttempts: 60,
-		DNSQueryTimeoutSeconds: 5, RetirementMinOverlapSeconds: 604800,
-	}
+	valid.DKIM2.TenantID = "tenant-example"
+	valid.DKIM2.ProfileUse = "originator"
+	valid.DKIM2.Rollout = "enforce"
+	valid.DKIM2.Compatibility = "strict"
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid DKIM2 config rejected: %v", err)
 	}
@@ -288,14 +283,142 @@ dkim2:
 	if err != nil {
 		t.Fatalf("load DKIM2 defaults: %v", err)
 	}
-	if cfg.DKIM2.RotationEnabled || cfg.DKIM2.RotateAfterDays != 365 || cfg.DKIM2.HistoryLimit != 1024 ||
-		cfg.DKIM2.MaxClockSkewSeconds != 300 || cfg.DKIM2.RunTimeoutSeconds != 900 ||
-		cfg.DKIM2.ProofPollIntervalSeconds != 5 || cfg.DKIM2.ProofMaxAttempts != 60 ||
-		cfg.DKIM2.DNSQueryTimeoutSeconds != 5 || cfg.DKIM2.RetirementMinOverlapSeconds != 604800 {
+	if cfg.DKIM2.RotationEnabled || cfg.DKIM2.RotateAfterDays != 30 || cfg.DKIM2.HistoryLimit != 16384 ||
+		cfg.DKIM2.MaxCampaignBindings != 16384 ||
+		cfg.DKIM2.MaxGenerationEntries != 131072 || cfg.DKIM2.MaxAttributeBytes != 64<<10 ||
+		cfg.DKIM2.MaxDatasetBytes != 1<<30 || cfg.DKIM2.MaxLDAPRequests != 262144 ||
+		cfg.DKIM2.MaxLDAPBytes != 1<<30 || cfg.DKIM2.MaxRetainedRootVisits != 32768 ||
+		cfg.DKIM2.IdentifierAllocationAttempts != 32 || cfg.DKIM2.PublicationReadbackAttempts != 8 ||
+		cfg.DKIM2.PublicationReadbackIntervalMillis != 25 ||
+		cfg.DKIM2.LDAPSearchTimeLimitSeconds != 30 ||
+		cfg.DKIM2.LDAPOperationTimeoutSeconds != 60 || cfg.DKIM2.AuthorityPasswordMaxBytes != 16384 ||
+		cfg.DKIM2.MaxClockSkewSeconds != 300 || cfg.DKIM2.RunTimeoutSeconds != 86400 ||
+		cfg.DKIM2.ProofPollIntervalSeconds != 5 || cfg.DKIM2.ProofMaxAttempts != 3600 ||
+		cfg.DKIM2.DNSQueryTimeoutSeconds != 5 || cfg.DKIM2.RetirementMinOverlapSeconds != 604800 ||
+		!cfg.DKIM2.Retention.Enabled || cfg.DKIM2.Retention.MaxGenerations != 12 ||
+		cfg.DKIM2.Retention.MinRollbackGenerations != 2 || cfg.DKIM2.Retention.MaxDeleteBatch != 64 ||
+		cfg.DKIM2.Retention.JournalFile != "/var/lib/opendkim-manage-go/dkim2-retention-plan.json" ||
+		cfg.DKIM2.Retention.MaxJournalBytes != 4096 {
 		t.Fatalf("unexpected DKIM2 rotation defaults: %#v", cfg.DKIM2)
 	}
 	if cfg.DNS.PrimaryNameserver != "127.0.0.1:53" || cfg.DNS.RecursiveNameserver != "127.0.0.2:53" {
 		t.Fatalf("unexpected proof endpoints: %#v", cfg.DNS)
+	}
+}
+
+func TestLoadDKIM2OperationalLimitsAreFullyOverrideable(t *testing.T) {
+	path := writeTemp(t, `
+global:
+  mode: dkim2
+ldap:
+  uri: "ldaps://ldap.example.org/ou=dkim,dc=example"
+dkim2:
+  tenant_id: tenant-example
+  profile_use: originator
+  rollout: enforce
+  compatibility: strict
+  rotate_after_days: 31
+  history_limit: 256
+  max_campaign_bindings: 128
+  max_generation_entries: 8192
+  max_attribute_bytes: 32768
+  max_dataset_bytes: 16777216
+  max_ldap_requests: 4096
+  max_ldap_bytes: 33554432
+  max_retained_root_visits: 512
+  identifier_allocation_attempts: 24
+  publication_readback_attempts: 6
+  publication_readback_interval_millis: 40
+  ldap_search_time_limit_seconds: 12
+  ldap_operation_timeout_seconds: 45
+  authority_password_max_bytes: 8192
+  max_clock_skew_seconds: 120
+  run_timeout_seconds: 7200
+  proof_poll_interval_seconds: 3
+  proof_max_attempts: 240
+  dns_query_timeout_seconds: 4
+  retirement_min_overlap_seconds: 86400
+  retention:
+    enabled: true
+    max_generations: 24
+    min_rollback_generations: 3
+    max_delete_batch: 16
+    journal_file: /var/lib/opendkim-manage-go/custom-retention-plan.json
+    max_journal_bytes: 8192
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load overridden DKIM2 limits: %v", err)
+	}
+	if cfg.DKIM2.RotateAfterDays != 31 || cfg.DKIM2.HistoryLimit != 256 || cfg.DKIM2.MaxCampaignBindings != 128 ||
+		cfg.DKIM2.MaxGenerationEntries != 8192 || cfg.DKIM2.MaxAttributeBytes != 32768 ||
+		cfg.DKIM2.MaxDatasetBytes != 16777216 || cfg.DKIM2.MaxLDAPRequests != 4096 ||
+		cfg.DKIM2.MaxLDAPBytes != 33554432 || cfg.DKIM2.MaxRetainedRootVisits != 512 ||
+		cfg.DKIM2.IdentifierAllocationAttempts != 24 || cfg.DKIM2.PublicationReadbackAttempts != 6 ||
+		cfg.DKIM2.PublicationReadbackIntervalMillis != 40 ||
+		cfg.DKIM2.LDAPSearchTimeLimitSeconds != 12 ||
+		cfg.DKIM2.LDAPOperationTimeoutSeconds != 45 || cfg.DKIM2.AuthorityPasswordMaxBytes != 8192 ||
+		cfg.DKIM2.Retention.MaxGenerations != 24 || cfg.DKIM2.Retention.MinRollbackGenerations != 3 ||
+		cfg.DKIM2.Retention.MaxDeleteBatch != 16 ||
+		cfg.DKIM2.Retention.JournalFile != "/var/lib/opendkim-manage-go/custom-retention-plan.json" ||
+		cfg.DKIM2.Retention.MaxJournalBytes != 8192 {
+		t.Fatalf("operational override was not preserved: %#v", cfg.DKIM2)
+	}
+}
+
+func TestValidateDKIM2AutomaticAuthoritiesAreCompleteAndDistinct(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Global.Mode = types.ModeDKIM2
+	cfg.LDAP.URI = "ldaps://ldap.example.org/ou=dkim2,o=company"
+	cfg.LDAP.BindMethod = "simple"
+	cfg.DKIM2.TenantID = "tenant-example"
+	cfg.DKIM2.ProfileUse = "originator"
+	cfg.DKIM2.Rollout = "enforce"
+	cfg.DKIM2.Compatibility = "strict"
+	cfg.DKIM2.RotationEnabled = true
+	cfg.DKIM2.LDAPAuthorities = DKIM2LDAPAuthorities{
+		Snapshot:   DKIM2LDAPAuthority{BindDN: "cn=snapshot,o=company", PasswordFile: "/run/secrets/snapshot"},
+		Staging:    DKIM2LDAPAuthority{BindDN: "cn=staging,o=company", PasswordFile: "/run/secrets/staging"},
+		Activation: DKIM2LDAPAuthority{BindDN: "cn=activation,o=company", PasswordFile: "/run/secrets/activation"},
+		Purge:      DKIM2LDAPAuthority{BindDN: "cn=purge,o=company", PasswordFile: "/run/secrets/purge"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid automatic authorities rejected: %v", err)
+	}
+
+	duplicate := cfg
+	duplicate.DKIM2.LDAPAuthorities.Purge.PasswordFile = duplicate.DKIM2.LDAPAuthorities.Staging.PasswordFile
+	if err := duplicate.Validate(); err == nil {
+		t.Fatal("duplicate automatic authority password files were accepted")
+	}
+	missing := cfg
+	missing.DKIM2.LDAPAuthorities.Activation = DKIM2LDAPAuthority{}
+	if err := missing.Validate(); err == nil {
+		t.Fatal("missing automatic activation authority was accepted")
+	}
+	nonCanonical := cfg
+	nonCanonical.DKIM2.Retention.JournalFile = "/var/lib/opendkim-manage-go/../retention.json"
+	if err := nonCanonical.Validate(); err == nil {
+		t.Fatal("non-canonical retention journal path was accepted")
+	}
+}
+
+func TestLoadDKIM2RejectsExternalCampaignCoupling(t *testing.T) {
+	path := writeTemp(t, `
+global:
+  mode: dkim2
+ldap:
+  uri: "ldaps://ldap.example.org/ou=dkim,dc=example"
+dkim2:
+  tenant_id: tenant-example
+  profile_use: originator
+  rollout: enforce
+  compatibility: strict
+  campaign:
+    executable: /usr/local/bin/dkim2d
+`)
+	if _, err := Load(path); err == nil {
+		t.Fatal("accepted an external DKIM campaign executable")
 	}
 }
 
@@ -317,12 +440,29 @@ func TestValidateDKIM2RotationRangesAndDistinctProofEndpoints(t *testing.T) {
 	}{
 		{name: "rotate days", mutate: func(c *Config) { c.DKIM2.RotateAfterDays = 0 }},
 		{name: "history", mutate: func(c *Config) { c.DKIM2.HistoryLimit = 1 }},
+		{name: "campaign bindings", mutate: func(c *Config) { c.DKIM2.MaxCampaignBindings = 0 }},
+		{name: "generation entries", mutate: func(c *Config) { c.DKIM2.MaxGenerationEntries = 0 }},
+		{name: "attribute bytes", mutate: func(c *Config) { c.DKIM2.MaxAttributeBytes = 0 }},
+		{name: "dataset bytes", mutate: func(c *Config) { c.DKIM2.MaxDatasetBytes = 0 }},
+		{name: "LDAP requests", mutate: func(c *Config) { c.DKIM2.MaxLDAPRequests = 0 }},
+		{name: "LDAP bytes", mutate: func(c *Config) { c.DKIM2.MaxLDAPBytes = c.DKIM2.MaxDatasetBytes - 1 }},
+		{name: "root visits", mutate: func(c *Config) { c.DKIM2.MaxRetainedRootVisits = c.DKIM2.HistoryLimit - 1 }},
+		{name: "identifier attempts", mutate: func(c *Config) { c.DKIM2.IdentifierAllocationAttempts = 0 }},
+		{name: "readback attempts", mutate: func(c *Config) { c.DKIM2.PublicationReadbackAttempts = 0 }},
+		{name: "readback interval", mutate: func(c *Config) { c.DKIM2.PublicationReadbackIntervalMillis = 0 }},
+		{name: "LDAP search time", mutate: func(c *Config) { c.DKIM2.LDAPSearchTimeLimitSeconds = 0 }},
+		{name: "LDAP operation timeout", mutate: func(c *Config) { c.DKIM2.LDAPOperationTimeoutSeconds = 0 }},
+		{name: "authority password bytes", mutate: func(c *Config) { c.DKIM2.AuthorityPasswordMaxBytes = 0 }},
 		{name: "skew", mutate: func(c *Config) { c.DKIM2.MaxClockSkewSeconds = 3601 }},
 		{name: "run timeout", mutate: func(c *Config) { c.DKIM2.RunTimeoutSeconds = 29 }},
 		{name: "poll", mutate: func(c *Config) { c.DKIM2.ProofPollIntervalSeconds = 301 }},
 		{name: "attempts", mutate: func(c *Config) { c.DKIM2.ProofMaxAttempts = 0 }},
 		{name: "query timeout", mutate: func(c *Config) { c.DKIM2.DNSQueryTimeoutSeconds = 31 }},
 		{name: "overlap", mutate: func(c *Config) { c.DKIM2.RetirementMinOverlapSeconds = 3599 }},
+		{name: "retained generations", mutate: func(c *Config) { c.DKIM2.Retention.MaxGenerations = 0 }},
+		{name: "rollback reserve", mutate: func(c *Config) { c.DKIM2.Retention.MinRollbackGenerations = c.DKIM2.Retention.MaxGenerations }},
+		{name: "delete batch", mutate: func(c *Config) { c.DKIM2.Retention.MaxDeleteBatch = 0 }},
+		{name: "journal bytes", mutate: func(c *Config) { c.DKIM2.Retention.MaxJournalBytes = 0 }},
 		{name: "same endpoint", mutate: func(c *Config) { c.DNS.RecursiveNameserver = c.DNS.PrimaryNameserver }},
 		{name: "missing port", mutate: func(c *Config) { c.DNS.PrimaryNameserver = "127.0.0.1" }},
 	}

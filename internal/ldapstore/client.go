@@ -5,12 +5,15 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
@@ -28,11 +31,23 @@ type URI struct {
 }
 
 type Client struct {
-	cfg    *config.Config
-	scheme types.Scheme
-	uri    URI
-	conn   *ldap.Conn
+	cfg       *config.Config
+	scheme    types.Scheme
+	uri       URI
+	conn      *ldap.Conn
+	authority *config.DKIM2LDAPAuthority
+	purpose   AuthorityPurpose
 }
+
+// AuthorityPurpose closes the automatic LDAP capability vocabulary.
+type AuthorityPurpose uint8
+
+const (
+	AuthoritySnapshot AuthorityPurpose = iota + 1
+	AuthorityStaging
+	AuthorityActivation
+	AuthorityPurge
+)
 
 // RequestExecutor exposes the exact LDAP operations needed by immutable
 // generation repositories without exposing the underlying connection.
@@ -53,6 +68,20 @@ func NewClient(cfg *config.Config) (*Client, error) {
 		return nil, err
 	}
 	return &Client{cfg: cfg, scheme: cfg.Scheme, uri: u}, nil
+}
+
+// NewAuthorityClient binds one DKIM2 automatic lifecycle role to the shared verified transport.
+func NewAuthorityClient(cfg *config.Config, authority config.DKIM2LDAPAuthority, purpose AuthorityPurpose) (*Client, error) {
+	if purpose < AuthoritySnapshot || purpose > AuthorityPurge {
+		return nil, errors.New("LDAP authority purpose is invalid")
+	}
+	client, err := NewClient(cfg)
+	if err != nil {
+		return nil, err
+	}
+	client.authority = &authority
+	client.purpose = purpose
+	return client, nil
 }
 
 func ParseLDAPURI(raw string) (URI, error) {
@@ -140,7 +169,11 @@ func (c *Client) EnsureConnected() error {
 	if err != nil {
 		return fmt.Errorf("ldap dial failed: %w", err)
 	}
-	conn.SetTimeout(60 * time.Second)
+	operationTimeout := 60 * time.Second
+	if c.authority != nil {
+		operationTimeout = time.Duration(c.cfg.DKIM2.LDAPOperationTimeoutSeconds) * time.Second
+	}
+	conn.SetTimeout(operationTimeout)
 
 	if c.cfg.LDAP.UseStartTLS && c.uri.Scheme != "ldaps" {
 		if err := conn.StartTLS(tlsCfg); err != nil {
@@ -205,6 +238,19 @@ func (c *Client) tlsServerName() string {
 }
 
 func (c *Client) bind(conn *ldap.Conn) error {
+	if c.authority != nil {
+		password, err := readAuthorityPassword(c.authority.PasswordFile, c.cfg.DKIM2.AuthorityPasswordMaxBytes)
+		if err != nil {
+			return err
+		}
+		defer clear(password)
+		secret := string(password)
+		defer func() { secret = "" }()
+		if err := conn.Bind(c.authority.BindDN, secret); err != nil {
+			return fmt.Errorf("LDAP authority bind failed")
+		}
+		return nil
+	}
 	if strings.EqualFold(c.cfg.LDAP.BindMethod, "sasl") {
 		mech := strings.ToLower(strings.TrimSpace(c.cfg.LDAP.SASLMech))
 		switch mech {
@@ -225,6 +271,56 @@ func (c *Client) bind(conn *ldap.Conn) error {
 		return fmt.Errorf("ldap simple bind failed: %w", err)
 	}
 	return nil
+}
+
+func readAuthorityPassword(path string, maximumBytes int) ([]byte, error) {
+	parent, parentErr := os.Lstat(filepath.Dir(path))
+	info, err := os.Lstat(path)
+	if maximumBytes < 1 || parentErr != nil || !parent.IsDir() || parent.Mode().Perm()&0o077 != 0 ||
+		!ownedByEffectiveUser(parent) || err != nil || !info.Mode().IsRegular() ||
+		(info.Mode().Perm() != 0o400 && info.Mode().Perm() != 0o600) || !ownedByEffectiveUser(info) ||
+		info.Size() < 1 || info.Size() > int64(maximumBytes) {
+		return nil, errors.New("LDAP authority password file is unavailable or unsafe")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("LDAP authority password file is unavailable or unsafe")
+	}
+	defer func() { _ = file.Close() }()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		return nil, errors.New("LDAP authority password file changed during open")
+	}
+	password, err := io.ReadAll(io.LimitReader(file, int64(maximumBytes)+1))
+	if err != nil || len(password) == 0 || len(password) > maximumBytes {
+		clear(password)
+		return nil, errors.New("LDAP authority password file is unavailable or unsafe")
+	}
+	if password[len(password)-1] == '\n' {
+		password = password[:len(password)-1]
+		if len(password) > 0 && password[len(password)-1] == '\r' {
+			password = password[:len(password)-1]
+		}
+	}
+	if len(password) == 0 || bytesContainsControl(password) {
+		clear(password)
+		return nil, errors.New("LDAP authority password file is malformed")
+	}
+	return password, nil
+}
+
+func ownedByEffectiveUser(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(os.Geteuid())
+}
+
+func bytesContainsControl(value []byte) bool {
+	for _, character := range value {
+		if character == 0 || character == '\r' || character == '\n' {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Client) Close() error {
@@ -328,6 +424,37 @@ func (c *Client) ModifyRequest(req *ldap.ModifyRequest) (*ldap.ModifyResult, err
 		return nil, safeRequestError("modify", err)
 	}
 	return result, nil
+}
+
+// DeleteRequest validates and executes one exact non-recursive LDAP deletion.
+func (c *Client) DeleteRequest(req *ldap.DelRequest) error {
+	if req == nil {
+		return errors.New("ldap delete request is nil")
+	}
+	if err := c.validateRequestDN(req.DN); err != nil {
+		return fmt.Errorf("ldap delete request DN: %w", err)
+	}
+	if c.purpose == AuthorityPurge {
+		if len(req.Controls) != 0 {
+			return errors.New("LDAP purge delete request does not accept caller-selected controls")
+		}
+	} else if len(req.Controls) != 1 {
+		return errors.New("ldap delete request requires one critical assertion control")
+	} else if err := validateControls(req.Controls); err != nil {
+		return fmt.Errorf("ldap delete request controls: %w", err)
+	} else {
+		assertion, ok := req.Controls[0].(*ldap.ControlString)
+		if !ok || assertion.ControlType != "1.3.6.1.1.12" || !assertion.Criticality || assertion.ControlValue == "" {
+			return errors.New("ldap delete request requires one critical assertion control")
+		}
+	}
+	if err := c.EnsureConnected(); err != nil {
+		return err
+	}
+	if err := c.conn.Del(req); err != nil {
+		return safeRequestError("delete", err)
+	}
+	return nil
 }
 
 // validateSearchRequest enforces bounded exact reads inside the configured

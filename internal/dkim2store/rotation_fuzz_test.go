@@ -48,7 +48,7 @@ func FuzzLDAPV2EntryMapper(f *testing.F) {
 			attribute := target.Attributes[int(attributeIndex)%len(target.Attributes)]
 			setEntryAttribute(target, attribute.Name, []string{replacement})
 		}
-		mapped, err := mapGeneration(entries, 1, datasetStateStaging, root)
+		mapped, err := mapGeneration(entries, 1, datasetStateStaging, root, testLimits())
 		if err == nil {
 			_ = mapped.Close()
 		}

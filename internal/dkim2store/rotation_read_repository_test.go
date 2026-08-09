@@ -421,11 +421,13 @@ func TestLDAPRepositoryAutoLineageUsesCreateTimestampNotModifyTimestamp(t *testi
 		t.Fatal(err)
 	}
 	defer func() { _ = current.Close() }()
-	decision, err := dkim2model.SelectOneEligibleBinding(
-		time.Date(2026, time.August, 2, 0, 0, 0, 0, time.UTC), current, lineage, 365, 300,
+	decisions, err := dkim2model.EligibleBindings(
+		time.Date(2026, time.August, 2, 0, 0, 0, 0, time.UTC), current, lineage,
+		dkim2model.RotationLimits{RotateAfter: 365 * 24 * time.Hour, MaximumClockSkew: 300 * time.Second,
+			AllocationAttempts: 16, RSABits: dkim2model.DefaultRSABits, MaximumBindings: 10},
 	)
-	if err != nil || !decision.Due() {
-		t.Fatalf("eligibility from immutable creation lineage = %v, %v", decision, err)
+	if err != nil || len(decisions) != 1 || !decisions[0].Due() {
+		t.Fatalf("eligibility from immutable creation lineage = %v, %v", decisions, err)
 	}
 
 	foundCreateProjection := false

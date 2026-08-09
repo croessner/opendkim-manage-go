@@ -11,22 +11,43 @@ import (
 	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
 )
 
-const (
-	readbackMaximumAttempts = 8
-	readbackRetryDelay      = 250 * time.Millisecond
-)
-
 // addCandidate creates one complete staging generation without editing committed data.
 func (r *LDAPRepository) addCandidate(ctx context.Context, candidate *dkim2model.Generation) error {
+	return r.addCandidateWithMetadata(ctx, candidate, nil)
+}
+
+// addCampaignCandidate creates one complete operation-bound v3 staging generation.
+func (r *LDAPRepository) addCampaignCandidate(ctx context.Context, candidate *dkim2model.Generation, metadata dkim2model.CandidateMetadata) error {
+	if metadata.ValidateCandidate(candidate) != nil {
+		return ErrMalformed
+	}
+	return r.addCandidateWithMetadata(ctx, candidate, &metadata)
+}
+
+func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate *dkim2model.Generation, metadata *dkim2model.CandidateMetadata) error {
 	generation := strconv.FormatUint(candidate.Number(), 10)
 	rootDN := r.generationRoot(candidate.Number())
-	if err := r.addEntry(ctx, rootDN, map[string][][]byte{
+	rootAttributes := map[string][][]byte{
 		attributeObjectClass:   bytesValues(classTop, classDataset),
 		attributeCN:            bytesValues("generation-" + generation),
 		attributeSchemaVersion: bytesValues(dkim2model.SchemaVersion),
 		attributeGeneration:    bytesValues(generation),
 		attributeDatasetState:  bytesValues(datasetStateStaging),
-	}); err != nil {
+	}
+	if metadata != nil {
+		rootAttributes[attributeObjectClass] = bytesValues(classTop, classDataset, classAdministrativeMetadata)
+		rootAttributes[attributeSchemaVersion] = bytesValues(dkim2model.SchemaVersionV3)
+		rootAttributes[attributeSourceGeneration] = bytesValues(strconv.FormatUint(metadata.SourceGeneration(), 10))
+		if err := metadata.WithLDAPValues(func(operation string, digest []byte) error {
+			rootAttributes[attributeOperationID] = bytesValues(operation)
+			rootAttributes[attributeCandidateDigest] = [][]byte{append([]byte(nil), digest...)}
+			return nil
+		}); err != nil {
+			return ErrMalformed
+		}
+		defer clearAttributeMap(rootAttributes)
+	}
+	if err := r.addEntry(ctx, rootDN, rootAttributes); err != nil {
 		return err
 	}
 	for _, unit := range generationUnits {
@@ -138,17 +159,17 @@ func (r *LDAPRepository) addCandidate(ctx context.Context, candidate *dkim2model
 // exactly equivalent to the candidate.
 func (r *LDAPRepository) validateReadback(ctx context.Context, candidate *dkim2model.Generation) error {
 	var err error
-	for attempt := 0; attempt < readbackMaximumAttempts; attempt++ {
+	for attempt := 0; attempt < r.limits.PublicationReadbackAttempts; attempt++ {
 		if err = r.validateReadbackOnce(ctx, candidate); err == nil {
 			return nil
 		}
 		if contextErr := validContext(ctx); contextErr != nil {
 			return contextErr
 		}
-		if attempt+1 == readbackMaximumAttempts {
+		if attempt+1 == r.limits.PublicationReadbackAttempts {
 			break
 		}
-		timer := time.NewTimer(readbackRetryDelay)
+		timer := time.NewTimer(r.limits.PublicationReadbackInterval)
 		select {
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -167,7 +188,7 @@ func (r *LDAPRepository) validateReadbackOnce(ctx context.Context, candidate *dk
 		return err
 	}
 	actual, err := mapGeneration(
-		entries, candidate.Number(), datasetStateStaging, r.generationRoot(candidate.Number()),
+		entries, candidate.Number(), datasetStateStaging, r.generationRoot(candidate.Number()), r.limits,
 	)
 	if err != nil {
 		return err
@@ -199,6 +220,118 @@ func (r *LDAPRepository) commitGeneration(ctx context.Context, generation uint64
 		return ErrOutcomeUncertain
 	}
 	return nil
+}
+
+// commitCampaignGeneration seals only the exact v3 candidate commitment.
+func (r *LDAPRepository) commitCampaignGeneration(ctx context.Context, metadata dkim2model.CandidateMetadata) error {
+	request := ldap.NewModifyRequest(r.generationRoot(metadata.Generation()), nil)
+	request.Replace(attributeDatasetState, []string{datasetStateCommitted})
+	assertion, err := campaignMetadataAssertion(metadata, datasetStateStaging)
+	if err != nil {
+		return ErrMalformed
+	}
+	control, err := newAssertionControl(assertion)
+	if err != nil {
+		return ErrMalformed
+	}
+	request.Controls = []ldap.Control{control}
+	result, err := r.modify(ctx, request)
+	if err != nil {
+		return classifyWriteError(err)
+	}
+	if result == nil || result.Referral != "" {
+		return ErrOutcomeUncertain
+	}
+	return nil
+}
+
+func campaignMetadataAssertion(metadata dkim2model.CandidateMetadata, state string) (string, error) {
+	var operation string
+	var digest []byte
+	err := metadata.WithLDAPValues(func(value string, commitment []byte) error {
+		operation, digest = value, append([]byte(nil), commitment...)
+		return nil
+	})
+	defer clear(digest)
+	if err != nil {
+		return "", ErrMalformed
+	}
+	return "(&(objectClass=" + ldap.EscapeFilter(classDataset) + ")(" +
+		attributeSchemaVersion + "=" + ldap.EscapeFilter(dkim2model.SchemaVersionV3) + ")(" +
+		attributeGeneration + "=" + ldap.EscapeFilter(strconv.FormatUint(metadata.Generation(), 10)) + ")(" +
+		attributeDatasetState + "=" + ldap.EscapeFilter(state) + ")(" +
+		attributeOperationID + "=" + ldap.EscapeFilter(operation) + ")(" +
+		attributeSourceGeneration + "=" + ldap.EscapeFilter(strconv.FormatUint(metadata.SourceGeneration(), 10)) + ")(" +
+		attributeCandidateDigest + "=" + ldap.EscapeFilter(string(digest)) + "))", nil
+}
+
+func currentPointerAssertion(pointer currentPointer) string {
+	filter := "(&(objectClass=" + ldap.EscapeFilter(classDataset) + ")(" +
+		attributeSchemaVersion + "=" + ldap.EscapeFilter(pointer.schema) + ")(" +
+		attributeGeneration + "=" + ldap.EscapeFilter(strconv.FormatUint(pointer.generation, 10)) + ")(" +
+		attributeDatasetState + "=" + ldap.EscapeFilter(pointer.state) + ")"
+	if pointer.schema == dkim2model.SchemaVersionV3 {
+		filter += "(" + attributeCandidateDigest + "=" + ldap.EscapeFilter(string(pointer.digest[:])) + ")"
+	}
+	return filter + ")"
+}
+
+// markSourceWasActive persists monotonic source-generation activation evidence.
+func (r *LDAPRepository) markSourceWasActive(ctx context.Context, source currentPointer) error {
+	request := ldap.NewModifyRequest(r.generationRoot(source.generation), nil)
+	request.Replace(attributeWasActive, []string{"TRUE"})
+	control, err := newAssertionControl(currentPointerAssertion(source))
+	if err != nil {
+		return ErrMalformed
+	}
+	request.Controls = []ldap.Control{control}
+	result, err := r.modify(ctx, request)
+	if err != nil {
+		return classifyWriteError(err)
+	}
+	if result == nil || result.Referral != "" {
+		return ErrOutcomeUncertain
+	}
+	return nil
+}
+
+func (r *LDAPRepository) switchCurrentCampaign(ctx context.Context, source currentPointer, metadata dkim2model.CandidateMetadata) error {
+	request := ldap.NewModifyRequest(r.currentDN, nil)
+	if source.schema != dkim2model.SchemaVersionV3 {
+		request.Add(attributeObjectClass, []string{classAdministrativeMetadata})
+	}
+	request.Replace(attributeSchemaVersion, []string{dkim2model.SchemaVersionV3})
+	request.Replace(attributeGeneration, []string{strconv.FormatUint(metadata.Generation(), 10)})
+	request.Replace(attributeDatasetState, []string{datasetStateCommitted})
+	digest := metadata.DigestBytes()
+	defer clear(digest)
+	request.Replace(attributeCandidateDigest, []string{string(digest)})
+	control, err := newAssertionControl(currentPointerAssertion(source))
+	if err != nil {
+		return ErrMalformed
+	}
+	request.Controls = []ldap.Control{control}
+	result, err := r.modify(ctx, request)
+	if err != nil {
+		return classifyWriteError(err)
+	}
+	if result == nil || result.Referral != "" {
+		return ErrOutcomeUncertain
+	}
+	pointer, absent, err := r.readCurrentPointer(ctx)
+	if err != nil || absent || pointer.generation != metadata.Generation() || pointer.schema != dkim2model.SchemaVersionV3 ||
+		pointer.digest != digestArray(metadata) {
+		return ErrOutcomeUncertain
+	}
+	return nil
+}
+
+func digestArray(metadata dkim2model.CandidateMetadata) [dkim2model.CandidateDigestBytes]byte {
+	var result [dkim2model.CandidateDigestBytes]byte
+	value := metadata.DigestBytes()
+	copy(result[:], value)
+	clear(value)
+	return result
 }
 
 // switchCurrent atomically claims the committed generation through RFC 4528.

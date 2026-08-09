@@ -244,7 +244,7 @@ access to * by dn.exact="cn=admin,dc=example,dc=test" manage by * none
 
 func newSlapdRepository(t *testing.T, executor *slapdRequestExecutor) *LDAPRepository {
 	t.Helper()
-	repository, err := NewLDAPRepository(executor)
+	repository, err := NewLDAPRepository(executor, testLimits())
 	if err != nil {
 		t.Fatal("cannot bind the repository to the isolated slapd")
 	}

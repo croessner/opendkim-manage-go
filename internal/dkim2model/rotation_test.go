@@ -29,7 +29,7 @@ func TestPlanRotationReplacesWholeBindingAndPreservesUnrelatedRecords(t *testing
 
 	candidate, err := PlanRotation(RotationPlan{
 		Current: current, NextGeneration: 2, TenantID: "tenant", Domain: "one.example",
-		Use: ProfileUseOriginator, RSABits: DefaultRSABits,
+		Use: ProfileUseOriginator, RSABits: DefaultRSABits, AllocationAttempts: 16,
 		Random:  &sequenceReader{},
 		History: collisionSet{selectors: map[string]bool{}, handles: map[string]bool{}},
 		Generate: func(algorithm Algorithm, bits int, _ io.Reader) (*KeyPair, error) {
@@ -77,6 +77,70 @@ func TestPlanRotationReplacesWholeBindingAndPreservesUnrelatedRecords(t *testing
 	}
 }
 
+func TestPlanGlobalRotationReplacesEveryDueBindingInOneSuccessor(t *testing.T) {
+	current := activeRotationGeneration(t)
+	defer func() { _ = current.Close() }()
+	history := lineageHistoryForGenerations(t, current)
+	candidate, decisions, err := PlanGlobalRotation(GlobalRotationPlan{
+		Current: current, NextGeneration: 2, Now: time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC),
+		History: history, Identifiers: collisionSet{}, Random: &sequenceReader{},
+		Limits: RotationLimits{RotateAfter: 30 * 24 * time.Hour, MaximumClockSkew: 5 * time.Minute,
+			AllocationAttempts: 16, RSABits: DefaultRSABits, MaximumBindings: 10},
+		Generate: func(algorithm Algorithm, bits int, _ io.Reader) (*KeyPair, error) {
+			return GenerateKeyPair(algorithm, bits, nil)
+		},
+	})
+	if err != nil {
+		t.Fatalf("PlanGlobalRotation() error = %v", err)
+	}
+	defer func() { _ = candidate.Close() }()
+	if len(decisions) != 2 {
+		t.Fatalf("rotated bindings = %d, want 2", len(decisions))
+	}
+	for _, domain := range []string{"one.example", "two.example"} {
+		profile, found := candidate.ProfileByDomain(domain)
+		if !found {
+			t.Fatalf("candidate missing %s", domain)
+		}
+		for _, credential := range credentialsForModelProfile(candidate, profile.ID()) {
+			if _, found := current.CredentialByDomainSelector(domain, credential.Selector()); found {
+				t.Fatalf("%s retained a due selector", domain)
+			}
+		}
+	}
+}
+
+func TestPlanGlobalRotationPreservesEveryNonDueBinding(t *testing.T) {
+	current := activeRotationGeneration(t)
+	defer func() { _ = current.Close() }()
+	history := lineageHistoryForGenerations(t, current)
+	// Make only the first binding old enough to rotate.
+	for index := range history.Facts {
+		if history.Facts[index].domain == "two.example" {
+			history.Facts[index].created = "20260801000000Z"
+		}
+	}
+	candidate, decisions, err := PlanGlobalRotation(GlobalRotationPlan{
+		Current: current, NextGeneration: 2, Now: time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC),
+		History: history, Identifiers: collisionSet{}, Random: &sequenceReader{},
+		Limits: RotationLimits{RotateAfter: 30 * 24 * time.Hour, MaximumClockSkew: 5 * time.Minute,
+			AllocationAttempts: 16, RSABits: DefaultRSABits, MaximumBindings: 10},
+		Generate: func(algorithm Algorithm, bits int, _ io.Reader) (*KeyPair, error) {
+			return GenerateKeyPair(algorithm, bits, nil)
+		},
+	})
+	if err != nil {
+		t.Fatalf("PlanGlobalRotation() error = %v", err)
+	}
+	defer func() { _ = candidate.Close() }()
+	if len(decisions) != 1 || decisions[0].Domain() != "one.example" {
+		t.Fatalf("decisions = %#v", decisions)
+	}
+	if _, found := candidate.CredentialByDomainSelector("two.example", "selector-two-ed"); !found {
+		t.Fatal("non-due binding changed")
+	}
+}
+
 func TestPlanRotationSucceedsForEachExactAlgorithmSet(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -97,7 +161,7 @@ func TestPlanRotationSucceedsForEachExactAlgorithmSet(t *testing.T) {
 			candidate, err := PlanRotation(RotationPlan{
 				Current: current, NextGeneration: 8, TenantID: "tenant", Domain: "one.example",
 				Use: ProfileUseOriginator, Algorithms: append([]Algorithm(nil), test.algorithms...),
-				RSABits: DefaultRSABits, Random: &sequenceReader{}, History: collisionSet{},
+				RSABits: DefaultRSABits, AllocationAttempts: 16, Random: &sequenceReader{}, History: collisionSet{},
 				Generate: func(algorithm Algorithm, bits int, _ io.Reader) (*KeyPair, error) {
 					return GenerateKeyPair(algorithm, bits, nil)
 				},
@@ -129,7 +193,7 @@ func TestPlanRotationRejectsAlgorithmDowngradeBeforeRandomness(t *testing.T) {
 	candidate, err := PlanRotation(RotationPlan{
 		Current: current, NextGeneration: 2, TenantID: "tenant", Domain: "one.example",
 		Use: ProfileUseOriginator, Algorithms: []Algorithm{AlgorithmEd25519SHA256},
-		RSABits: DefaultRSABits, Random: random, History: collisionSet{},
+		RSABits: DefaultRSABits, AllocationAttempts: 16, Random: random, History: collisionSet{},
 	})
 	if err == nil || candidate != nil {
 		t.Fatal("algorithm downgrade was accepted")
@@ -162,7 +226,7 @@ func TestPlanRotationRejectsProfileSharedByAnotherPolicyBeforeRandomness(t *test
 	random := &countingReader{}
 	candidate, err := PlanRotation(RotationPlan{
 		Current: shared, NextGeneration: 2, TenantID: "tenant", Domain: "one.example",
-		Use: ProfileUseOriginator, RSABits: DefaultRSABits, Random: random, History: collisionSet{},
+		Use: ProfileUseOriginator, RSABits: DefaultRSABits, AllocationAttempts: 16, Random: random, History: collisionSet{},
 	})
 	if err == nil || candidate != nil {
 		t.Fatal("rotation accepted a profile shared by another policy")
@@ -181,7 +245,7 @@ func TestPlanRotationBoundsHistoricalCollisions(t *testing.T) {
 	}
 	_, err := PlanRotation(RotationPlan{
 		Current: current, NextGeneration: 2, TenantID: "tenant", Domain: "one.example",
-		Use: ProfileUseOriginator, RSABits: DefaultRSABits,
+		Use: ProfileUseOriginator, RSABits: DefaultRSABits, AllocationAttempts: 16,
 		Random: &sequenceReader{}, History: history,
 	})
 	if err == nil {
@@ -198,7 +262,7 @@ func TestPlanRotationBoundsHistoricalHandleCollisions(t *testing.T) {
 	}
 	if candidate, err := PlanRotation(RotationPlan{
 		Current: current, NextGeneration: 2, TenantID: "tenant", Domain: "one.example",
-		Use: ProfileUseOriginator, RSABits: DefaultRSABits, Random: &sequenceReader{}, History: history,
+		Use: ProfileUseOriginator, RSABits: DefaultRSABits, AllocationAttempts: 16, Random: &sequenceReader{}, History: history,
 	}); err == nil || candidate != nil {
 		t.Fatal("bounded historical handle collisions were accepted")
 	}
@@ -210,7 +274,7 @@ func TestPlanRotationRejectsGenerationOverflowBeforeRandomness(t *testing.T) {
 	random := &countingReader{}
 	if candidate, err := PlanRotation(RotationPlan{
 		Current: current, NextGeneration: 1, TenantID: "tenant", Domain: "one.example",
-		Use: ProfileUseOriginator, RSABits: DefaultRSABits, Random: random, History: collisionSet{},
+		Use: ProfileUseOriginator, RSABits: DefaultRSABits, AllocationAttempts: 16, Random: random, History: collisionSet{},
 	}); err == nil || candidate != nil {
 		t.Fatal("generation overflow was accepted")
 	}
@@ -236,7 +300,7 @@ func TestPlanRotationClosesGeneratedOwnersWhenGeneratorFails(t *testing.T) {
 	}
 	if candidate, err := PlanRotation(RotationPlan{
 		Current: current, NextGeneration: 2, TenantID: "tenant", Domain: "one.example",
-		Use: ProfileUseOriginator, RSABits: DefaultRSABits, Random: &sequenceReader{},
+		Use: ProfileUseOriginator, RSABits: DefaultRSABits, AllocationAttempts: 16, Random: &sequenceReader{},
 		History: collisionSet{}, Generate: generate,
 	}); err == nil || candidate != nil {
 		t.Fatal("generator failure was accepted")
@@ -251,7 +315,7 @@ func TestPlanRotationClosesGeneratedOwnersWhenGeneratorFails(t *testing.T) {
 	}
 }
 
-func TestSelectOneEligibleBindingUsesCanonicalLineageClock(t *testing.T) {
+func TestEligibleBindingsUsesCanonicalLineageClock(t *testing.T) {
 	current := activeRotationGeneration(t)
 	defer func() { _ = current.Close() }()
 	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
@@ -267,25 +331,27 @@ func TestSelectOneEligibleBindingUsesCanonicalLineageClock(t *testing.T) {
 		}
 		facts = append(facts, fact)
 	}
-	decision, err := SelectOneEligibleBinding(now, current, LineageHistory{Complete: true, Facts: facts}, 365, 300)
+	limits := RotationLimits{RotateAfter: 365 * 24 * time.Hour, MaximumClockSkew: 300 * time.Second,
+		AllocationAttempts: 16, RSABits: DefaultRSABits, MaximumBindings: 10}
+	decisions, err := EligibleBindings(now, current, LineageHistory{Complete: true, Facts: facts}, limits)
 	if err != nil {
-		t.Fatalf("SelectOneEligibleBinding() error = %v", err)
+		t.Fatalf("EligibleBindings() error = %v", err)
 	}
-	if !decision.Due() || decision.Domain() != "one.example" {
-		t.Fatalf("unexpected eligibility decision: %v", decision)
+	if len(decisions) != 2 || !decisions[0].Due() || decisions[0].Domain() != "one.example" {
+		t.Fatalf("unexpected eligibility decisions: %v", decisions)
 	}
 
 	for _, history := range []LineageHistory{
 		{Complete: false, Facts: facts},
 		{Complete: true, Facts: append([]LineageFact(nil), facts[:len(facts)-1]...)},
 	} {
-		if _, err := SelectOneEligibleBinding(now, current, history, 365, 300); err == nil {
+		if _, err := EligibleBindings(now, current, history, limits); err == nil {
 			t.Fatal("incomplete or ambiguous lineage was accepted")
 		}
 	}
 	future := facts
 	future[0].created = "20260802120501Z"
-	if _, err := SelectOneEligibleBinding(now, current, LineageHistory{Complete: true, Facts: future}, 365, 300); err == nil {
+	if _, err := EligibleBindings(now, current, LineageHistory{Complete: true, Facts: future}, limits); err == nil {
 		t.Fatal("future lineage beyond skew was accepted")
 	}
 }

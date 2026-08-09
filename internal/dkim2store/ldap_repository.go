@@ -24,18 +24,20 @@ const generalizedTimeLayout = "20060102150405Z"
 var _ GenerationRepository = (*LDAPRepository)(nil)
 var _ RotationReadRepository = (*LDAPRepository)(nil)
 var _ RotationRepository = (*LDAPRepository)(nil)
+var _ CampaignRepository = (*LDAPRepository)(nil)
 
 // LDAPRepository owns the fixed DKIM2 dataset layout over an authenticated executor.
 type LDAPRepository struct {
 	executor        ldapstore.RequestExecutor
+	limits          Limits
 	baseDN          string
 	currentDN       string
 	generationsBase string
 }
 
 // NewLDAPRepository binds immutable generation operations to one validated LDAP base.
-func NewLDAPRepository(executor ldapstore.RequestExecutor) (*LDAPRepository, error) {
-	if executor == nil || isNilExecutor(executor) {
+func NewLDAPRepository(executor ldapstore.RequestExecutor, limits Limits) (*LDAPRepository, error) {
+	if executor == nil || isNilExecutor(executor) || limits.Validate() != nil {
 		return nil, ErrUnavailable
 	}
 	parsed, err := ldap.ParseDN(executor.BaseDN())
@@ -45,6 +47,7 @@ func NewLDAPRepository(executor ldapstore.RequestExecutor) (*LDAPRepository, err
 	baseDN := parsed.String()
 	return &LDAPRepository{
 		executor:        executor,
+		limits:          limits,
 		baseDN:          baseDN,
 		currentDN:       "cn=current," + baseDN,
 		generationsBase: "ou=generations," + baseDN,
@@ -72,7 +75,7 @@ func (r *LDAPRepository) LoadCurrent(ctx context.Context) (*dkim2model.Generatio
 	if err != nil {
 		return nil, err
 	}
-	generation, err := mapGeneration(entries, pointer.generation, datasetStateCommitted, r.generationRoot(pointer.generation))
+	generation, err := mapGeneration(entries, pointer.generation, datasetStateCommitted, r.generationRoot(pointer.generation), r.limits)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +122,7 @@ func (r *LDAPRepository) LoadCurrentActivation(ctx context.Context) (CurrentActi
 	if r == nil {
 		return CurrentActivation{}, ErrMalformed
 	}
-	request := boundedSearch(
+	request := r.boundedSearch(
 		r.currentDN, ldap.ScopeBaseObject, 2,
 		metadataAssertionFilter(datasetStateCommitted),
 		[]string{attributeGeneration, attributeModifyTimestamp},
@@ -132,7 +135,7 @@ func (r *LDAPRepository) LoadCurrentActivation(ctx context.Context) (CurrentActi
 		return CurrentActivation{}, ErrUnavailable
 	}
 	values, err := exactProjectedEntry(result.Entries[0], r.currentDN,
-		[]string{attributeGeneration, attributeModifyTimestamp})
+		[]string{attributeGeneration, attributeModifyTimestamp}, r.limits.MaxAttributeBytes)
 	if err != nil {
 		return CurrentActivation{}, err
 	}
@@ -161,7 +164,7 @@ func (r *LDAPRepository) loadOperationalTimestampWithSchema(
 	attribute string,
 	schemaVersion string,
 ) (time.Time, error) {
-	result, err := r.search(ctx, boundedSearch(
+	result, err := r.search(ctx, r.boundedSearch(
 		dn, ldap.ScopeBaseObject, 2, metadataAssertionFilterWithSchema("", schemaVersion), []string{attribute},
 	))
 	if err != nil || !exactSearchResult(result, 1) {
@@ -170,7 +173,7 @@ func (r *LDAPRepository) loadOperationalTimestampWithSchema(
 		}
 		return time.Time{}, ErrUnavailable
 	}
-	values, err := exactProjectedEntry(result.Entries[0], dn, []string{attribute})
+	values, err := exactProjectedEntry(result.Entries[0], dn, []string{attribute}, r.limits.MaxAttributeBytes)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -191,7 +194,7 @@ func metadataAssertionFilterWithSchema(state, schemaVersion string) string {
 	return filter + ")"
 }
 
-func exactProjectedEntry(entry *ldap.Entry, expectedDN string, attributes []string) (map[string][][]byte, error) {
+func exactProjectedEntry(entry *ldap.Entry, expectedDN string, attributes []string, maxAttributeBytes int) (map[string][][]byte, error) {
 	if entry == nil || !sameDN(entry.DN, expectedDN) || len(entry.Attributes) != len(attributes) {
 		return nil, ErrMalformed
 	}
@@ -205,7 +208,7 @@ func exactProjectedEntry(entry *ldap.Entry, expectedDN string, attributes []stri
 		if !found || len(attribute.ByteValues) != 1 {
 			return nil, ErrMalformed
 		}
-		if _, duplicate := values[name]; duplicate || len(attribute.ByteValues[0]) > maximumAttributeBytes {
+		if _, duplicate := values[name]; duplicate || len(attribute.ByteValues[0]) > maxAttributeBytes {
 			return nil, ErrMalformed
 		}
 		values[name] = attribute.ByteValues
@@ -232,13 +235,13 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 	if err := validContext(ctx); err != nil {
 		return RetainedHistory{}, err
 	}
-	if r == nil || limit < 2 || limit > 4096 {
+	if r == nil || limit < 2 || limit > r.limits.HistoryLimit {
 		return RetainedHistory{}, ErrMalformed
 	}
-	result, err := r.search(ctx, boundedSearch(
-		r.generationsBase, ldap.ScopeSingleLevel, limit,
+	result, err := r.search(ctx, r.boundedSearch(
+		r.generationsBase, ldap.ScopeSingleLevel, limit+1,
 		"("+attributeObjectClass+"=*)",
-		[]string{attributeObjectClass, attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState},
+		[]string{attributeObjectClass, attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState, attributeCandidateDigest},
 	))
 	if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) {
 		return NewRetainedHistory(nil, false, nil, nil), nil
@@ -249,7 +252,7 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 		}
 		return RetainedHistory{}, fmt.Errorf("DKIM2 retained history root index is unavailable: %w", ErrUnavailable)
 	}
-	if len(result.Entries) >= limit {
+	if len(result.Entries) > limit {
 		return NewRetainedHistory(nil, false, nil, nil), nil
 	}
 	history := NewRetainedHistory(nil, true, nil, nil)
@@ -263,7 +266,8 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 			return RetainedHistory{}, fmt.Errorf("DKIM2 retained history work budget is unavailable: %w", ErrUnavailable)
 		}
 		values, entryErr := exactEntry(entry, entry.DN, classDataset,
-			[]string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState}, nil)
+			[]string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState},
+			[]string{attributeCandidateDigest}, r.limits)
 		if entryErr != nil {
 			return RetainedHistory{}, fmt.Errorf("DKIM2 retained history roots are malformed: %w", ErrMalformed)
 		}
@@ -275,7 +279,7 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 		}
 		schemaVersion := string(values[attributeSchemaVersion][0])
 		legacyBootstrap := generation == 1 && schemaVersion == legacySchemaVersion
-		if schemaVersion != dkim2model.SchemaVersion && !legacyBootstrap {
+		if schemaVersion != dkim2model.SchemaVersion && schemaVersion != dkim2model.SchemaVersionV3 && !legacyBootstrap {
 			return RetainedHistory{}, fmt.Errorf("DKIM2 retained history schema is malformed: %w", ErrMalformed)
 		}
 		if _, duplicate := seen[generation]; duplicate {
@@ -348,7 +352,7 @@ func (r *LDAPRepository) LoadRetainedGeneration(
 	if err != nil {
 		return nil, err
 	}
-	loaded, err := mapGeneration(entries, generation, datasetStateCommitted, r.generationRoot(generation))
+	loaded, err := mapGeneration(entries, generation, datasetStateCommitted, r.generationRoot(generation), r.limits)
 	if err != nil {
 		return nil, err
 	}
@@ -374,10 +378,32 @@ func (r *LDAPRepository) Stage(
 	candidate *dkim2model.Generation,
 	historyLimit int,
 ) (*PreparedGeneration, error) {
+	return r.stageWithReader(ctx, candidate, historyLimit, nil, r)
+}
+
+// StageCampaign writes and exactly reads back one autonomous operation-bound v3 successor.
+func (r *LDAPRepository) StageCampaign(
+	ctx context.Context,
+	candidate *dkim2model.Generation,
+	metadata dkim2model.CandidateMetadata,
+) (*PreparedGeneration, error) {
+	if candidate == nil || metadata.ValidateCandidate(candidate) != nil {
+		return nil, ErrMalformed
+	}
+	return r.stageWithReader(ctx, candidate, r.limits.HistoryLimit, &metadata, r)
+}
+
+func (r *LDAPRepository) stageWithReader(
+	ctx context.Context,
+	candidate *dkim2model.Generation,
+	historyLimit int,
+	metadata *dkim2model.CandidateMetadata,
+	reader *LDAPRepository,
+) (*PreparedGeneration, error) {
 	if err := validContext(ctx); err != nil {
 		return nil, err
 	}
-	if r == nil || r.executor == nil || candidate == nil || candidate.Number() < 2 ||
+	if r == nil || reader == nil || r.executor == nil || candidate == nil || candidate.Number() < 2 ||
 		candidate.State() != dkim2model.DatasetStateStaging {
 		return nil, ErrMalformed
 	}
@@ -388,7 +414,7 @@ func (r *LDAPRepository) Stage(
 	}
 	defer func() { _ = owned.Close() }()
 
-	current, err := r.LoadCurrent(ctx)
+	current, err := reader.LoadCurrent(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +426,7 @@ func (r *LDAPRepository) Stage(
 	if currentNumber != expected {
 		return nil, ErrConflict
 	}
-	history, err := r.LoadRetainedHistory(ctx, historyLimit)
+	history, err := reader.LoadRetainedHistory(ctx, historyLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -410,16 +436,21 @@ func (r *LDAPRepository) Stage(
 	if err := validContext(ctx); err != nil {
 		return nil, err
 	}
-	if err := r.addCandidate(ctx, owned); err != nil {
+	if metadata == nil {
+		err = r.addCandidate(ctx, owned)
+	} else {
+		err = r.addCampaignCandidate(ctx, owned, *metadata)
+	}
+	if err != nil {
 		return nil, err
 	}
 	if err := validContext(ctx); err != nil {
 		return nil, err
 	}
-	if err := r.validateReadback(ctx, owned); err != nil {
+	if err := reader.validateReadback(ctx, owned); err != nil {
 		return nil, err
 	}
-	return r.LoadPending(ctx, owned.Number(), historyLimit)
+	return reader.LoadPending(ctx, owned.Number(), historyLimit)
 }
 
 // LoadPending derives expected-current as candidate-1 and returns exact stored material.
@@ -461,7 +492,11 @@ func (r *LDAPRepository) LoadPending(
 	if err != nil {
 		return nil, err
 	}
-	loaded, err := mapGeneration(entries, candidateNumber, string(state), r.generationRoot(candidateNumber))
+	metadata, campaign, err := projectCampaignMetadata(entries, r.generationRoot(candidateNumber), candidateNumber, r.limits)
+	if err != nil {
+		return nil, err
+	}
+	loaded, err := mapGeneration(entries, candidateNumber, string(state), r.generationRoot(candidateNumber), r.limits)
 	if err != nil {
 		return nil, err
 	}
@@ -481,7 +516,23 @@ func (r *LDAPRepository) LoadPending(
 		_ = loaded.Close()
 		return nil, err
 	}
-	return newPreparedGeneration(expected, pointer.generation, loaded)
+	prepared, err := newPreparedGeneration(expected, pointer.generation, loaded)
+	if err != nil {
+		return nil, err
+	}
+	if campaign {
+		candidate, generationErr := prepared.Generation()
+		if generationErr != nil || metadata.ValidateCandidate(candidate) != nil {
+			if candidate != nil {
+				_ = candidate.Close()
+			}
+			_ = prepared.Close()
+			return nil, ErrMalformed
+		}
+		_ = candidate.Close()
+		prepared.metadata = &metadata
+	}
+	return prepared, nil
 }
 
 // CommitAndSwitch commits one exact staged candidate, then advances current once.
@@ -537,12 +588,70 @@ func (r *LDAPRepository) CommitAndSwitch(ctx context.Context, candidateNumber ui
 	return nil
 }
 
+// CommitCampaignAndSwitch commits one exact v3 candidate and moves current once.
+func (r *LDAPRepository) CommitCampaignAndSwitch(ctx context.Context, evidence *PreparedGeneration) error {
+	if evidence == nil {
+		return ErrMalformed
+	}
+	metadata, ok := evidence.CampaignMetadata()
+	if !ok {
+		return ErrMalformed
+	}
+	prepared, err := r.LoadPending(ctx, evidence.CandidateNumber(), r.limits.HistoryLimit)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = prepared.Close() }()
+	observedMetadata, ok := prepared.CampaignMetadata()
+	if !ok || !metadata.DigestEqual(observedMetadata) || metadata.SourceGeneration() != prepared.ExpectedCurrent() {
+		return ErrConflict
+	}
+	if prepared.ObservedCurrent() == prepared.CandidateNumber() {
+		return nil
+	}
+	pointer, absent, err := r.readCurrentPointer(ctx)
+	if err != nil || absent || pointer.generation != prepared.ExpectedCurrent() {
+		return ErrConflict
+	}
+	// Legacy v2 source roots are immutable. Their history remains retained
+	// instead of retroactively adding v3-only activation evidence.
+	if pointer.schema == dkim2model.SchemaVersionV3 {
+		if err := r.markSourceWasActive(ctx, pointer); err != nil {
+			return err
+		}
+	}
+	candidate, err := prepared.Generation()
+	if err != nil {
+		return err
+	}
+	state := candidate.State()
+	_ = candidate.Close()
+	if state == dkim2model.DatasetStateStaging {
+		if err := r.commitCampaignGeneration(ctx, observedMetadata); err != nil {
+			return err
+		}
+	}
+	if err := r.switchCurrentCampaign(ctx, pointer, observedMetadata); err != nil {
+		return err
+	}
+	final, err := r.LoadPending(ctx, prepared.CandidateNumber(), r.limits.HistoryLimit)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = final.Close() }()
+	finalMetadata, ok := final.CampaignMetadata()
+	if !ok || final.ObservedCurrent() != prepared.CandidateNumber() || !finalMetadata.DigestEqual(observedMetadata) {
+		return ErrOutcomeUncertain
+	}
+	return nil
+}
+
 func (r *LDAPRepository) loadExactGeneration(ctx context.Context, number uint64, state dkim2model.DatasetState) (*dkim2model.Generation, error) {
 	entries, err := r.readGeneration(ctx, number)
 	if err != nil {
 		return nil, err
 	}
-	return mapGeneration(entries, number, string(state), r.generationRoot(number))
+	return mapGeneration(entries, number, string(state), r.generationRoot(number), r.limits)
 }
 
 func historyHasExactCurrentMaximum(roots []GenerationRoot, current uint64) bool {
@@ -586,13 +695,13 @@ func historyHasPendingShape(roots []GenerationRoot, expected, candidate uint64) 
 	return expectedFound && candidateCount == 1
 }
 
-// contiguousGenerationRoots requires every retained immutable root from one through the maximum.
+// contiguousGenerationRoots accepts one complete contiguous retained suffix.
 func contiguousGenerationRoots(roots []GenerationRoot) bool {
 	if len(roots) == 0 {
 		return false
 	}
 	for index, root := range roots {
-		if root.Number != uint64(index+1) {
+		if root.Number == 0 || index > 0 && root.Number != roots[index-1].Number+1 {
 			return false
 		}
 	}
@@ -648,13 +757,13 @@ func (r *LDAPRepository) loadHistoricalLineages(
 	root := r.generationRoot(generation)
 	load := func(unit string, attributes []string, allowAbsent bool) ([]*ldap.Entry, error) {
 		base := "ou=" + ldap.EscapeDN(unit) + "," + root
-		result, err := r.search(ctx, boundedSearch(base, ldap.ScopeSingleLevel, maximumSearchEntries,
+		result, err := r.search(ctx, r.boundedSearch(base, ldap.ScopeSingleLevel, r.limits.MaxGenerationEntries,
 			"("+attributeObjectClass+"=*)", attributes))
 		if allowAbsent && ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
 			return nil, nil
 		}
 		if ldap.IsErrorWithCode(err, ldap.LDAPResultSizeLimitExceeded) ||
-			err == nil && result != nil && len(result.Referrals) == 0 && len(result.Entries) >= maximumSearchEntries {
+			err == nil && result != nil && len(result.Referrals) == 0 && len(result.Entries) >= r.limits.MaxGenerationEntries {
 			return nil, errHistoryIncomplete
 		}
 		if err != nil || result == nil || len(result.Referrals) != 0 {
@@ -683,7 +792,7 @@ func (r *LDAPRepository) loadHistoricalLineages(
 	}
 	for _, entry := range handleEntries {
 		values, exactErr := exactEntry(entry, entry.DN, classHandle,
-			[]string{attributeCN, attributeGeneration, attributeHandleID}, nil)
+			[]string{attributeCN, attributeGeneration, attributeHandleID}, nil, r.limits)
 		if exactErr != nil {
 			return ErrMalformed
 		}
@@ -708,7 +817,7 @@ func (r *LDAPRepository) loadHistoricalLineages(
 	}
 	for _, entry := range profileEntries {
 		values, exactErr := exactEntry(entry, entry.DN, classProfile,
-			[]string{attributeCN, attributeGeneration, attributeProfileID, attributeSigningDomain}, nil)
+			[]string{attributeCN, attributeGeneration, attributeProfileID, attributeSigningDomain}, nil, r.limits)
 		if exactErr != nil {
 			return ErrMalformed
 		}
@@ -736,7 +845,7 @@ func (r *LDAPRepository) loadHistoricalLineages(
 		values, exactErr := exactEntry(entry, entry.DN, classPolicy, []string{
 			attributeCN, attributeGeneration, attributeTenantID, attributeSigningDomain,
 			attributeProfileUse, attributeProfileID,
-		}, nil)
+		}, nil, r.limits)
 		if exactErr != nil {
 			return ErrMalformed
 		}
@@ -771,7 +880,7 @@ func (r *LDAPRepository) loadHistoricalLineages(
 		values, exactErr := exactEntry(entry, entry.DN, classCredential, []string{
 			attributeCN, attributeGeneration, attributeProfileID, attributeAlgorithm,
 			attributeSelector, attributePublicKeySPKI, attributeHandleID,
-		}, nil)
+		}, nil, r.limits)
 		if exactErr != nil {
 			return ErrMalformed
 		}
@@ -821,7 +930,7 @@ func (r *LDAPRepository) loadHistoricalLineages(
 		values, exactErr := exactEntry(entry, entry.DN, classKeyMaterial, []string{
 			attributeCN, attributeGeneration, attributeTenantID, attributeSigningDomain,
 			attributeProfileUse, attributeHandleID, attributeAlgorithm, attributePublicKeySPKI,
-		}, nil)
+		}, nil, r.limits)
 		if exactErr != nil {
 			return ErrMalformed
 		}
@@ -1023,14 +1132,16 @@ type currentPointer struct {
 	schema     string
 	generation uint64
 	state      string
+	digest     [dkim2model.CandidateDigestBytes]byte
 }
 
 // readCurrentPointer loads one exact committed current fence or preserves proven absence.
 func (r *LDAPRepository) readCurrentPointer(ctx context.Context) (currentPointer, bool, error) {
-	request := boundedSearch(
+	request := r.boundedSearch(
 		r.currentDN, ldap.ScopeBaseObject, 2,
 		"("+attributeObjectClass+"="+ldap.EscapeFilter(classDataset)+")",
-		[]string{attributeObjectClass, attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState},
+		[]string{attributeObjectClass, attributeCN, attributeSchemaVersion, attributeGeneration,
+			attributeDatasetState, attributeCandidateDigest},
 	)
 	result, err := r.search(ctx, request)
 	if ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
@@ -1042,12 +1153,20 @@ func (r *LDAPRepository) readCurrentPointer(ctx context.Context) (currentPointer
 		}
 		return currentPointer{}, false, ErrUnavailable
 	}
-	values, err := exactEntry(
-		result.Entries[0], r.currentDN, classDataset,
-		[]string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState}, nil,
-	)
+	schemaValues, found := rawAttribute(result.Entries[0], attributeSchemaVersion)
+	if !found || len(schemaValues) != 1 {
+		return currentPointer{}, false, ErrMalformed
+	}
+	schema := string(schemaValues[0])
+	required := []string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState}
+	optional := []string{attributeCandidateDigest}
+	if schema == dkim2model.SchemaVersionV3 {
+		required = append(required, attributeCandidateDigest)
+		optional = nil
+	}
+	values, err := exactEntry(result.Entries[0], r.currentDN, classDataset, required, optional, r.limits)
 	if err != nil || string(values[attributeCN][0]) != "current" ||
-		string(values[attributeSchemaVersion][0]) != dkim2model.SchemaVersion ||
+		(schema != dkim2model.SchemaVersion && schema != dkim2model.SchemaVersionV3) ||
 		string(values[attributeDatasetState][0]) != datasetStateCommitted {
 		return currentPointer{}, false, ErrMalformed
 	}
@@ -1055,14 +1174,29 @@ func (r *LDAPRepository) readCurrentPointer(ctx context.Context) (currentPointer
 	if err != nil {
 		return currentPointer{}, false, err
 	}
-	return currentPointer{
-		schema: dkim2model.SchemaVersion, generation: generation, state: datasetStateCommitted,
-	}, false, nil
+	pointer := currentPointer{
+		schema: schema, generation: generation, state: datasetStateCommitted,
+	}
+	if schema == dkim2model.SchemaVersionV3 {
+		digest := values[attributeCandidateDigest][0]
+		if len(digest) != len(pointer.digest) {
+			return currentPointer{}, false, ErrMalformed
+		}
+		copy(pointer.digest[:], digest)
+		allZero := byte(0)
+		for _, value := range pointer.digest {
+			allZero |= value
+		}
+		if allZero == 0 {
+			return currentPointer{}, false, ErrMalformed
+		}
+	}
+	return pointer, false, nil
 }
 
 // generationContainerEmpty proves that the fixed generation container exists without children.
 func (r *LDAPRepository) generationContainerEmpty(ctx context.Context) (bool, error) {
-	result, err := r.search(ctx, boundedSearch(
+	result, err := r.search(ctx, r.boundedSearch(
 		r.generationsBase, ldap.ScopeSingleLevel, 1,
 		"("+attributeObjectClass+"=*)", []string{attributeObjectClass},
 	))
@@ -1079,12 +1213,12 @@ func (r *LDAPRepository) generationContainerEmpty(ctx context.Context) (bool, er
 func (r *LDAPRepository) readGeneration(ctx context.Context, generation uint64) ([]*ldap.Entry, error) {
 	// Organizational units do not carry dkim2Generation, so the structural read
 	// intentionally uses objectClass only and validates every returned entry.
-	result, err := r.search(ctx, boundedSearch(
-		r.generationRoot(generation), ldap.ScopeWholeSubtree, maximumSearchEntries,
+	result, err := r.search(ctx, r.boundedSearch(
+		r.generationRoot(generation), ldap.ScopeWholeSubtree, r.limits.MaxGenerationEntries,
 		"("+attributeObjectClass+"=*)", allAttributes,
 	))
 	if err != nil || result == nil || len(result.Referrals) != 0 ||
-		len(result.Entries) < 6 || len(result.Entries) > maximumSearchEntries {
+		len(result.Entries) < 6 || len(result.Entries) > r.limits.MaxGenerationEntries {
 		if contextErr := validContext(ctx); contextErr != nil {
 			return nil, contextErr
 		}
@@ -1131,9 +1265,9 @@ func (r *LDAPRepository) generationRoot(generation uint64) string {
 }
 
 // boundedSearch constructs one no-alias exact-attribute request with hard limits.
-func boundedSearch(base string, scope, size int, filter string, attributes []string) *ldap.SearchRequest {
+func (r *LDAPRepository) boundedSearch(base string, scope, size int, filter string, attributes []string) *ldap.SearchRequest {
 	request := ldap.NewSearchRequest(
-		base, scope, ldap.NeverDerefAliases, size, searchTimeLimit,
+		base, scope, ldap.NeverDerefAliases, size, r.limits.SearchTimeLimitSeconds,
 		false, filter, attributes, nil,
 	)
 	request.EnforceSizeLimit = true
@@ -1180,7 +1314,7 @@ func (r *LDAPRepository) search(ctx context.Context, request *ldap.SearchRequest
 	if err != nil {
 		return result, err
 	}
-	bytesRead, sizeErr := ldapSearchResultBytes(result)
+	bytesRead, sizeErr := ldapSearchResultBytes(result, r.limits.MaxDatasetBytes)
 	if sizeErr != nil || budget.consume(0, bytesRead, 0) != nil {
 		return nil, ErrUnavailable
 	}
@@ -1250,7 +1384,12 @@ func exactEntry(
 	class string,
 	required []string,
 	optional []string,
+	limits Limits,
 ) (map[string][][]byte, error) {
+	if limits.Validate() != nil {
+		return nil, ErrMalformed
+	}
+	maxAttributeBytes, maxDatasetBytes := limits.MaxAttributeBytes, limits.MaxDatasetBytes
 	if entry == nil || !sameDN(entry.DN, expectedDN) {
 		return nil, ErrMalformed
 	}
@@ -1280,7 +1419,7 @@ func exactEntry(
 		}
 		projected := make([][]byte, len(attribute.ByteValues))
 		for index, value := range attribute.ByteValues {
-			if value == nil || len(value) > maximumAttributeBytes || total > maximumDatasetBytes-len(value) {
+			if value == nil || len(value) > maxAttributeBytes || total > maxDatasetBytes-len(value) {
 				return nil, ErrMalformed
 			}
 			total += len(value)
@@ -1301,7 +1440,14 @@ func exactEntry(
 			return nil, ErrMalformed
 		}
 	}
-	if !exactStringSet(values[attributeObjectClass], []string{classTop, class}) {
+	wantClasses := []string{classTop, class}
+	if class == classDataset {
+		schema := values[attributeSchemaVersion]
+		if len(schema) == 1 && string(schema[0]) == dkim2model.SchemaVersionV3 {
+			wantClasses = append(wantClasses, classAdministrativeMetadata)
+		}
+	}
+	if !exactStringSet(values[attributeObjectClass], wantClasses) {
 		return nil, ErrMalformed
 	}
 	success = true

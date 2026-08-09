@@ -19,16 +19,15 @@ type ldapWorkBudget struct {
 	maximumHistories int
 }
 
-// WithLifecycleWorkBudget binds cumulative LDAP work to one configured lifecycle run.
-func WithLifecycleWorkBudget(ctx context.Context, historyLimit int) context.Context {
-	if ctx == nil || historyLimit < 2 || historyLimit > 4096 {
+// WithLifecycleWorkBudget binds exact configured cumulative LDAP work to one lifecycle run.
+func WithLifecycleWorkBudget(ctx context.Context, limits Limits) context.Context {
+	if ctx == nil || limits.Validate() != nil {
 		return ctx
 	}
-	maximumHistoryBytes := maximumDatasetBytes * min(historyLimit, 8)
 	budget := &ldapWorkBudget{
-		maximumRequests:  128 + 64*historyLimit,
-		maximumBytes:     maximumHistoryBytes,
-		maximumHistories: 16 * historyLimit,
+		maximumRequests:  limits.MaxLDAPRequests,
+		maximumBytes:     limits.MaxLDAPBytes,
+		maximumHistories: limits.MaxRetainedRootVisits,
 	}
 	return context.WithValue(ctx, ldapWorkBudgetKey{}, budget)
 }
@@ -59,23 +58,23 @@ func (b *ldapWorkBudget) consume(requests, bytes, histories int) error {
 	return nil
 }
 
-func ldapSearchResultBytes(result *ldap.SearchResult) (int, error) {
+func ldapSearchResultBytes(result *ldap.SearchResult, maximumBytes int) (int, error) {
 	if result == nil {
 		return 0, nil
 	}
 	total := 0
 	for _, entry := range result.Entries {
-		if entry == nil || total > maximumDatasetBytes-len(entry.DN) {
+		if entry == nil || total > maximumBytes-len(entry.DN) {
 			return 0, ErrUnavailable
 		}
 		total += len(entry.DN)
 		for _, attribute := range entry.Attributes {
-			if attribute == nil || total > maximumDatasetBytes-len(attribute.Name) {
+			if attribute == nil || total > maximumBytes-len(attribute.Name) {
 				return 0, ErrUnavailable
 			}
 			total += len(attribute.Name)
 			for _, value := range attribute.ByteValues {
-				if total > maximumDatasetBytes-len(value) {
+				if total > maximumBytes-len(value) {
 					return 0, ErrUnavailable
 				}
 				total += len(value)
@@ -108,6 +107,19 @@ func ldapModifyRequestBytes(request *ldap.ModifyRequest) int {
 		total += len(change.Modification.Type)
 		for _, value := range change.Modification.Vals {
 			total += len(value)
+		}
+	}
+	return total
+}
+
+func ldapDeleteRequestBytes(request *ldap.DelRequest) int {
+	if request == nil {
+		return 0
+	}
+	total := len(request.DN)
+	for _, control := range request.Controls {
+		if assertion, ok := control.(*ldap.ControlString); ok {
+			total += len(assertion.ControlType) + len(assertion.ControlValue) + 1
 		}
 	}
 	return total

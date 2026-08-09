@@ -10,14 +10,6 @@ import (
 
 const generationRedacted = "dkim2model.Generation{redacted}"
 
-const (
-	maxProfiles    = 1024
-	maxCredentials = 2048
-	maxHandles     = 2048
-	maxPolicies    = 4096
-	maxRecords     = 9216
-)
-
 // Generation owns one complete immutable all-domain DKIM2 snapshot.
 type Generation struct {
 	number      uint64
@@ -55,10 +47,7 @@ func NewGenerationWithState(
 ) (*Generation, error) {
 	if number == 0 || !state.Known() || len(handles) == 0 || len(profiles) == 0 ||
 		len(credentials) == 0 || len(policies) == 0 || len(materials) == 0 ||
-		len(handles) > maxHandles || len(profiles) > maxProfiles ||
-		len(credentials) > maxCredentials || len(policies) > maxPolicies ||
-		len(materials) > maxHandles ||
-		len(handles)+len(profiles)+len(credentials)+len(policies) > maxRecords {
+		len(materials) != len(handles) {
 		return nil, ErrInvalid
 	}
 	result := &Generation{

@@ -2,6 +2,8 @@ package ldapstore
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -10,6 +12,46 @@ import (
 	"github.com/croessner/opendkim-manage-go/internal/config"
 	"github.com/croessner/opendkim-manage-go/internal/types"
 )
+
+func TestReadAuthorityPasswordRequiresOwnerOnlyCanonicalContent(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(directory, "authority")
+	if err := os.WriteFile(path, []byte("synthetic-password\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	password, err := readAuthorityPassword(path, 1024)
+	if err != nil || string(password) != "synthetic-password" {
+		t.Fatalf("password read = %q, %v", password, err)
+	}
+	clear(password)
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAuthorityPassword(path, 1024); err == nil {
+		t.Fatal("world-readable authority password was accepted")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("first\nsecond"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAuthorityPassword(path, 1024); err == nil {
+		t.Fatal("multi-line authority password was accepted")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(directory, "missing"), path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readAuthorityPassword(path, 1024); err == nil {
+		t.Fatal("symlink authority password was accepted")
+	}
+}
 
 func TestTLSConfigUsesLDAPURIHostAsServerName(t *testing.T) {
 	cfg := &config.Config{}

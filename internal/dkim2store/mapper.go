@@ -16,12 +16,13 @@ func mapGeneration(
 	generation uint64,
 	state string,
 	rootDN string,
+	limits Limits,
 ) (*dkim2model.Generation, error) {
-	if generation == 0 || len(entries) < 6 || len(entries) > maximumSearchEntries {
+	if generation == 0 || limits.Validate() != nil || len(entries) < 6 || len(entries) > limits.MaxGenerationEntries {
 		return nil, ErrMalformed
 	}
 	defer clearSensitiveEntries(entries)
-	if validateDatasetSize(entries) != nil {
+	if validateDatasetSize(entries, limits) != nil {
 		return nil, ErrMalformed
 	}
 	parsedState, err := dkim2model.ParseDatasetState(state)
@@ -41,6 +42,8 @@ func mapGeneration(
 	}()
 
 	rootSeen := false
+	rootSchema := ""
+	var rootMetadata dkim2model.CandidateMetadata
 	units := make(map[string]struct{}, len(generationUnits))
 	storageDNs := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
@@ -66,19 +69,38 @@ func mapGeneration(
 			if rootSeen || !sameDN(entry.DN, rootDN) {
 				return nil, ErrMalformed
 			}
-			values, exactErr := exactEntry(
-				entry, rootDN, classDataset,
-				[]string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState}, nil,
-			)
+			schemaValues, schemaFound := rawAttribute(entry, attributeSchemaVersion)
+			if !schemaFound || len(schemaValues) != 1 {
+				return nil, ErrMalformed
+			}
+			rootSchema = string(schemaValues[0])
+			required := []string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState}
+			optional := []string{attributeWasActive}
+			if rootSchema == dkim2model.SchemaVersionV3 {
+				required = append(required, attributeCandidateDigest, attributeOperationID, attributeSourceGeneration)
+			}
+			values, exactErr := exactEntry(entry, rootDN, classDataset, required, optional, limits)
 			if exactErr != nil || string(values[attributeCN][0]) != "generation-"+strconv.FormatUint(generation, 10) ||
-				string(values[attributeSchemaVersion][0]) != dkim2model.SchemaVersion ||
+				(rootSchema != dkim2model.SchemaVersion && rootSchema != dkim2model.SchemaVersionV3) ||
 				string(values[attributeDatasetState][0]) != state ||
 				exactGeneration(values[attributeGeneration][0], generation) != nil {
 				return nil, ErrMalformed
 			}
+			if rootSchema == dkim2model.SchemaVersionV3 {
+				source, parseErr := parseGeneration(values[attributeSourceGeneration][0])
+				if parseErr != nil {
+					return nil, ErrMalformed
+				}
+				rootMetadata, parseErr = dkim2model.ParseCandidateMetadata(
+					string(values[attributeOperationID][0]), source, generation, values[attributeCandidateDigest][0],
+				)
+				if parseErr != nil {
+					return nil, ErrMalformed
+				}
+			}
 			rootSeen = true
 		case classOrganizationalUnit:
-			unit, unitErr := exactUnit(entry, rootDN)
+			unit, unitErr := exactUnit(entry, rootDN, limits)
 			if unitErr != nil {
 				return nil, unitErr
 			}
@@ -89,7 +111,7 @@ func mapGeneration(
 		case classHandle:
 			values, exactErr := exactRecord(entry, rootDN, "handles", classHandle, []string{
 				attributeGeneration, attributeHandleID,
-			}, nil)
+			}, nil, limits)
 			if exactErr != nil || exactGeneration(values[attributeGeneration][0], generation) != nil {
 				return nil, ErrMalformed
 			}
@@ -101,7 +123,7 @@ func mapGeneration(
 		case classProfile:
 			values, exactErr := exactRecord(entry, rootDN, "profiles", classProfile, []string{
 				attributeGeneration, attributeProfileID, attributeSigningDomain, attributeRecordStatus,
-			}, []string{attributeNotBefore, attributeNotAfter})
+			}, []string{attributeNotBefore, attributeNotAfter}, limits)
 			if exactErr != nil || exactGeneration(values[attributeGeneration][0], generation) != nil {
 				return nil, ErrMalformed
 			}
@@ -125,7 +147,7 @@ func mapGeneration(
 			values, exactErr := exactRecord(entry, rootDN, "credentials", classCredential, []string{
 				attributeGeneration, attributeProfileID, attributeAlgorithm, attributeSelector,
 				attributePublicKeySPKI, attributeHandleID,
-			}, nil)
+			}, nil, limits)
 			if exactErr != nil || exactGeneration(values[attributeGeneration][0], generation) != nil {
 				return nil, ErrMalformed
 			}
@@ -146,7 +168,7 @@ func mapGeneration(
 				attributeGeneration, attributeTenantID, attributeSigningDomain,
 				attributeProfileUse, attributeProfileID, attributeRecordStatus,
 				attributeRollout, attributeCompatibility,
-			}, []string{attributeFeedbackRouteID})
+			}, []string{attributeFeedbackRouteID}, limits)
 			if exactErr != nil || exactGeneration(values[attributeGeneration][0], generation) != nil {
 				return nil, ErrMalformed
 			}
@@ -159,7 +181,7 @@ func mapGeneration(
 			values, exactErr := exactRecord(entry, rootDN, "key-material", classKeyMaterial, []string{
 				attributeGeneration, attributeTenantID, attributeSigningDomain, attributeProfileUse,
 				attributeHandleID, attributeAlgorithm, attributePublicKeySPKI, attributePrivatePKCS8,
-			}, nil)
+			}, nil, limits)
 			if exactErr != nil {
 				return nil, ErrMalformed
 			}
@@ -186,10 +208,50 @@ func mapGeneration(
 	if err != nil {
 		return nil, ErrMalformed
 	}
+	if rootSchema == dkim2model.SchemaVersionV3 && rootMetadata.ValidateCandidate(result) != nil {
+		_ = result.Close()
+		return nil, ErrMalformed
+	}
 	return result, nil
 }
 
-// structuralClass accepts exactly top plus one known structural object class.
+// projectCampaignMetadata copies only non-key v3 root evidence before full mapping clears LDAP buffers.
+func projectCampaignMetadata(entries []*ldap.Entry, rootDN string, generation uint64, limits Limits) (dkim2model.CandidateMetadata, bool, error) {
+	for _, entry := range entries {
+		if entry == nil || !sameDN(entry.DN, rootDN) {
+			continue
+		}
+		schema, found := rawAttribute(entry, attributeSchemaVersion)
+		if !found || len(schema) != 1 {
+			return dkim2model.CandidateMetadata{}, false, ErrMalformed
+		}
+		if string(schema[0]) != dkim2model.SchemaVersionV3 {
+			return dkim2model.CandidateMetadata{}, false, nil
+		}
+		values, err := exactEntry(entry, rootDN, classDataset,
+			[]string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState,
+				attributeCandidateDigest, attributeOperationID, attributeSourceGeneration},
+			[]string{attributeWasActive}, limits)
+		if err != nil {
+			return dkim2model.CandidateMetadata{}, false, ErrMalformed
+		}
+		source, err := parseGeneration(values[attributeSourceGeneration][0])
+		if err != nil {
+			return dkim2model.CandidateMetadata{}, false, ErrMalformed
+		}
+		metadata, err := dkim2model.ParseCandidateMetadata(
+			string(values[attributeOperationID][0]), source, generation,
+			append([]byte(nil), values[attributeCandidateDigest][0]...),
+		)
+		if err != nil {
+			return dkim2model.CandidateMetadata{}, false, ErrMalformed
+		}
+		return metadata, true, nil
+	}
+	return dkim2model.CandidateMetadata{}, false, ErrMalformed
+}
+
+// structuralClass accepts one known structural class and the sole v3 root auxiliary class.
 func structuralClass(entry *ldap.Entry) (string, error) {
 	values, found := rawAttribute(entry, attributeObjectClass)
 	if !found {
@@ -203,17 +265,20 @@ func structuralClass(entry *ldap.Entry) (string, error) {
 			return class, nil
 		}
 	}
+	if exactStringSet(values, []string{classTop, classDataset, classAdministrativeMetadata}) {
+		return classDataset, nil
+	}
 	return "", ErrMalformed
 }
 
 // exactUnit validates one of the five fixed organizational units.
-func exactUnit(entry *ldap.Entry, rootDN string) (string, error) {
+func exactUnit(entry *ldap.Entry, rootDN string, limits Limits) (string, error) {
 	for _, unit := range generationUnits {
 		dn := "ou=" + ldap.EscapeDN(unit) + "," + rootDN
 		if !sameDN(entry.DN, dn) {
 			continue
 		}
-		values, err := exactEntry(entry, dn, classOrganizationalUnit, []string{attributeOU}, nil)
+		values, err := exactEntry(entry, dn, classOrganizationalUnit, []string{attributeOU}, nil, limits)
 		if err != nil || string(values[attributeOU][0]) != unit {
 			return "", ErrMalformed
 		}
@@ -230,6 +295,7 @@ func exactRecord(
 	class string,
 	required []string,
 	optional []string,
+	limits Limits,
 ) (map[string][][]byte, error) {
 	cnValues, found := rawAttribute(entry, attributeCN)
 	if !found || len(cnValues) != 1 {
@@ -241,7 +307,7 @@ func exactRecord(
 		return nil, ErrMalformed
 	}
 	dn := attributeCN + "=" + ldap.EscapeDN(cn) + ",ou=" + ldap.EscapeDN(unit) + "," + rootDN
-	return exactEntry(entry, dn, class, append([]string{attributeCN}, required...), optional)
+	return exactEntry(entry, dn, class, append([]string{attributeCN}, required...), optional, limits)
 }
 
 // rawAttribute returns one unique case-insensitive raw attribute projection.
@@ -350,22 +416,22 @@ func mapKeyMaterial(generation uint64, values map[string][][]byte) (*dkim2model.
 }
 
 // validateDatasetSize rejects oversized results before model retention.
-func validateDatasetSize(entries []*ldap.Entry) error {
+func validateDatasetSize(entries []*ldap.Entry, limits Limits) error {
 	total := 0
 	for _, entry := range entries {
 		if entry == nil {
 			return ErrMalformed
 		}
 		for _, attribute := range entry.Attributes {
-			if attribute == nil || len(attribute.Name) > maximumAttributeBytes {
+			if attribute == nil || len(attribute.Name) > limits.MaxAttributeBytes {
 				return ErrMalformed
 			}
-			if total > maximumDatasetBytes-len(attribute.Name) {
+			if total > limits.MaxDatasetBytes-len(attribute.Name) {
 				return ErrMalformed
 			}
 			total += len(attribute.Name)
 			for _, value := range attribute.ByteValues {
-				if value == nil || len(value) > maximumAttributeBytes || total > maximumDatasetBytes-len(value) {
+				if value == nil || len(value) > limits.MaxAttributeBytes || total > limits.MaxDatasetBytes-len(value) {
 					return ErrMalformed
 				}
 				total += len(value)
