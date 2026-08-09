@@ -59,6 +59,7 @@ type DKIM2Config struct {
 	LDAPSearchTimeLimitSeconds        int                  `mapstructure:"ldap_search_time_limit_seconds" yaml:"ldap_search_time_limit_seconds"`
 	LDAPOperationTimeoutSeconds       int                  `mapstructure:"ldap_operation_timeout_seconds" yaml:"ldap_operation_timeout_seconds"`
 	AuthorityPasswordMaxBytes         int                  `mapstructure:"authority_password_max_bytes" yaml:"authority_password_max_bytes"`
+	AuthorityPasswordPreserveNewline  bool                 `mapstructure:"authority_password_preserve_trailing_newline" yaml:"authority_password_preserve_trailing_newline"`
 	MaxClockSkewSeconds               int                  `mapstructure:"max_clock_skew_seconds" yaml:"max_clock_skew_seconds"`
 	RunTimeoutSeconds                 int                  `mapstructure:"run_timeout_seconds" yaml:"run_timeout_seconds"`
 	ProofPollIntervalSeconds          int                  `mapstructure:"proof_poll_interval_seconds" yaml:"proof_poll_interval_seconds"`

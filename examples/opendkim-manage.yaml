@@ -81,6 +81,7 @@ dkim2:
   ldap_search_time_limit_seconds: 30
   ldap_operation_timeout_seconds: 60
   authority_password_max_bytes: 16384
+  authority_password_preserve_trailing_newline: false
 
   # Required when rotation_enabled is true. Each role uses the common verified
   # LDAP transport below, but a distinct DN and owner-only password file.

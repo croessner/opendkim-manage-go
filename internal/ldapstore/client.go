@@ -239,7 +239,11 @@ func (c *Client) tlsServerName() string {
 
 func (c *Client) bind(conn *ldap.Conn) error {
 	if c.authority != nil {
-		password, err := readAuthorityPassword(c.authority.PasswordFile, c.cfg.DKIM2.AuthorityPasswordMaxBytes)
+		password, err := readAuthorityPassword(
+			c.authority.PasswordFile,
+			c.cfg.DKIM2.AuthorityPasswordMaxBytes,
+			c.cfg.DKIM2.AuthorityPasswordPreserveNewline,
+		)
 		if err != nil {
 			return err
 		}
@@ -273,7 +277,7 @@ func (c *Client) bind(conn *ldap.Conn) error {
 	return nil
 }
 
-func readAuthorityPassword(path string, maximumBytes int) ([]byte, error) {
+func readAuthorityPassword(path string, maximumBytes int, preserveTrailingNewline bool) ([]byte, error) {
 	parent, parentErr := os.Lstat(filepath.Dir(path))
 	info, err := os.Lstat(path)
 	if maximumBytes < 1 || parentErr != nil || !parent.IsDir() || parent.Mode().Perm()&0o077 != 0 ||
@@ -296,17 +300,29 @@ func readAuthorityPassword(path string, maximumBytes int) ([]byte, error) {
 		clear(password)
 		return nil, errors.New("LDAP authority password file is unavailable or unsafe")
 	}
-	if password[len(password)-1] == '\n' {
+	if !preserveTrailingNewline && password[len(password)-1] == '\n' {
 		password = password[:len(password)-1]
 		if len(password) > 0 && password[len(password)-1] == '\r' {
 			password = password[:len(password)-1]
 		}
 	}
-	if len(password) == 0 || bytesContainsControl(password) {
+	if len(password) == 0 || passwordContainsInvalidControl(password, preserveTrailingNewline) {
 		clear(password)
 		return nil, errors.New("LDAP authority password file is malformed")
 	}
 	return password, nil
+}
+
+// passwordContainsInvalidControl permits only one explicitly preserved final LF or CRLF.
+func passwordContainsInvalidControl(value []byte, preserveTrailingNewline bool) bool {
+	contentEnd := len(value)
+	if preserveTrailingNewline && contentEnd > 0 && value[contentEnd-1] == '\n' {
+		contentEnd--
+		if contentEnd > 0 && value[contentEnd-1] == '\r' {
+			contentEnd--
+		}
+	}
+	return bytesContainsControl(value[:contentEnd])
 }
 
 func ownedByEffectiveUser(info os.FileInfo) bool {
@@ -316,7 +332,7 @@ func ownedByEffectiveUser(info os.FileInfo) bool {
 
 func bytesContainsControl(value []byte) bool {
 	for _, character := range value {
-		if character == 0 || character == '\r' || character == '\n' {
+		if character < 0x20 || character == 0x7f {
 			return true
 		}
 	}

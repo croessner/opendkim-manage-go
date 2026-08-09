@@ -332,6 +332,7 @@ dkim2:
   ldap_search_time_limit_seconds: 12
   ldap_operation_timeout_seconds: 45
   authority_password_max_bytes: 8192
+  authority_password_preserve_trailing_newline: true
   max_clock_skew_seconds: 120
   run_timeout_seconds: 7200
   proof_poll_interval_seconds: 3
@@ -358,6 +359,7 @@ dkim2:
 		cfg.DKIM2.PublicationReadbackIntervalMillis != 40 ||
 		cfg.DKIM2.LDAPSearchTimeLimitSeconds != 12 ||
 		cfg.DKIM2.LDAPOperationTimeoutSeconds != 45 || cfg.DKIM2.AuthorityPasswordMaxBytes != 8192 ||
+		!cfg.DKIM2.AuthorityPasswordPreserveNewline ||
 		cfg.DKIM2.Retention.MaxGenerations != 24 || cfg.DKIM2.Retention.MinRollbackGenerations != 3 ||
 		cfg.DKIM2.Retention.MaxDeleteBatch != 16 ||
 		cfg.DKIM2.Retention.JournalFile != "/var/lib/opendkim-manage-go/custom-retention-plan.json" ||

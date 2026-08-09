@@ -81,6 +81,7 @@ dkim2:
   ldap_search_time_limit_seconds: 30
   ldap_operation_timeout_seconds: 60
   authority_password_max_bytes: 16384
+  authority_password_preserve_trailing_newline: false
   ldap_authorities:
     snapshot:
       bind_dn: "cn=dkim2-snapshot,o=company"
@@ -111,6 +112,11 @@ dns:
   primary_nameserver: "127.0.0.1:53"
   recursive_nameserver: "127.0.0.2:53"
 ```
+
+`authority_password_preserve_trailing_newline` is an explicit compatibility
+switch for pre-existing LDAP credentials whose final LF or CRLF is part of
+the password itself. It defaults to `false`; embedded control characters are
+always rejected and the password files remain owner-only regular files.
 
 All displayed values are centralized, documented defaults and every one is
 overrideable. Validation applies finite lower and upper bounds before use.
