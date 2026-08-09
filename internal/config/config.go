@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -36,20 +37,32 @@ type GlobalConfig struct {
 
 // DKIM2Config contains the closed policy inputs needed to construct a native DKIM2 dataset.
 type DKIM2Config struct {
-	TenantID                    string `mapstructure:"tenant_id" yaml:"tenant_id"`
-	ProfileUse                  string `mapstructure:"profile_use" yaml:"profile_use"`
-	Rollout                     string `mapstructure:"rollout" yaml:"rollout"`
-	Compatibility               string `mapstructure:"compatibility" yaml:"compatibility"`
-	FeedbackRouteID             string `mapstructure:"feedback_route_id" yaml:"feedback_route_id"`
-	RotationEnabled             bool   `mapstructure:"rotation_enabled" yaml:"rotation_enabled"`
-	RotateAfterDays             int    `mapstructure:"rotate_after_days" yaml:"rotate_after_days"`
-	HistoryLimit                int    `mapstructure:"history_limit" yaml:"history_limit"`
-	MaxClockSkewSeconds         int    `mapstructure:"max_clock_skew_seconds" yaml:"max_clock_skew_seconds"`
-	RunTimeoutSeconds           int    `mapstructure:"run_timeout_seconds" yaml:"run_timeout_seconds"`
-	ProofPollIntervalSeconds    int    `mapstructure:"proof_poll_interval_seconds" yaml:"proof_poll_interval_seconds"`
-	ProofMaxAttempts            int    `mapstructure:"proof_max_attempts" yaml:"proof_max_attempts"`
-	DNSQueryTimeoutSeconds      int    `mapstructure:"dns_query_timeout_seconds" yaml:"dns_query_timeout_seconds"`
-	RetirementMinOverlapSeconds int    `mapstructure:"retirement_min_overlap_seconds" yaml:"retirement_min_overlap_seconds"`
+	TenantID                    string              `mapstructure:"tenant_id" yaml:"tenant_id"`
+	ProfileUse                  string              `mapstructure:"profile_use" yaml:"profile_use"`
+	Rollout                     string              `mapstructure:"rollout" yaml:"rollout"`
+	Compatibility               string              `mapstructure:"compatibility" yaml:"compatibility"`
+	FeedbackRouteID             string              `mapstructure:"feedback_route_id" yaml:"feedback_route_id"`
+	RotationEnabled             bool                `mapstructure:"rotation_enabled" yaml:"rotation_enabled"`
+	RotateAfterDays             int                 `mapstructure:"rotate_after_days" yaml:"rotate_after_days"`
+	HistoryLimit                int                 `mapstructure:"history_limit" yaml:"history_limit"`
+	MaxClockSkewSeconds         int                 `mapstructure:"max_clock_skew_seconds" yaml:"max_clock_skew_seconds"`
+	RunTimeoutSeconds           int                 `mapstructure:"run_timeout_seconds" yaml:"run_timeout_seconds"`
+	ProofPollIntervalSeconds    int                 `mapstructure:"proof_poll_interval_seconds" yaml:"proof_poll_interval_seconds"`
+	ProofMaxAttempts            int                 `mapstructure:"proof_max_attempts" yaml:"proof_max_attempts"`
+	DNSQueryTimeoutSeconds      int                 `mapstructure:"dns_query_timeout_seconds" yaml:"dns_query_timeout_seconds"`
+	RetirementMinOverlapSeconds int                 `mapstructure:"retirement_min_overlap_seconds" yaml:"retirement_min_overlap_seconds"`
+	Campaign                    DKIM2CampaignConfig `mapstructure:"campaign" yaml:"campaign"`
+}
+
+// DKIM2CampaignConfig binds automatic rotation to the external v3 campaign owner.
+type DKIM2CampaignConfig struct {
+	Enabled           bool   `mapstructure:"enabled" yaml:"enabled"`
+	Executable        string `mapstructure:"executable" yaml:"executable"`
+	ConfigFile        string `mapstructure:"config_file" yaml:"config_file"`
+	JournalFile       string `mapstructure:"journal_file" yaml:"journal_file"`
+	CadenceFile       string `mapstructure:"cadence_file" yaml:"cadence_file"`
+	ArtifactDirectory string `mapstructure:"artifact_directory" yaml:"artifact_directory"`
+	MaxBatches        int    `mapstructure:"max_batches" yaml:"max_batches"`
 }
 
 type LDAPConfig struct {
@@ -119,6 +132,7 @@ func defaultConfig() Config {
 			RotateAfterDays: 365, HistoryLimit: 1024, MaxClockSkewSeconds: 300,
 			RunTimeoutSeconds: 900, ProofPollIntervalSeconds: 5, ProofMaxAttempts: 60,
 			DNSQueryTimeoutSeconds: 5, RetirementMinOverlapSeconds: 604800,
+			Campaign: DKIM2CampaignConfig{Executable: "/usr/local/bin/dkim2d", MaxBatches: 1024},
 		},
 		Scheme: types.DefaultScheme(),
 	}
@@ -358,7 +372,7 @@ func (c *Config) ValidateForMode(mode types.Mode) error {
 
 // configured reports whether any DKIM2-only field was supplied.
 func (c DKIM2Config) configured() bool {
-	return c.TenantID != "" || c.ProfileUse != "" || c.Rollout != "" || c.Compatibility != "" || c.FeedbackRouteID != ""
+	return c.TenantID != "" || c.ProfileUse != "" || c.Rollout != "" || c.Compatibility != "" || c.FeedbackRouteID != "" || c.Campaign.configured()
 }
 
 // validate enforces the complete closed DKIM2 policy contract.
@@ -404,6 +418,46 @@ func (c DKIM2Config) validate() error {
 	}
 	if c.RetirementMinOverlapSeconds < 3600 || c.RetirementMinOverlapSeconds > 31536000 {
 		return errors.New("dkim2.retirement_min_overlap_seconds must be between 3600 and 31536000")
+	}
+	if err := c.Campaign.validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c DKIM2CampaignConfig) configured() bool {
+	return c.Enabled || c.ConfigFile != "" || c.JournalFile != "" || c.CadenceFile != "" || c.ArtifactDirectory != ""
+}
+
+// validate rejects ambiguous or broad filesystem authority for global campaigns.
+func (c DKIM2CampaignConfig) validate() error {
+	if !c.configured() {
+		return nil
+	}
+	if !c.Enabled {
+		return errors.New("dkim2.campaign must be enabled when campaign fields are configured")
+	}
+	for name, value := range map[string]string{
+		"executable": c.Executable, "config_file": c.ConfigFile,
+		"journal_file": c.JournalFile, "cadence_file": c.CadenceFile, "artifact_directory": c.ArtifactDirectory,
+	} {
+		if value == "" || !filepath.IsAbs(value) || filepath.Clean(value) != value || value == string(filepath.Separator) {
+			return fmt.Errorf("dkim2.campaign.%s must be a canonical absolute path", name)
+		}
+	}
+	if filepath.Dir(c.JournalFile) != c.ArtifactDirectory || filepath.Base(c.JournalFile) == "." ||
+		c.JournalFile == c.ArtifactDirectory {
+		return errors.New("dkim2.campaign.journal_file must be a direct child of artifact_directory")
+	}
+	if filepath.Dir(c.CadenceFile) != c.ArtifactDirectory || c.CadenceFile == c.ArtifactDirectory {
+		return errors.New("dkim2.campaign.cadence_file must be a direct child of artifact_directory")
+	}
+	if c.Executable == c.ConfigFile || c.Executable == c.JournalFile || c.ConfigFile == c.JournalFile ||
+		c.CadenceFile == c.JournalFile || c.CadenceFile == c.ConfigFile || c.CadenceFile == c.Executable {
+		return errors.New("dkim2 campaign paths must be distinct")
+	}
+	if c.MaxBatches < 1 || c.MaxBatches > 1024 {
+		return errors.New("dkim2.campaign.max_batches must be between 1 and 1024")
 	}
 	return nil
 }

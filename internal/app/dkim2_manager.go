@@ -17,6 +17,7 @@ import (
 
 	"github.com/croessner/opendkim-manage-go/internal/cli"
 	"github.com/croessner/opendkim-manage-go/internal/config"
+	"github.com/croessner/opendkim-manage-go/internal/dkim2campaign"
 	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
 	"github.com/croessner/opendkim-manage-go/internal/dkim2store"
 	"github.com/croessner/opendkim-manage-go/internal/dnsupdate"
@@ -67,6 +68,11 @@ type dkim2RotationRetirer interface {
 	DeleteExact(context.Context, string, dnsupdate.ExpectedTXT) (dnsupdate.DeleteResult, error)
 }
 
+type dkim2CampaignController interface {
+	Run(context.Context, bool) (dkim2campaign.Outcome, error)
+	Close() error
+}
+
 // DKIM2Manager owns one invocation of the immutable native DKIM2 mode.
 type DKIM2Manager struct {
 	cfg                  *config.Config
@@ -85,6 +91,7 @@ type DKIM2Manager struct {
 	newRotationRetirer   func(*config.Config) (dkim2RotationRetirer, error)
 	now                  func() time.Time
 	newLifecycleContext  func(time.Duration) (context.Context, context.CancelFunc)
+	campaign             dkim2CampaignController
 }
 
 // NewDKIM2Manager constructs only the native DKIM2 repository and its optional DNS writer.
@@ -97,6 +104,27 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 	}
 	if err := cfg.ValidateForMode(types.ModeDKIM2); err != nil {
 		return nil, err
+	}
+	if opts.Auto {
+		runner, err := dkim2campaign.NewOSRunner(cfg.DKIM2.Campaign.Executable)
+		if err != nil {
+			return nil, errors.New("DKIM2 global campaign command is unavailable")
+		}
+		publisher, err := dnsupdate.NewRotationPublisher(cfg)
+		if err != nil {
+			return nil, errors.New("DKIM2 global campaign DNS publisher is unavailable")
+		}
+		campaign, err := dkim2campaign.New(cfg.DKIM2.Campaign, cfg.DKIM2.RotateAfterDays, runner, publisher)
+		if err != nil {
+			return nil, errors.New("DKIM2 global campaign configuration is unavailable")
+		}
+		return &DKIM2Manager{
+			cfg: cfg, opts: opts, campaign: campaign, random: rand.Reader, in: os.Stdin, out: os.Stdout,
+			now: func() time.Time { return time.Now().UTC() },
+			newLifecycleContext: func(timeout time.Duration) (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), timeout)
+			},
+		}, nil
 	}
 	ldapClient, err := ldapstore.NewClient(cfg)
 	if err != nil {
@@ -146,7 +174,15 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 
 // Close releases the selected LDAP transport without retaining protected material.
 func (m *DKIM2Manager) Close() error {
-	if m == nil || m.ldap == nil {
+	if m == nil {
+		return nil
+	}
+	if m.campaign != nil {
+		if err := m.campaign.Close(); err != nil {
+			return err
+		}
+	}
+	if m.ldap == nil {
 		return nil
 	}
 	return m.ldap.Close()
@@ -154,7 +190,7 @@ func (m *DKIM2Manager) Close() error {
 
 // Run rejects legacy lifecycle semantics before dispatching one native command.
 func (m *DKIM2Manager) Run() (*RunResult, error) {
-	if m == nil || m.opts == nil || m.repository == nil {
+	if m == nil || m.opts == nil || (m.repository == nil && (!m.opts.Auto || m.campaign == nil)) {
 		return nil, errors.New("DKIM2 manager is unavailable")
 	}
 	if err := m.validateCommand(); err != nil {
@@ -214,7 +250,23 @@ func (m *DKIM2Manager) Run() (*RunResult, error) {
 		case m.opts.Rotate:
 			return result, m.rotate(ctx, result)
 		case m.opts.Auto:
-			return result, m.autoRotate(ctx, result)
+			if m.campaign == nil {
+				return result, errors.New("DKIM2 automatic rotation requires the global campaign controller")
+			}
+			outcome, campaignErr := m.campaign.Run(ctx, m.opts.DryRun)
+			if campaignErr != nil {
+				return result, errors.New("DKIM2 global campaign did not complete safely")
+			}
+			switch outcome {
+			case dkim2campaign.OutcomeActivated:
+				return result, m.reportRotation(result, DKIM2OutcomeActivated)
+			case dkim2campaign.OutcomeDryRun:
+				return result, m.reportRotationDryRun(result, false)
+			case dkim2campaign.OutcomeIdle:
+				return result, m.reportRotation(result, DKIM2OutcomeIdle)
+			default:
+				return result, errors.New("DKIM2 global campaign returned an unknown outcome")
+			}
 		case m.opts.RetireGenerationSet:
 			return result, m.retire(ctx, result)
 		default:
@@ -281,8 +333,10 @@ func (m *DKIM2Manager) validateCommand() error {
 		}
 	}
 	if o.Auto {
-		if len(domains) != 0 || len(selectors) != 0 || !o.UpdateDNS || !m.cfg.DKIM2.RotationEnabled || o.KeyType != "" {
-			return errors.New("DKIM2 automatic rotation requires rotation_enabled and --update-dns without explicit scope")
+		campaignUnavailable := m.campaign != nil && !m.cfg.DKIM2.Campaign.Enabled
+		if len(domains) != 0 || len(selectors) != 0 || !o.UpdateDNS || !m.cfg.DKIM2.RotationEnabled ||
+			campaignUnavailable || o.KeyType != "" || o.ResumeGenerationSet || o.PrepareOnly {
+			return errors.New("DKIM2 automatic rotation requires the global campaign, rotation_enabled, and --update-dns without explicit scope")
 		}
 	}
 	if o.RetireGenerationSet {

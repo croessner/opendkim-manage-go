@@ -178,10 +178,14 @@ DKIM2 mode supports only these commands:
   `--prepare-only` stops after exact LDAP staging and readback, before TSIG or
   DNS access. `--resume-generation <G>` continues only the exact protected
   candidate already stored in LDAP and never generates replacement keys.
-- `--auto --update-dns` is available only when `dkim2.rotation_enabled: true`.
-  It resumes one pending candidate first or rotates at most one deterministically
-  selected due binding from an exact, complete historical-lineage clock. It
-  never retires DNS records or deletes LDAP history.
+- `--auto --update-dns` is available only when `dkim2.rotation_enabled: true`
+  and the protected `dkim2.campaign` block is complete. It never enters the
+  old one-binding v2 path. Instead it starts or resumes one external
+  `dkim2-datasource-v3` campaign, publishes every deterministic DNS batch, and
+  lets `dkim2d` move `current` once after complete proof. A protected cadence
+  document enforces `rotate_after_days`, so a daily timer cannot create a
+  generation on every invocation. It never retires DNS records or deletes
+  datasource history.
 - `--observe --domain ...` reports the bounded LDAP/DNS lifecycle phase for
   exactly one native binding without performing a write or opening TSIG
   material.
@@ -196,8 +200,14 @@ DKIM2 mode supports only these commands:
 
 `--delete`, `--force-delete`, `--age`, `--add-missing`, `--add-new`, and
 CNAME-oriented behavior remain unsupported in DKIM2 mode and fail before LDAP
-or DNS writes. Automatic DNS retirement, LDAP generation deletion, pointer
+or DNS writes. Automatic DNS retirement, datasource generation deletion, pointer
 rollback, and implicit rollback are deliberately unavailable.
+
+The runtime deployment for global automation must provide the configured
+`dkim2d` executable beside `opendkim-manage`. Its protected rotation
+configuration contains the five separate datasource authorities; the manager
+configuration contains the TSIG authority. Neither process receives the
+other's write credential.
 
 DKIM2 creation first publishes an inactive LDAP generation. An optional DNS
 update follows that successful publication. Activation always performs a new

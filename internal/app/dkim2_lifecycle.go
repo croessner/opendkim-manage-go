@@ -13,64 +13,6 @@ import (
 	"github.com/croessner/opendkim-manage-go/internal/dnsupdate"
 )
 
-// autoRotate resumes the one protected successor first, or rotates one deterministic due binding.
-func (m *DKIM2Manager) autoRotate(ctx context.Context, result *RunResult) error {
-	if m.rotationRepository == nil || result == nil {
-		return errors.New("DKIM2 automatic rotation repository is unavailable")
-	}
-	current, err := m.rotationRepository.LoadCurrent(ctx)
-	if err != nil || current == nil {
-		return errors.New("DKIM2 automatic rotation cannot load current state safely")
-	}
-	defer func() { _ = current.Close() }()
-	history, err := m.rotationRepository.LoadRetainedHistory(ctx, m.cfg.DKIM2.HistoryLimit)
-	if err != nil {
-		return fmt.Errorf("DKIM2 automatic rotation cannot validate retained history: %w", err)
-	}
-	if !history.Complete {
-		return errors.New("DKIM2 automatic rotation requires complete retained history")
-	}
-	pendingNumber, err := exactPendingSuccessor(history, current.Number())
-	if err != nil {
-		return errors.New("DKIM2 automatic rotation found ambiguous retained state")
-	}
-	if pendingNumber != 0 {
-		prepared, loadErr := m.rotationRepository.LoadPending(ctx, pendingNumber, m.cfg.DKIM2.HistoryLimit)
-		if loadErr != nil {
-			return errors.New("DKIM2 automatic rotation cannot resume the protected candidate")
-		}
-		binding, bindingErr := preparedRotationBinding(current, prepared, history)
-		if bindingErr != nil {
-			_ = prepared.Close()
-			return errors.New("DKIM2 automatic rotation candidate intent is ambiguous")
-		}
-		return m.continuePreparedRotation(ctx, result, prepared, binding, m.opts.DryRun, false)
-	}
-	lineage, err := history.LineageHistory()
-	if err != nil {
-		return errors.New("DKIM2 automatic rotation lineage is incomplete")
-	}
-	now, err := m.utcNow()
-	if err != nil {
-		return err
-	}
-	decision, err := dkim2model.SelectOneEligibleBinding(
-		now, current, lineage, m.cfg.DKIM2.RotateAfterDays, m.cfg.DKIM2.MaxClockSkewSeconds,
-	)
-	if err != nil {
-		return errors.New("DKIM2 automatic rotation eligibility is unknown")
-	}
-	if !decision.Due() {
-		return m.reportRotation(result, DKIM2OutcomeIdle)
-	}
-	binding := lifecycleBinding{tenant: decision.TenantID(), domain: decision.Domain(), use: decision.Use()}
-	prepared, err := m.prepareRotation(ctx, binding, result, current.Number())
-	if err != nil || m.opts.DryRun {
-		return err
-	}
-	return m.continuePreparedRotation(ctx, result, prepared, binding, false, false)
-}
-
 // observeLifecycle derives one bounded state from authoritative LDAP and DNS reads only.
 func (m *DKIM2Manager) observeLifecycle(ctx context.Context, result *RunResult) error {
 	if m.rotationRepository == nil || m.newPresenceObserver == nil || result == nil {

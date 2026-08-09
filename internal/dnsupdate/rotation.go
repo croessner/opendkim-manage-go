@@ -389,6 +389,9 @@ func validateExpectedTXT(expected ExpectedTXT) error {
 	return nil
 }
 
+// ValidateExpectedTXT validates one detached exact DNS publication expectation.
+func ValidateExpectedTXT(expected ExpectedTXT) error { return validateExpectedTXT(expected) }
+
 func validateZoneOwner(zone string, expected ExpectedTXT) error {
 	if err := validateExpectedTXT(expected); err != nil || !absoluteCanonicalName(zone) || !dns.IsSubDomain(zone, expected.Owner) {
 		return errors.New("invalid absolute DKIM2 DNS zone or owner")
@@ -450,7 +453,8 @@ func parseDKIMContent(content string) (dkim2model.Algorithm, []byte, error) {
 		}
 		values[pair[0]] = pair[1]
 	}
-	if len(values) != 4 || values["h"] != "sha256" || values["p"] == "" || (values["k"] != "rsa" && values["k"] != "ed25519") {
+	if (len(values) != 3 && len(values) != 4) || (values["h"] != "" && values["h"] != "sha256") ||
+		values["p"] == "" || (values["k"] != "rsa" && values["k"] != "ed25519") {
 		return "", nil, errors.New("invalid DKIM key record")
 	}
 	public, err := base64.StdEncoding.Strict().DecodeString(values["p"])

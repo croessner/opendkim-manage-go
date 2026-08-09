@@ -299,6 +299,80 @@ dkim2:
 	}
 }
 
+func TestLoadDKIM2GlobalCampaignConfiguration(t *testing.T) {
+	path := writeTemp(t, `
+global:
+  mode: dkim2
+ldap:
+  uri: "ldaps://ldap.example.org/ou=dkim,dc=example"
+dkim2:
+  tenant_id: tenant-example
+  profile_use: originator
+  rollout: enforce
+  compatibility: strict
+  rotation_enabled: true
+  campaign:
+    enabled: true
+    executable: /usr/local/bin/dkim2d
+    config_file: /run/dkim2/rotation.yaml
+    journal_file: /var/lib/opendkim-manage/dkim2/campaign.json
+    cadence_file: /var/lib/opendkim-manage/dkim2/cadence.json
+    artifact_directory: /var/lib/opendkim-manage/dkim2
+    max_batches: 1024
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load campaign config: %v", err)
+	}
+	if !cfg.DKIM2.Campaign.Enabled || cfg.DKIM2.Campaign.MaxBatches != 1024 ||
+		cfg.DKIM2.Campaign.JournalFile != "/var/lib/opendkim-manage/dkim2/campaign.json" {
+		t.Fatalf("unexpected campaign config: %#v", cfg.DKIM2.Campaign)
+	}
+}
+
+func TestValidateDKIM2GlobalCampaignRejectsUnsafePathsAndBounds(t *testing.T) {
+	valid := defaultConfig()
+	valid.Global.Mode = types.ModeDKIM2
+	valid.LDAP.URI = "ldaps://ldap.example.org/ou=dkim,dc=example"
+	valid.DKIM2.TenantID = "tenant-example"
+	valid.DKIM2.ProfileUse = "originator"
+	valid.DKIM2.Rollout = "enforce"
+	valid.DKIM2.Compatibility = "strict"
+	valid.DKIM2.RotationEnabled = true
+	valid.DKIM2.Campaign = DKIM2CampaignConfig{
+		Enabled: true, Executable: "/usr/local/bin/dkim2d", ConfigFile: "/run/dkim2/rotation.yaml",
+		JournalFile:       "/var/lib/opendkim-manage/dkim2/campaign.json",
+		CadenceFile:       "/var/lib/opendkim-manage/dkim2/cadence.json",
+		ArtifactDirectory: "/var/lib/opendkim-manage/dkim2", MaxBatches: 1024,
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid campaign config rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*DKIM2CampaignConfig)
+	}{
+		{name: "relative executable", mutate: func(c *DKIM2CampaignConfig) { c.Executable = "dkim2d" }},
+		{name: "relative config", mutate: func(c *DKIM2CampaignConfig) { c.ConfigFile = "rotation.yaml" }},
+		{name: "journal outside state", mutate: func(c *DKIM2CampaignConfig) { c.JournalFile = "/tmp/campaign.json" }},
+		{name: "journal is directory", mutate: func(c *DKIM2CampaignConfig) { c.JournalFile = c.ArtifactDirectory }},
+		{name: "cadence outside state", mutate: func(c *DKIM2CampaignConfig) { c.CadenceFile = "/tmp/cadence.json" }},
+		{name: "zero batches", mutate: func(c *DKIM2CampaignConfig) { c.MaxBatches = 0 }},
+		{name: "excess batches", mutate: func(c *DKIM2CampaignConfig) { c.MaxBatches = 1025 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			candidate.DKIM2 = valid.DKIM2
+			candidate.DKIM2.Campaign = valid.DKIM2.Campaign
+			test.mutate(&candidate.DKIM2.Campaign)
+			if err := candidate.Validate(); err == nil {
+				t.Fatal("expected campaign configuration rejection")
+			}
+		})
+	}
+}
+
 func TestValidateDKIM2RotationRangesAndDistinctProofEndpoints(t *testing.T) {
 	valid := defaultConfig()
 	valid.Global.Mode = types.ModeDKIM2

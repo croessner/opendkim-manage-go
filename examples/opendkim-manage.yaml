@@ -82,6 +82,18 @@ dkim2:
   # explicitly attested DNS retirement can become eligible.
   retirement_min_overlap_seconds: 604800
 
+  # Automatic mode exclusively drives one global dkim2-datasource-v3
+  # campaign. The sibling dkim2d command owns datasource credentials and
+  # writes; this process owns only scheduling and authenticated DNS updates.
+  campaign:
+    enabled: false
+    executable: "/usr/local/bin/dkim2d"
+    config_file: "/path/to/rotation.yaml"
+    journal_file: "/path/to/state/campaign.json"
+    cadence_file: "/path/to/state/cadence.json"
+    artifact_directory: "/path/to/state"
+    max_batches: 1024
+
 ldap:
   # LDAP URL format: ldap://host:port/base??scope?filter
   # In dkim2 mode, the URL base DN is the immutable dataset base. Install the
