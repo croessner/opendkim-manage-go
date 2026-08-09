@@ -1,4 +1,4 @@
-# Native DKIM2 Rotation And Global Campaign Automation
+# Native DKIM2 Rotation
 
 Status: source-code implementation contract. This document does not claim a
 deployment, runtime reload, queue drain, mail-flow verification, backup, or
@@ -6,21 +6,20 @@ external signature switchover.
 
 This specification extends only `mode: dkim2`. The OpenDKIM mode, its default
 selection, mutable selector lifecycle, and command semantics remain unchanged.
-The original native key-management commands remain compatible with
-`dkim2-datasource-v2`. Automatic rotation is a separate global campaign path
-for `dkim2-datasource-v3`. It consumes the versioned DKIM2 offline campaign
-command and report contract and never writes v3 LDAP or SQL records itself.
-`opendkim-manage-go` is the automation and DNS-publication owner; `dkim2d` is
-the sole datasource transaction, key-generation, and current-pointer owner.
+The native key model is compatible with `dkim2-datasource-v2`; the rotation
+contract is pinned to DKIM2 commit
+`75e2bb2ba6a71fc4f017201da021b5509acbfb4f`, including its empty-v2 layout,
+native LDAP key custody, immutable generation trees, exact readback, and
+critical publication fences. The obsolete v1 pre-created-current layout is not
+accepted.
 
 ## Security Invariants
 
 - The current committed generation remains active until every new DNS record
   passes fresh authoritative and recursive proof.
-- A normal automatic candidate is one complete frozen all-binding snapshot.
-  Every due active binding is rotated in that single candidate. Bindings which
-  are not due remain logically equal. The campaign creates at most one
-  generation and moves `current` at most once.
+- A candidate is a complete all-domain snapshot. Rotation replaces every
+  credential, handle, and key-material record in exactly one active binding;
+  unrelated records and all profile and policy facts remain logically equal.
 - Selectors and handles are allocated with bounded cryptographic randomness
   and may not collide with any retained generation.
 - Private PKCS#8 material is stored only in an unreachable LDAP candidate. It
@@ -39,37 +38,8 @@ the sole datasource transaction, key-generation, and current-pointer owner.
 - `cn=current` moves only forward under a critical exact-current assertion.
   A staging root becomes committed only under a critical exact-staging
   assertion. Committed generation contents are never edited.
-- Automatic rotation never uses the legacy one-binding rotation path. It never
-  retires DNS or deletes datasource history. Retirement and purge remain
-  separate explicit operations.
-
-## Owner Boundary
-
-One scheduled `opendkim-manage-go --mode dkim2 --auto` invocation serially:
-
-1. starts or resumes one `dkim2d datasource rotation run --automatic`
-   campaign using a protected journal;
-2. obtains every bounded deterministic DNS batch from `dkim2d`;
-3. parses the closed DNS export grammar and publishes each exact absent TXT
-   RRset through the configured authenticated DNS update authority;
-4. resumes the same campaign so `dkim2d` proves all records and performs one
-   exact-current activation; and
-5. removes only the completed campaign journal and its transient DNS exports
-   after an exact machine report proves `activated`.
-
-When `campaign.retention_enabled` is explicitly enabled, a successful campaign
-then invokes the separate `dkim2d datasource rotation purge plan` command,
-persists only its protected key-free artifact, and invokes exact `purge apply
---apply`. The manager has no purge or closer credential, does not infer
-eligibility, and treats pending, reconcile-required, malformed, or ambiguous
-reports as non-success. A present artifact is retried only by exact apply;
-legacy deletion remains disabled unless the datasource owner marks it eligible.
-
-The manager executable does not receive any snapshot, staging, activation,
-purge, or closer credential. The DKIM2 command receives no TSIG secret and has
-no DNS write transport. Command stderr, provider errors, private keys, DNS
-record contents, domains, and protected paths are never copied into manager
-reports or logs.
+- Automatic rotation handles at most one binding and never retires DNS or
+  deletes LDAP history. Retirement is a separate explicit operation.
 
 ## Configuration
 
@@ -86,16 +56,6 @@ dkim2:
   proof_max_attempts: 60
   dns_query_timeout_seconds: 5
   retirement_min_overlap_seconds: 604800
-  campaign:
-    enabled: false
-    executable: /usr/local/bin/dkim2d
-    config_file: /path/to/rotation.yaml
-    journal_file: /path/to/state/campaign.json
-    cadence_file: /path/to/state/cadence.json
-    artifact_directory: /path/to/state
-    max_batches: 1024
-    retention_enabled: false
-    retention_artifact: /path/to/state/retention-plan.json
 dns:
   primary_nameserver: "127.0.0.1:53"
   recursive_nameserver: "127.0.0.2:53"
@@ -139,25 +99,14 @@ Rotation, automatic rotation, retirement, and forward rollback are mutually
 exclusive. Every production mutation requires `--yes` or affirmative
 interaction before random-key generation, TSIG loading, or a write.
 
-`--auto --update-dns` additionally requires `rotation_enabled: true`, the
-complete `campaign` configuration, and no explicit domain, selector, key type,
-or lifecycle subcommand. It exclusively runs the global v3 campaign adapter;
-falling back to the old per-binding v2 implementation is forbidden. A dry run
-invokes the DKIM2 read-only global preview and performs no journal, key, DNS,
-datasource, or pointer write.
-
-The executable, configuration, journal, cadence, and artifact paths must be absolute
-and canonical. The journal must be a direct child of the artifact directory.
-The batch cap is finite (`1..1024`). Existing export files must be regular,
-owner-only files with exact deterministic content; conflicts, symbolic links,
-unknown report fields, noncanonical JSON, malformed zone records, partial
-publication, command ambiguity, and cleanup ambiguity fail closed.
-
-The owner-only cadence document is written atomically before an activated
-journal is removed. While no journal exists, a new campaign is started only
-after `rotate_after_days` has elapsed since that durable activation. A present
-journal is always resumed regardless of cadence. This makes a daily timer safe:
-restarts and repeated invocations cannot create one generation per timer run.
+`--auto --update-dns` additionally requires `rotation_enabled: true` and no
+explicit domain, selector, or lifecycle subcommand. It first resumes the one
+exact pending candidate if present. Resume, automatic selection, and
+observation carry the full tenant, domain, and profile-use identity; a domain
+alone is never a binding. Otherwise it chooses at most one due binding
+deterministically from trustworthy lineage evidence and runs the same
+prepare, publish, prove, commit, and pointer-switch path as manual rotation.
+It never retires DNS records and never deletes LDAP history.
 
 ## Prepare, Publish, Prove, And Activate
 

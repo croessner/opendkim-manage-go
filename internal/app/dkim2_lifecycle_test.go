@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -19,57 +18,6 @@ import (
 type fakeDualObserver struct {
 	observations []dnsupdate.PresenceObservation
 	calls        int
-}
-
-// runRemovedPerBindingAutoModel retains v2 candidate-validation coverage
-// without leaving a production automatic entry point.
-func runRemovedPerBindingAutoModel(ctx context.Context, manager *DKIM2Manager, result *RunResult) error {
-	current, err := manager.rotationRepository.LoadCurrent(ctx)
-	if err != nil || current == nil {
-		return errors.New("load current")
-	}
-	defer func() { _ = current.Close() }()
-	history, err := manager.rotationRepository.LoadRetainedHistory(ctx, manager.cfg.DKIM2.HistoryLimit)
-	if err != nil {
-		return fmt.Errorf("load history: %w", err)
-	}
-	if !history.Complete {
-		return errors.New("incomplete history")
-	}
-	pending, err := exactPendingSuccessor(history, current.Number())
-	if err != nil {
-		return err
-	}
-	if pending != 0 {
-		prepared, err := manager.rotationRepository.LoadPending(ctx, pending, manager.cfg.DKIM2.HistoryLimit)
-		if err != nil {
-			return err
-		}
-		binding, err := preparedRotationBinding(current, prepared, history)
-		if err != nil {
-			_ = prepared.Close()
-			return err
-		}
-		return manager.continuePreparedRotation(ctx, result, prepared, binding, manager.opts.DryRun, false)
-	}
-	lineage, err := history.LineageHistory()
-	if err != nil {
-		return err
-	}
-	now, err := manager.utcNow()
-	if err != nil {
-		return err
-	}
-	decision, err := dkim2model.SelectOneEligibleBinding(now, current, lineage, manager.cfg.DKIM2.RotateAfterDays, manager.cfg.DKIM2.MaxClockSkewSeconds)
-	if err != nil || !decision.Due() {
-		return err
-	}
-	binding := lifecycleBinding{tenant: decision.TenantID(), domain: decision.Domain(), use: decision.Use()}
-	prepared, err := manager.prepareRotation(ctx, binding, result, current.Number())
-	if err != nil || manager.opts.DryRun {
-		return err
-	}
-	return manager.continuePreparedRotation(ctx, result, prepared, binding, false, false)
 }
 
 type cancelYesReader struct{ cancel context.CancelFunc }
@@ -127,8 +75,7 @@ func TestDKIM2AutoResumesExactPendingCandidateBeforeEligibilityOrRandomness(t *t
 	manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) { return publisher, nil }
 	manager.newRotationProof = func(*config.Config) (dkim2RotationProof, error) { return proof, nil }
 
-	result := &RunResult{}
-	err := runRemovedPerBindingAutoModel(context.Background(), manager, result)
+	result, err := manager.Run()
 	if err != nil || result.DKIM2Outcome != DKIM2OutcomeActivated {
 		t.Fatalf("automatic resume result=%#v err=%v", result, err)
 	}
@@ -144,7 +91,7 @@ func TestDKIM2AutoPreservesRetainedHistoryFailureClass(t *testing.T) {
 	manager.cfg.DKIM2.RotationEnabled = true
 	repository.fail["load-history"] = dkim2store.ErrMalformed
 
-	err := runRemovedPerBindingAutoModel(context.Background(), manager, &RunResult{})
+	_, err := manager.Run()
 	if !errors.Is(err, dkim2store.ErrMalformed) {
 		t.Fatalf("automatic history error = %v", err)
 	}
@@ -170,8 +117,7 @@ func TestDKIM2AutoSelectsAtMostOneDueBindingDeterministicallyAndNeverRetires(t *
 	if !found {
 		t.Fatal("other binding fixture missing")
 	}
-	result := &RunResult{}
-	err := runRemovedPerBindingAutoModel(context.Background(), manager, result)
+	result, err := manager.Run()
 	if err != nil || result.DKIM2Outcome != DKIM2OutcomeActivated || publisher.calls != 1 {
 		t.Fatalf("result=%#v publications=%d err=%v", result, publisher.calls, err)
 	}
@@ -198,8 +144,7 @@ func TestDKIM2AutoRotatesTheDeterministicallySelectedFullBinding(t *testing.T) {
 		return &fakeRotationPublisher{events: events}, nil
 	}
 	manager.newRotationProof = func(*config.Config) (dkim2RotationProof, error) { return &fakeRotationProof{events: events}, nil }
-	result := &RunResult{}
-	err := runRemovedPerBindingAutoModel(context.Background(), manager, result)
+	result, err := manager.Run()
 	if err != nil || result.DKIM2Outcome != DKIM2OutcomeActivated {
 		t.Fatalf("auto result=%#v err=%v", result, err)
 	}
@@ -234,13 +179,7 @@ func TestDKIM2AutoFailsClosedOnDisabledOrIncompleteHistoryBeforeMutation(t *test
 			if test.future {
 				repository.lineageCreatedAt = manager.now().Add(time.Hour)
 			}
-			result := &RunResult{}
-			var err error
-			if !test.enabled {
-				err = manager.validateCommand()
-			} else {
-				err = runRemovedPerBindingAutoModel(context.Background(), manager, result)
-			}
+			result, err := manager.Run()
 			if err == nil || result != nil && result.DKIM2Outcome == DKIM2OutcomeActivated || repository.stageCalls != 0 {
 				t.Fatalf("result=%#v events=%v stage=%d err=%v", result, *events, repository.stageCalls, err)
 			}

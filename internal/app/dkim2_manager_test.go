@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
-	"io"
 	"strings"
 	"testing"
 	"time"
@@ -17,42 +16,10 @@ import (
 	"github.com/croessner/opendkim-manage-go/internal/cli"
 	"github.com/croessner/opendkim-manage-go/internal/config"
 	"github.com/croessner/opendkim-manage-go/internal/dkim"
-	"github.com/croessner/opendkim-manage-go/internal/dkim2campaign"
 	"github.com/croessner/opendkim-manage-go/internal/dkim2model"
 	"github.com/croessner/opendkim-manage-go/internal/dkim2store"
 	"github.com/croessner/opendkim-manage-go/internal/types"
 )
-
-type campaignControllerFake struct {
-	outcome dkim2campaign.Outcome
-	err     error
-	calls   int
-}
-
-func (f *campaignControllerFake) Run(context.Context, bool) (dkim2campaign.Outcome, error) {
-	f.calls++
-	return f.outcome, f.err
-}
-
-func (f *campaignControllerFake) Close() error { return nil }
-
-func TestDKIM2AutomaticRunUsesOnlyGlobalCampaignController(t *testing.T) {
-	controller := &campaignControllerFake{outcome: dkim2campaign.OutcomeActivated}
-	manager := &DKIM2Manager{
-		cfg: &config.Config{DKIM2: config.DKIM2Config{
-			RotationEnabled: true, RunTimeoutSeconds: 30, HistoryLimit: 2,
-			Campaign: config.DKIM2CampaignConfig{Enabled: true},
-		}},
-		opts: &cli.Options{Auto: true, UpdateDNS: true, Yes: true}, campaign: controller,
-		out: io.Discard, newLifecycleContext: func(timeout time.Duration) (context.Context, context.CancelFunc) {
-			return context.WithTimeout(context.Background(), timeout)
-		},
-	}
-	result, err := manager.Run()
-	if err != nil || result.DKIM2Outcome != DKIM2OutcomeActivated || controller.calls != 1 {
-		t.Fatalf("result=%#v calls=%d err=%v", result, controller.calls, err)
-	}
-}
 
 type fakeGenerationRepository struct {
 	current           *dkim2model.Generation

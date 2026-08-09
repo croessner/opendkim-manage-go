@@ -425,16 +425,6 @@ func TestProofClientRejectsAuthoritativeRecursiveDisagreement(t *testing.T) {
 	}
 }
 
-func TestValidateExpectedTXTAcceptsCanonicalDKIM2ExportWithoutOptionalHashTag(t *testing.T) {
-	expected := ExpectedTXT{
-		Owner:   "selector._domainkey.example.test.",
-		Content: "v=DKIM1; k=ed25519; p=AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
-	}
-	if err := ValidateExpectedTXT(expected); err != nil {
-		t.Fatalf("canonical DKIM2 export rejected: %v", err)
-	}
-}
-
 func rotationDNSConfig() *config.Config {
 	return &config.Config{DNS: config.DNSConfig{PrimaryNameserver: "127.0.0.1:53", RecursiveNameserver: "127.0.0.2:53", TTL: 300}, DKIM2: config.DKIM2Config{DNSQueryTimeoutSeconds: 5, ProofPollIntervalSeconds: 1, ProofMaxAttempts: 2, RunTimeoutSeconds: 30}}
 }
