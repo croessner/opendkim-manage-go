@@ -319,12 +319,15 @@ dkim2:
     cadence_file: /var/lib/opendkim-manage/dkim2/cadence.json
     artifact_directory: /var/lib/opendkim-manage/dkim2
     max_batches: 1024
+    retention_enabled: true
+    retention_artifact: /var/lib/opendkim-manage/dkim2/retention.json
 `)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load campaign config: %v", err)
 	}
-	if !cfg.DKIM2.Campaign.Enabled || cfg.DKIM2.Campaign.MaxBatches != 1024 ||
+	if !cfg.DKIM2.Campaign.Enabled || cfg.DKIM2.Campaign.MaxBatches != 1024 || !cfg.DKIM2.Campaign.RetentionEnabled ||
+		cfg.DKIM2.Campaign.RetentionArtifact != "/var/lib/opendkim-manage/dkim2/retention.json" ||
 		cfg.DKIM2.Campaign.JournalFile != "/var/lib/opendkim-manage/dkim2/campaign.json" {
 		t.Fatalf("unexpected campaign config: %#v", cfg.DKIM2.Campaign)
 	}
@@ -344,6 +347,7 @@ func TestValidateDKIM2GlobalCampaignRejectsUnsafePathsAndBounds(t *testing.T) {
 		JournalFile:       "/var/lib/opendkim-manage/dkim2/campaign.json",
 		CadenceFile:       "/var/lib/opendkim-manage/dkim2/cadence.json",
 		ArtifactDirectory: "/var/lib/opendkim-manage/dkim2", MaxBatches: 1024,
+		RetentionEnabled: true, RetentionArtifact: "/var/lib/opendkim-manage/dkim2/retention.json",
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid campaign config rejected: %v", err)
@@ -359,6 +363,12 @@ func TestValidateDKIM2GlobalCampaignRejectsUnsafePathsAndBounds(t *testing.T) {
 		{name: "cadence outside state", mutate: func(c *DKIM2CampaignConfig) { c.CadenceFile = "/tmp/cadence.json" }},
 		{name: "zero batches", mutate: func(c *DKIM2CampaignConfig) { c.MaxBatches = 0 }},
 		{name: "excess batches", mutate: func(c *DKIM2CampaignConfig) { c.MaxBatches = 1025 }},
+		{name: "missing retention artifact", mutate: func(c *DKIM2CampaignConfig) { c.RetentionArtifact = "" }},
+		{name: "retention outside state", mutate: func(c *DKIM2CampaignConfig) { c.RetentionArtifact = "/tmp/retention.json" }},
+		{name: "retention equals journal", mutate: func(c *DKIM2CampaignConfig) { c.RetentionArtifact = c.JournalFile }},
+		{name: "retention equals config", mutate: func(c *DKIM2CampaignConfig) { c.RetentionArtifact = c.ConfigFile }},
+		{name: "retention equals executable", mutate: func(c *DKIM2CampaignConfig) { c.RetentionArtifact = c.Executable }},
+		{name: "disabled retention with artifact", mutate: func(c *DKIM2CampaignConfig) { c.RetentionEnabled = false }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

@@ -126,6 +126,138 @@ func TestControllerDryRunHasNoDNSOrStateWrites(t *testing.T) {
 	}
 }
 
+// TestRetentionNoEligibleIsAnIdentityFreeNoOp proves the manager never applies
+// a plan unless dkim2d explicitly produced an exact eligible artifact.
+func TestRetentionNoEligibleIsAnIdentityFreeNoOp(t *testing.T) {
+	directory := protectedTempDir(t)
+	configuration := testCampaignConfig(directory)
+	configuration.RetentionEnabled = true
+	configuration.RetentionArtifact = filepath.Join(directory, "retention.json")
+	calls := 0
+	runner := RunnerFunc(func(_ context.Context, arguments []string) ([]byte, error) {
+		calls++
+		if strings.Join(arguments[:4], " ") != "datasource rotation purge plan" {
+			t.Fatalf("unexpected %v", arguments)
+		}
+		return []byte(`{"schema":"dkim2-rotation-report-v1","command":"purge-plan","backend":"ldap","work_count":0,"record_count":0,"batch_count":0,"retained_count":1,"unresolved_count":0,"result":"no_eligible"}` + "\n"), errors.New("no eligible generations")
+	})
+	controller, err := New(configuration, 365, runner, &fakePublisher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close() //nolint:errcheck
+	if err := controller.retain(t.Context()); err != nil || calls != 1 {
+		t.Fatalf("err=%v calls=%d", err, calls)
+	}
+}
+
+// TestRetentionNoEligibleRejectsUnresolvedOrArtifactState proves an apparent
+// no-op cannot hide ambiguous inventory or a durable destructive plan.
+func TestRetentionNoEligibleRejectsUnresolvedOrArtifactState(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		unresolved uint32
+		artifact   bool
+	}{
+		{name: "unresolved inventory", unresolved: 1},
+		{name: "unexpected artifact", artifact: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := protectedTempDir(t)
+			configuration := testCampaignConfig(directory)
+			configuration.RetentionEnabled, configuration.RetentionArtifact = true, filepath.Join(directory, "retention.json")
+			runner := RunnerFunc(func(_ context.Context, _ []string) ([]byte, error) {
+				if test.artifact {
+					if err := os.WriteFile(configuration.RetentionArtifact, []byte("artifact"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				report := fmt.Sprintf(`{"schema":"dkim2-rotation-report-v1","command":"purge-plan","backend":"ldap","work_count":0,"record_count":0,"batch_count":0,"retained_count":1,"unresolved_count":%d,"result":"no_eligible"}`+"\n", test.unresolved)
+				return []byte(report), errors.New("no eligible generations")
+			})
+			controller, err := New(configuration, 365, runner, &fakePublisher{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer controller.Close() //nolint:errcheck
+			if err := controller.retain(t.Context()); err == nil {
+				t.Fatal("ambiguous no-eligible report accepted")
+			}
+		})
+	}
+}
+
+// TestRetentionPlanApplyAndRetryFreezeArtifactLifecycle behavior.
+func TestRetentionPlanApplyAndRetryFreezeArtifactLifecycle(t *testing.T) {
+	directory := protectedTempDir(t)
+	configuration := testCampaignConfig(directory)
+	configuration.RetentionEnabled, configuration.RetentionArtifact = true, filepath.Join(directory, "retention.json")
+	for _, existing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existing=%t", existing), func(t *testing.T) {
+			if existing {
+				if err := os.WriteFile(configuration.RetentionArtifact, []byte("artifact"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var commands []string
+			runner := RunnerFunc(func(_ context.Context, args []string) ([]byte, error) {
+				commands = append(commands, strings.Join(args[:4], " "))
+				if args[3] == "plan" {
+					if err := os.WriteFile(configuration.RetentionArtifact, []byte("artifact"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					return purgeReport("purge-plan", "planned"), nil
+				}
+				return purgeReport("purge-apply", "purged"), nil
+			})
+			controller, err := New(configuration, 365, runner, &fakePublisher{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer controller.Close() //nolint:errcheck
+			if err := controller.retain(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if len(commands) != map[bool]int{false: 2, true: 1}[existing] {
+				t.Fatalf("commands=%v", commands)
+			}
+			if _, err := os.Stat(configuration.RetentionArtifact); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("successful apply retained artifact")
+			}
+		})
+	}
+}
+
+// TestRetentionApplyFailurePreservesArtifact proves unknown destruction is retried only by exact apply.
+func TestRetentionApplyFailurePreservesArtifact(t *testing.T) {
+	directory := protectedTempDir(t)
+	configuration := testCampaignConfig(directory)
+	configuration.RetentionEnabled, configuration.RetentionArtifact = true, filepath.Join(directory, "retention.json")
+	if err := os.WriteFile(configuration.RetentionArtifact, []byte("artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := New(configuration, 365, RunnerFunc(func(_ context.Context, args []string) ([]byte, error) {
+		if args[3] != "apply" {
+			t.Fatal("replanned uncertain artifact")
+		}
+		return purgeReport("purge-apply", "reconcile_required"), errors.New("unknown")
+	}), &fakePublisher{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close() //nolint:errcheck
+	if err := controller.retain(t.Context()); err == nil {
+		t.Fatal("unknown apply accepted")
+	}
+	if _, err := os.Stat(configuration.RetentionArtifact); err != nil {
+		t.Fatal("unknown apply removed artifact")
+	}
+}
+
+func purgeReport(command, result string) []byte {
+	return []byte(fmt.Sprintf(`{"schema":"dkim2-rotation-report-v1","command":%q,"backend":"ldap","work_count":0,"record_count":0,"batch_count":0,"retained_count":0,"unresolved_count":0,"result":%q}`+"\n", command, result))
+}
+
 func TestControllerRejectsWritableCampaignDirectory(t *testing.T) {
 	directory := protectedTempDir(t)
 	if err := os.Chmod(directory, 0o770); err != nil {

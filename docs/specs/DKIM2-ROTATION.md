@@ -57,6 +57,14 @@ One scheduled `opendkim-manage-go --mode dkim2 --auto` invocation serially:
 5. removes only the completed campaign journal and its transient DNS exports
    after an exact machine report proves `activated`.
 
+When `campaign.retention_enabled` is explicitly enabled, a successful campaign
+then invokes the separate `dkim2d datasource rotation purge plan` command,
+persists only its protected key-free artifact, and invokes exact `purge apply
+--apply`. The manager has no purge or closer credential, does not infer
+eligibility, and treats pending, reconcile-required, malformed, or ambiguous
+reports as non-success. A present artifact is retried only by exact apply;
+legacy deletion remains disabled unless the datasource owner marks it eligible.
+
 The manager executable does not receive any snapshot, staging, activation,
 purge, or closer credential. The DKIM2 command receives no TSIG secret and has
 no DNS write transport. Command stderr, provider errors, private keys, DNS
@@ -86,6 +94,8 @@ dkim2:
     cadence_file: /path/to/state/cadence.json
     artifact_directory: /path/to/state
     max_batches: 1024
+    retention_enabled: false
+    retention_artifact: /path/to/state/retention-plan.json
 dns:
   primary_nameserver: "127.0.0.1:53"
   recursive_nameserver: "127.0.0.2:53"

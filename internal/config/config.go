@@ -63,6 +63,8 @@ type DKIM2CampaignConfig struct {
 	CadenceFile       string `mapstructure:"cadence_file" yaml:"cadence_file"`
 	ArtifactDirectory string `mapstructure:"artifact_directory" yaml:"artifact_directory"`
 	MaxBatches        int    `mapstructure:"max_batches" yaml:"max_batches"`
+	RetentionEnabled  bool   `mapstructure:"retention_enabled" yaml:"retention_enabled"`
+	RetentionArtifact string `mapstructure:"retention_artifact" yaml:"retention_artifact"`
 }
 
 type LDAPConfig struct {
@@ -426,7 +428,7 @@ func (c DKIM2Config) validate() error {
 }
 
 func (c DKIM2CampaignConfig) configured() bool {
-	return c.Enabled || c.ConfigFile != "" || c.JournalFile != "" || c.CadenceFile != "" || c.ArtifactDirectory != ""
+	return c.Enabled || c.ConfigFile != "" || c.JournalFile != "" || c.CadenceFile != "" || c.ArtifactDirectory != "" || c.RetentionEnabled || c.RetentionArtifact != ""
 }
 
 // validate rejects ambiguous or broad filesystem authority for global campaigns.
@@ -458,6 +460,13 @@ func (c DKIM2CampaignConfig) validate() error {
 	}
 	if c.MaxBatches < 1 || c.MaxBatches > 1024 {
 		return errors.New("dkim2.campaign.max_batches must be between 1 and 1024")
+	}
+	if c.RetentionEnabled {
+		if c.RetentionArtifact == "" || !filepath.IsAbs(c.RetentionArtifact) || filepath.Clean(c.RetentionArtifact) != c.RetentionArtifact || filepath.Dir(c.RetentionArtifact) != c.ArtifactDirectory || c.RetentionArtifact == c.JournalFile || c.RetentionArtifact == c.CadenceFile || c.RetentionArtifact == c.ConfigFile || c.RetentionArtifact == c.Executable {
+			return errors.New("dkim2.campaign.retention_artifact must be a distinct direct child of artifact_directory when retention is enabled")
+		}
+	} else if c.RetentionArtifact != "" {
+		return errors.New("dkim2.campaign.retention_artifact requires retention_enabled")
 	}
 	return nil
 }

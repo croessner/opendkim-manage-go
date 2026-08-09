@@ -72,8 +72,12 @@ type Controller struct {
 func New(configuration config.DKIM2CampaignConfig, rotateAfterDays int, runner Runner, publisher Publisher) (*Controller, error) {
 	if !configuration.Enabled || runner == nil || publisher == nil || configuration.MaxBatches < 1 || configuration.MaxBatches > 1024 ||
 		rotateAfterDays < 1 || rotateAfterDays > 36500 ||
-		!filepath.IsAbs(configuration.ConfigFile) || !filepath.IsAbs(configuration.JournalFile) || !filepath.IsAbs(configuration.ArtifactDirectory) ||
-		filepath.Dir(configuration.JournalFile) != configuration.ArtifactDirectory || filepath.Dir(configuration.CadenceFile) != configuration.ArtifactDirectory {
+		!filepath.IsAbs(configuration.ConfigFile) || !filepath.IsAbs(configuration.JournalFile) || !filepath.IsAbs(configuration.CadenceFile) || !filepath.IsAbs(configuration.ArtifactDirectory) ||
+		filepath.Dir(configuration.JournalFile) != configuration.ArtifactDirectory || filepath.Dir(configuration.CadenceFile) != configuration.ArtifactDirectory ||
+		configuration.RetentionEnabled && (!filepath.IsAbs(configuration.RetentionArtifact) || filepath.Dir(configuration.RetentionArtifact) != configuration.ArtifactDirectory ||
+			configuration.RetentionArtifact == configuration.JournalFile || configuration.RetentionArtifact == configuration.CadenceFile ||
+			configuration.RetentionArtifact == configuration.ConfigFile || configuration.RetentionArtifact == configuration.Executable) ||
+		!configuration.RetentionEnabled && configuration.RetentionArtifact != "" {
 		return nil, errCampaign
 	}
 	directory, err := openProtectedDirectory(configuration.ArtifactDirectory)
@@ -118,6 +122,9 @@ func (c *Controller) Run(ctx context.Context, dryRun bool) (Outcome, error) { //
 			return "", errCampaign
 		}
 		if !due {
+			if err := c.retain(ctx); err != nil {
+				return OutcomePending, errCampaign
+			}
 			return OutcomeIdle, nil
 		}
 	}
@@ -126,6 +133,9 @@ func (c *Controller) Run(ctx context.Context, dryRun bool) (Outcome, error) { //
 	if runErr == nil && report.activated() {
 		if err := c.complete(now); err != nil {
 			return "", errCampaign
+		}
+		if err := c.retain(ctx); err != nil {
+			return OutcomePending, errCampaign
 		}
 		return OutcomeActivated, nil
 	}
@@ -136,6 +146,9 @@ func (c *Controller) Run(ctx context.Context, dryRun bool) (Outcome, error) { //
 	if status.activated() {
 		if err := c.complete(now); err != nil {
 			return "", errCampaign
+		}
+		if err := c.retain(ctx); err != nil {
+			return OutcomePending, errCampaign
 		}
 		return OutcomeActivated, nil
 	}
@@ -175,7 +188,57 @@ func (c *Controller) Run(ctx context.Context, dryRun bool) (Outcome, error) { //
 	if err := c.complete(now); err != nil {
 		return "", errCampaign
 	}
+	if err := c.retain(ctx); err != nil {
+		return OutcomePending, errCampaign
+	}
 	return OutcomeActivated, nil
+}
+
+// retain invokes only dkim2d's separate protected plan/apply protocol. The
+// manager never reads provider credentials or treats an uncertain purge as success.
+func (c *Controller) retain(ctx context.Context) error {
+	if !c.configuration.RetentionEnabled {
+		return nil
+	}
+	name := filepath.Base(c.configuration.RetentionArtifact)
+	present, err := c.directory.regularPresent(name, maxArtifactBytes)
+	if err != nil {
+		return errCampaign
+	}
+	if !present {
+		report, planErr := c.invokePurgePlan(ctx)
+		if planErr != nil || report.Command != "purge-plan" {
+			return errCampaign
+		}
+		if report.Result == "no_eligible" {
+			artifactPresent, presenceErr := c.directory.regularPresent(name, maxArtifactBytes)
+			if presenceErr != nil || artifactPresent || report.WorkCount != 0 || report.UnresolvedCount != 0 {
+				return errCampaign
+			}
+			return nil
+		}
+		if report.Result != "planned" {
+			return errCampaign
+		}
+	}
+	report, applyErr := c.invoke(ctx, "purge", "apply", "--config", c.configuration.ConfigFile, "--journal", c.configuration.JournalFile, "--plan", c.configuration.RetentionArtifact, "--apply", "--machine")
+	if applyErr != nil || report.Command != "purge-apply" || report.Result != "purged" {
+		return errCampaign
+	}
+	return c.directory.removeRegularIfPresent(name, maxArtifactBytes)
+}
+
+// invokePurgePlan accepts dkim2d's canonical no-eligible report even though
+// that intentionally non-mutating outcome uses a nonzero process status.
+func (c *Controller) invokePurgePlan(ctx context.Context) (machineReport, error) {
+	full := []string{"datasource", "rotation", "purge", "plan", "--config", c.configuration.ConfigFile, "--journal", c.configuration.JournalFile, "--output", c.configuration.RetentionArtifact, "--machine"}
+	document, runErr := c.runner.Run(ctx, full)
+	report, parseErr := parseMachineReport(document)
+	clear(document)
+	if parseErr != nil || runErr != nil && (report.Command != "purge-plan" || report.Result != "no_eligible") {
+		return machineReport{}, errCampaign
+	}
+	return report, nil
 }
 
 func (c *Controller) due(now time.Time) (bool, error) {
@@ -290,12 +353,12 @@ func parseMachineReport(document []byte) (machineReport, error) {
 }
 
 func (r machineReport) valid() bool {
-	if r.Schema != reportSchema || r.Command == "" || r.Backend == "" || r.Result == "" || r.Mode != "normal" {
+	if r.Schema != reportSchema || r.Command == "" || r.Backend == "" || r.Result == "" || (oneOf(r.Command, "run", "status", "dns-export") && r.Mode != "normal") {
 		return false
 	}
-	if !oneOf(r.Command, "run", "status", "dns-export") || !oneOf(r.Backend, "ldap", "postgresql", "mysql", "mariadb") ||
-		!oneOf(r.State, "planned", "staged", "dns_in_progress", "dns_complete", "activating", "activated", "reconcile_required") ||
-		!oneOf(r.Result, "success", "dry_run", "in_progress", "reconcile_required") {
+	if !oneOf(r.Command, "run", "status", "dns-export", "purge-plan", "purge-apply") || !oneOf(r.Backend, "ldap", "postgresql", "mysql", "mariadb") ||
+		(!oneOf(r.Command, "purge-plan", "purge-apply") && !oneOf(r.State, "planned", "staged", "dns_in_progress", "dns_complete", "activating", "activated", "reconcile_required")) ||
+		!oneOf(r.Result, "success", "dry_run", "in_progress", "reconcile_required", "planned", "purged", "no_eligible") {
 		return false
 	}
 	return r.WorkCount <= 131072 && r.RecordCount <= 262144 && r.BatchCount <= 1024

@@ -93,6 +93,10 @@ dkim2:
     cadence_file: "/path/to/state/cadence.json"
     artifact_directory: "/path/to/state"
     max_batches: 1024
+    # The manager never receives a purge credential. This only enables the
+    # separate dkim2d plan/artifact/apply protocol after activation.
+    retention_enabled: false
+    retention_artifact: "/path/to/state/retention-plan.json"
 
 ldap:
   # LDAP URL format: ldap://host:port/base??scope?filter
