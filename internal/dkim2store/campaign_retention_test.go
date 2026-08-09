@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/go-ldap/ldap/v3"
@@ -114,6 +115,33 @@ func TestLDAPRepositoryRetentionInventoriesSuffixAndDeletesLeafFirst(t *testing.
 		t.Fatal("source-mismatched purge deleted LDAP entries")
 	}
 	setEntryAttribute(root, attributeSourceGeneration, []string{"1"})
+	var changedKey, originalDN string
+	for key, entry := range executor.entries {
+		if isAtOrBelow(entry.DN, repository.generationRoot(2)) && hasObjectClass(entry, classHandle) &&
+			entry.GetAttributeValue(attributeCN) == "record-1" {
+			changedKey, originalDN = key, entry.DN
+			entry.DN = strings.Replace(entry.DN, "cn=record-1,", "cn=1,", 1)
+			setEntryAttribute(entry, attributeCN, []string{"1"})
+			delete(executor.entries, key)
+			executor.entries[dnKey(entry.DN)] = entry
+			break
+		}
+	}
+	if changedKey == "" {
+		t.Fatal("missing v3 handle for mixed-format retention regression")
+	}
+	deletesBeforeMixedFormat := len(executor.deletes)
+	if err := repository.DeleteGeneration(context.Background(), plan); !errors.Is(err, ErrConflict) {
+		t.Fatalf("mixed-format purge error = %v, want conflict", err)
+	}
+	if len(executor.deletes) != deletesBeforeMixedFormat {
+		t.Fatal("mixed-format purge deleted LDAP entries")
+	}
+	changed := executor.entries[dnKey(strings.Replace(originalDN, "cn=record-1,", "cn=1,", 1))]
+	delete(executor.entries, dnKey(changed.DN))
+	changed.DN = originalDN
+	setEntryAttribute(changed, attributeCN, []string{"record-1"})
+	executor.entries[changedKey] = changed
 	beforeEntries := entriesBelow(executor.entries, repository.generationRoot(2))
 	executor.failDeleteAt = 2
 	executor.deleteError = errors.New("synthetic crash boundary")

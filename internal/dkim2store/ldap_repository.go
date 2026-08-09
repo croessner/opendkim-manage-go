@@ -299,7 +299,7 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 			return RetainedHistory{}, createdErr
 		}
 		history.Roots = append(history.Roots, GenerationRoot{Number: generation, State: state})
-		if err := r.loadHistoricalLineages(ctx, &history, generation, created, legacyBootstrap); err != nil {
+		if err := r.loadHistoricalLineages(ctx, &history, generation, created, schemaVersion, legacyBootstrap); err != nil {
 			if errors.Is(err, errHistoryIncomplete) {
 				return NewRetainedHistory(nil, false, nil, nil), nil
 			}
@@ -743,6 +743,7 @@ func (r *LDAPRepository) loadHistoricalLineages(
 	history *RetainedHistory,
 	generation uint64,
 	created time.Time,
+	schemaVersion string,
 	legacyBootstrap bool,
 ) (err error) {
 	stage := "structure"
@@ -777,7 +778,7 @@ func (r *LDAPRepository) loadHistoricalLineages(
 				return nil, ErrMalformed
 			}
 		}
-		if !canonicalHistoricalRecordSet(result.Entries, base) {
+		if !canonicalHistoricalRecordSet(result.Entries, base, schemaVersion) {
 			return nil, ErrMalformed
 		}
 		return result.Entries, nil
@@ -1047,15 +1048,15 @@ func directChildDN(child, parent string) bool {
 	return (&ldap.DN{RDNs: childDN.RDNs[1:]}).EqualFold(parentDN)
 }
 
-func canonicalHistoricalRecordSet(entries []*ldap.Entry, base string) bool {
+func canonicalHistoricalRecordSet(entries []*ldap.Entry, base, schemaVersion string) bool {
 	seen := make(map[uint64]struct{}, len(entries))
 	for _, entry := range entries {
 		values, found := rawAttribute(entry, attributeCN)
 		if !found || len(values) != 1 {
 			return false
 		}
-		number, err := strconv.ParseUint(string(values[0]), 10, 64)
-		if err != nil || number == 0 || strconv.FormatUint(number, 10) != string(values[0]) ||
+		number, err := parseStorageRecordCN(string(values[0]), schemaVersion)
+		if err != nil ||
 			!sameDN(entry.DN, attributeCN+"="+ldap.EscapeDN(string(values[0]))+","+base) {
 			return false
 		}

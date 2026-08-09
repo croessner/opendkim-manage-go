@@ -26,6 +26,7 @@ func (r *LDAPRepository) addCampaignCandidate(ctx context.Context, candidate *dk
 
 func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate *dkim2model.Generation, metadata *dkim2model.CandidateMetadata) error {
 	generation := strconv.FormatUint(candidate.Number(), 10)
+	v3 := metadata != nil
 	rootDN := r.generationRoot(candidate.Number())
 	rootAttributes := map[string][][]byte{
 		attributeObjectClass:   bytesValues(classTop, classDataset),
@@ -59,9 +60,9 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 		}
 	}
 	for index, handle := range candidate.Handles() {
-		if err := r.addEntry(ctx, r.recordDN(index, "handles", rootDN), map[string][][]byte{
+		if err := r.addEntry(ctx, r.recordDN(index, "handles", rootDN, v3), map[string][][]byte{
 			attributeObjectClass: bytesValues(classTop, classHandle),
-			attributeCN:          bytesValues(recordCN(index)),
+			attributeCN:          bytesValues(recordCNForSchema(index, v3)),
 			attributeGeneration:  bytesValues(generation),
 			attributeHandleID:    bytesValues(handle.ID()),
 		}); err != nil {
@@ -71,7 +72,7 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 	for index, profile := range candidate.Profiles() {
 		attributes := map[string][][]byte{
 			attributeObjectClass:   bytesValues(classTop, classProfile),
-			attributeCN:            bytesValues(recordCN(index)),
+			attributeCN:            bytesValues(recordCNForSchema(index, v3)),
 			attributeGeneration:    bytesValues(generation),
 			attributeProfileID:     bytesValues(profile.ID()),
 			attributeSigningDomain: bytesValues(profile.SigningDomain()),
@@ -81,7 +82,7 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 			attributes[attributeNotBefore] = bytesValues(notBefore.Format(time.RFC3339Nano))
 			attributes[attributeNotAfter] = bytesValues(notAfter.Format(time.RFC3339Nano))
 		}
-		if err := r.addEntry(ctx, r.recordDN(index, "profiles", rootDN), attributes); err != nil {
+		if err := r.addEntry(ctx, r.recordDN(index, "profiles", rootDN, v3), attributes); err != nil {
 			return err
 		}
 	}
@@ -89,7 +90,7 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 		publicSPKI := credential.PublicSPKIDER()
 		attributes := map[string][][]byte{
 			attributeObjectClass:   bytesValues(classTop, classCredential),
-			attributeCN:            bytesValues(recordCN(index)),
+			attributeCN:            bytesValues(recordCNForSchema(index, v3)),
 			attributeGeneration:    bytesValues(generation),
 			attributeProfileID:     bytesValues(credential.ProfileID()),
 			attributeAlgorithm:     bytesValues(string(credential.Algorithm())),
@@ -97,7 +98,7 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 			attributePublicKeySPKI: {publicSPKI},
 			attributeHandleID:      bytesValues(credential.HandleID()),
 		}
-		err := r.addEntry(ctx, r.recordDN(index, "credentials", rootDN), attributes)
+		err := r.addEntry(ctx, r.recordDN(index, "credentials", rootDN, v3), attributes)
 		clear(publicSPKI)
 		if err != nil {
 			return err
@@ -106,7 +107,7 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 	for index, policy := range candidate.Policies() {
 		attributes := map[string][][]byte{
 			attributeObjectClass:   bytesValues(classTop, classPolicy),
-			attributeCN:            bytesValues(recordCN(index)),
+			attributeCN:            bytesValues(recordCNForSchema(index, v3)),
 			attributeGeneration:    bytesValues(generation),
 			attributeTenantID:      bytesValues(policy.TenantID()),
 			attributeSigningDomain: bytesValues(policy.SigningDomain()),
@@ -119,7 +120,7 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 		if route := policy.FeedbackRouteID(); route != "" {
 			attributes[attributeFeedbackRouteID] = bytesValues(route)
 		}
-		if err := r.addEntry(ctx, r.recordDN(index, "policies", rootDN), attributes); err != nil {
+		if err := r.addEntry(ctx, r.recordDN(index, "policies", rootDN, v3), attributes); err != nil {
 			return err
 		}
 	}
@@ -134,7 +135,7 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 		privatePKCS8 := material.PrivatePKCS8DER()
 		attributes := map[string][][]byte{
 			attributeObjectClass:   bytesValues(classTop, classKeyMaterial),
-			attributeCN:            bytesValues(recordCN(index)),
+			attributeCN:            bytesValues(recordCNForSchema(index, v3)),
 			attributeGeneration:    bytesValues(generation),
 			attributeTenantID:      bytesValues(material.TenantID()),
 			attributeSigningDomain: bytesValues(material.SigningDomain()),
@@ -144,7 +145,7 @@ func (r *LDAPRepository) addCandidateWithMetadata(ctx context.Context, candidate
 			attributePublicKeySPKI: {publicSPKI},
 			attributePrivatePKCS8:  {privatePKCS8},
 		}
-		err := r.addEntry(ctx, r.recordDN(index, "key-material", rootDN), attributes)
+		err := r.addEntry(ctx, r.recordDN(index, "key-material", rootDN, v3), attributes)
 		clear(publicSPKI)
 		clear(privatePKCS8)
 		if err != nil {
@@ -427,9 +428,17 @@ func (r *LDAPRepository) addEntry(ctx context.Context, dn string, attributes map
 }
 
 // recordDN derives one storage-only sequence RDN beneath a fixed unit.
-func (r *LDAPRepository) recordDN(index int, unit, rootDN string) string {
-	return attributeCN + "=" + ldap.EscapeDN(recordCN(index)) + ",ou=" + ldap.EscapeDN(unit) + "," + rootDN
+func (r *LDAPRepository) recordDN(index int, unit, rootDN string, v3 bool) string {
+	return attributeCN + "=" + ldap.EscapeDN(recordCNForSchema(index, v3)) + ",ou=" + ldap.EscapeDN(unit) + "," + rootDN
 }
 
-// recordCN derives one canonical positive storage sequence.
-func recordCN(index int) string { return strconv.Itoa(index + 1) }
+// recordCN derives the canonical DKIM2 storage sequence used by every provider.
+func recordCN(index int) string { return "record-" + strconv.Itoa(index+1) }
+
+// recordCNForSchema preserves legacy v2 storage while producing canonical v3 records.
+func recordCNForSchema(index int, v3 bool) string {
+	if v3 {
+		return recordCN(index)
+	}
+	return strconv.Itoa(index + 1)
+}

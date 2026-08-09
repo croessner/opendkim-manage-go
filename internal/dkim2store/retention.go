@@ -143,7 +143,7 @@ func (r *LDAPRepository) deleteGenerationFromPlan(ctx context.Context, plan Gene
 		return err
 	}
 	defer clearSensitiveEntries(entries)
-	if !rootMatchesPurgePlan(entries, r.generationRoot(generation), plan, r.limits) {
+	if !purgeSnapshotMatchesPlan(entries, r.generationRoot(generation), plan, r.limits) {
 		return ErrConflict
 	}
 	sort.Slice(entries, func(i, j int) bool {
@@ -174,6 +174,55 @@ func (r *LDAPRepository) deleteGenerationFromPlan(ctx context.Context, plan Gene
 		return ErrConflict
 	}
 	return nil
+}
+
+// purgeSnapshotMatchesPlan validates every remaining v3 entry before a first or resumed delete.
+func purgeSnapshotMatchesPlan(entries []*ldap.Entry, rootDN string, plan GenerationPurgePlan, limits Limits) bool {
+	if !rootMatchesPurgePlan(entries, rootDN, plan, limits) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(entries))
+	rootCount := 0
+	for _, entry := range entries {
+		if entry == nil {
+			return false
+		}
+		parsed, err := ldap.ParseDN(entry.DN)
+		if err != nil {
+			return false
+		}
+		key := parsed.String()
+		if _, duplicate := seen[key]; duplicate {
+			return false
+		}
+		seen[key] = struct{}{}
+		class, err := structuralClass(entry)
+		if err != nil {
+			return false
+		}
+		switch class {
+		case classDataset:
+			if !sameDN(entry.DN, rootDN) {
+				return false
+			}
+			rootCount++
+		case classOrganizationalUnit:
+			if _, err := exactUnit(entry, rootDN, limits); err != nil {
+				return false
+			}
+		case classHandle, classProfile, classCredential, classPolicy, classKeyMaterial:
+			unit := map[string]string{classHandle: "handles", classProfile: "profiles", classCredential: "credentials",
+				classPolicy: "policies", classKeyMaterial: "key-material"}[class]
+			values, err := exactRecord(entry, rootDN, dkim2model.SchemaVersionV3, unit, class,
+				[]string{attributeGeneration}, nil, limits)
+			if err != nil || exactGeneration(values[attributeGeneration][0], plan.Generation()) != nil {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return rootCount == 1
 }
 
 func rootMatchesPurgePlan(entries []*ldap.Entry, rootDN string, plan GenerationPurgePlan, limits Limits) bool {

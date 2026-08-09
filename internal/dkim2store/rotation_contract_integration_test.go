@@ -84,6 +84,33 @@ func TestLDAPV2RepositoryContractHarness(t *testing.T) {
 	}
 }
 
+func TestLDAPRecordCNMatchesProviderWireContract(t *testing.T) {
+	for index, want := range []string{"record-1", "record-2", "record-3"} {
+		if got := recordCN(index); got != want {
+			t.Fatalf("recordCN(%d) = %q, want %q", index, got, want)
+		}
+	}
+	for _, test := range []struct {
+		name   string
+		value  string
+		schema string
+		valid  bool
+	}{
+		{name: "v2 canonical", value: "1", schema: dkim2model.SchemaVersion, valid: true},
+		{name: "v2 rejects v3", value: "record-1", schema: dkim2model.SchemaVersion},
+		{name: "v3 canonical", value: "record-1", schema: dkim2model.SchemaVersionV3, valid: true},
+		{name: "v3 rejects v2", value: "1", schema: dkim2model.SchemaVersionV3},
+		{name: "v3 rejects leading zero", value: "record-01", schema: dkim2model.SchemaVersionV3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseStorageRecordCN(test.value, test.schema)
+			if (err == nil) != test.valid {
+				t.Fatalf("parseStorageRecordCN(%q, %q) error = %v", test.value, test.schema, err)
+			}
+		})
+	}
+}
+
 func TestLDAPV2RepositoryContractRejectsPartialAndConcurrentPublication(t *testing.T) {
 	t.Run("partial staging", func(t *testing.T) {
 		executor, _, candidate := stagedSuccessor(t)

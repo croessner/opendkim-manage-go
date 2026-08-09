@@ -29,6 +29,10 @@ func mapGeneration(
 	if err != nil {
 		return nil, ErrMalformed
 	}
+	rootSchema, err := generationSchema(entries, rootDN)
+	if err != nil {
+		return nil, ErrMalformed
+	}
 
 	var handles []dkim2model.Handle
 	var profiles []dkim2model.Profile
@@ -42,7 +46,6 @@ func mapGeneration(
 	}()
 
 	rootSeen := false
-	rootSchema := ""
 	var rootMetadata dkim2model.CandidateMetadata
 	units := make(map[string]struct{}, len(generationUnits))
 	storageDNs := make(map[string]struct{}, len(entries))
@@ -73,7 +76,9 @@ func mapGeneration(
 			if !schemaFound || len(schemaValues) != 1 {
 				return nil, ErrMalformed
 			}
-			rootSchema = string(schemaValues[0])
+			if string(schemaValues[0]) != rootSchema {
+				return nil, ErrMalformed
+			}
 			required := []string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState}
 			optional := []string{attributeWasActive}
 			if rootSchema == dkim2model.SchemaVersionV3 {
@@ -109,7 +114,7 @@ func mapGeneration(
 			}
 			units[unit] = struct{}{}
 		case classHandle:
-			values, exactErr := exactRecord(entry, rootDN, "handles", classHandle, []string{
+			values, exactErr := exactRecord(entry, rootDN, rootSchema, "handles", classHandle, []string{
 				attributeGeneration, attributeHandleID,
 			}, nil, limits)
 			if exactErr != nil || exactGeneration(values[attributeGeneration][0], generation) != nil {
@@ -121,7 +126,7 @@ func mapGeneration(
 			}
 			handles = append(handles, handle)
 		case classProfile:
-			values, exactErr := exactRecord(entry, rootDN, "profiles", classProfile, []string{
+			values, exactErr := exactRecord(entry, rootDN, rootSchema, "profiles", classProfile, []string{
 				attributeGeneration, attributeProfileID, attributeSigningDomain, attributeRecordStatus,
 			}, []string{attributeNotBefore, attributeNotAfter}, limits)
 			if exactErr != nil || exactGeneration(values[attributeGeneration][0], generation) != nil {
@@ -144,7 +149,7 @@ func mapGeneration(
 			}
 			profiles = append(profiles, profile)
 		case classCredential:
-			values, exactErr := exactRecord(entry, rootDN, "credentials", classCredential, []string{
+			values, exactErr := exactRecord(entry, rootDN, rootSchema, "credentials", classCredential, []string{
 				attributeGeneration, attributeProfileID, attributeAlgorithm, attributeSelector,
 				attributePublicKeySPKI, attributeHandleID,
 			}, nil, limits)
@@ -164,7 +169,7 @@ func mapGeneration(
 			}
 			credentials = append(credentials, credential)
 		case classPolicy:
-			values, exactErr := exactRecord(entry, rootDN, "policies", classPolicy, []string{
+			values, exactErr := exactRecord(entry, rootDN, rootSchema, "policies", classPolicy, []string{
 				attributeGeneration, attributeTenantID, attributeSigningDomain,
 				attributeProfileUse, attributeProfileID, attributeRecordStatus,
 				attributeRollout, attributeCompatibility,
@@ -178,7 +183,7 @@ func mapGeneration(
 			}
 			policies = append(policies, policy)
 		case classKeyMaterial:
-			values, exactErr := exactRecord(entry, rootDN, "key-material", classKeyMaterial, []string{
+			values, exactErr := exactRecord(entry, rootDN, rootSchema, "key-material", classKeyMaterial, []string{
 				attributeGeneration, attributeTenantID, attributeSigningDomain, attributeProfileUse,
 				attributeHandleID, attributeAlgorithm, attributePublicKeySPKI, attributePrivatePKCS8,
 			}, nil, limits)
@@ -291,6 +296,7 @@ func exactUnit(entry *ldap.Entry, rootDN string, limits Limits) (string, error) 
 func exactRecord(
 	entry *ldap.Entry,
 	rootDN string,
+	schemaVersion string,
 	unit string,
 	class string,
 	required []string,
@@ -302,12 +308,55 @@ func exactRecord(
 		return nil, ErrMalformed
 	}
 	cn := string(cnValues[0])
-	parsed, err := strconv.ParseUint(cn, 10, 64)
-	if err != nil || parsed == 0 || strconv.FormatUint(parsed, 10) != cn {
+	if _, err := parseStorageRecordCN(cn, schemaVersion); err != nil {
 		return nil, ErrMalformed
 	}
 	dn := attributeCN + "=" + ldap.EscapeDN(cn) + ",ou=" + ldap.EscapeDN(unit) + "," + rootDN
 	return exactEntry(entry, dn, class, append([]string{attributeCN}, required...), optional, limits)
+}
+
+// generationSchema projects the sole schema discriminator before record parsing.
+func generationSchema(entries []*ldap.Entry, rootDN string) (string, error) {
+	for _, entry := range entries {
+		if entry == nil || !sameDN(entry.DN, rootDN) {
+			continue
+		}
+		values, found := rawAttribute(entry, attributeSchemaVersion)
+		if !found || len(values) != 1 {
+			return "", ErrMalformed
+		}
+		return string(values[0]), nil
+	}
+	return "", ErrMalformed
+}
+
+// parseRecordCN accepts one canonical DKIM2 provider record sequence.
+func parseRecordCN(value string) (uint64, error) {
+	const prefix = "record-"
+	if !strings.HasPrefix(value, prefix) {
+		return 0, ErrMalformed
+	}
+	sequence := strings.TrimPrefix(value, prefix)
+	number, err := strconv.ParseUint(sequence, 10, 64)
+	if err != nil || number == 0 || prefix+strconv.FormatUint(number, 10) != value {
+		return 0, ErrMalformed
+	}
+	return number, nil
+}
+
+// parseStorageRecordCN enforces the distinct canonical v2 and v3 RDN grammars.
+func parseStorageRecordCN(value, schemaVersion string) (uint64, error) {
+	if schemaVersion == dkim2model.SchemaVersionV3 {
+		return parseRecordCN(value)
+	}
+	if schemaVersion != dkim2model.SchemaVersion && schemaVersion != legacySchemaVersion {
+		return 0, ErrMalformed
+	}
+	number, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || number == 0 || strconv.FormatUint(number, 10) != value {
+		return 0, ErrMalformed
+	}
+	return number, nil
 }
 
 // rawAttribute returns one unique case-insensitive raw attribute projection.
