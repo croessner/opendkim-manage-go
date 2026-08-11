@@ -161,6 +161,8 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 			_ = manager.Close()
 			return nil, roleErr
 		}
+		manager.repository = campaignRepository
+		manager.rotationRepository = campaignRepository
 		manager.campaignRepository = campaignRepository
 	}
 	if opts.UpdateDNS {

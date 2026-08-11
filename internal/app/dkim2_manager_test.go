@@ -216,6 +216,46 @@ func TestNewDKIM2ManagerRevalidatesLDAPTransportBoundary(t *testing.T) {
 	}
 }
 
+func TestNewDKIM2ManagerUsesRoleRepositoryForNativeReads(t *testing.T) {
+	cfg := validFactoryConfig()
+	cfg.Global.Mode = types.ModeDKIM2
+	cfg.Global.ExpireAfter = 365
+	cfg.Global.KeyType = "ed25519"
+	cfg.Global.CNAMESelectorRSAPrefix = "rsa-"
+	cfg.Global.CNAMESelectorED25519Prefix = "ed-"
+	cfg.LDAP.URI = "ldaps://ldap.example.org/ou=dkim2,dc=example"
+	cfg.LDAP.DomainAttribute = "associatedDomain"
+	cfg.DKIM2.RotationEnabled = true
+	cfg.DKIM2.LDAPAuthorities = config.DKIM2LDAPAuthorities{
+		Snapshot: config.DKIM2LDAPAuthority{
+			BindDN: "cn=snapshot,dc=example", PasswordFile: "/run/secrets/snapshot",
+		},
+		Staging: config.DKIM2LDAPAuthority{
+			BindDN: "cn=staging,dc=example", PasswordFile: "/run/secrets/staging",
+		},
+		Activation: config.DKIM2LDAPAuthority{
+			BindDN: "cn=activation,dc=example", PasswordFile: "/run/secrets/activation",
+		},
+		Purge: config.DKIM2LDAPAuthority{
+			BindDN: "cn=purge,dc=example", PasswordFile: "/run/secrets/purge",
+		},
+	}
+
+	manager, err := NewDKIM2Manager(cfg, &cli.Options{List: true})
+	if err != nil {
+		t.Fatalf("NewDKIM2Manager() error = %v", err)
+	}
+	defer func() { _ = manager.Close() }()
+
+	roleRepository, ok := manager.repository.(*dkim2store.RoleRepository)
+	if !ok {
+		t.Fatalf("native read repository type = %T, want *dkim2store.RoleRepository", manager.repository)
+	}
+	if manager.rotationRepository != roleRepository || manager.campaignRepository != roleRepository {
+		t.Fatal("native read, rotation, and campaign paths do not share the role repository")
+	}
+}
+
 func TestDKIM2CreateDryRunBuildsCompleteCandidateWithoutWrite(t *testing.T) {
 	repository := &fakeGenerationRepository{}
 	opts := &cli.Options{
