@@ -183,11 +183,18 @@ DKIM2 mode supports only these commands:
 - `--auto --update-dns` is available only when `dkim2.rotation_enabled: true`.
   It resumes one pending candidate first or freezes every binding and rotates
   every due binding in one complete generation. The default age is 30 days.
-  After activation or an idle run it applies the configured bounded v3
-  retention policy; current, staging, malformed, legacy, and rollback-reserve
-  generations are never deleted. Automatic LDAP access uses distinct snapshot,
-  staging, activation, and purge identities. A canonical owner-only journal
-  resumes the exact purge plan after partial leaf-first deletion or restart.
+  When no binding is due, it also reconciles every bounded active current DNS
+  RRset from the immutable current LDAP generation. Exact records are read-only;
+  absent records are recreated under `NXRRSET`, while conflicts or uncertain
+  results fail closed before retention. Fresh authoritative and recursive proof
+  is required, no generation is created or activated, and the outcome is
+  `reconciled` only when this invocation created at least one RRset; otherwise it
+  remains `idle`. After activation or an idle/reconciled run it applies the
+  configured bounded v3 retention policy; current, staging, malformed, legacy,
+  and rollback-reserve generations are never deleted. Automatic LDAP access uses
+  distinct snapshot, staging, activation, and purge identities. A canonical
+  owner-only journal resumes the exact purge plan after partial leaf-first
+  deletion or restart.
 - `--observe --domain ...` reports the bounded LDAP/DNS lifecycle phase for
   exactly one native binding without performing a write or opening TSIG
   material.

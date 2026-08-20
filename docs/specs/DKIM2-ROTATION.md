@@ -167,8 +167,16 @@ exact pending candidate if present. Otherwise it freezes every active binding,
 selects all due bindings deterministically from trustworthy lineage evidence,
 and builds one successor. Publication and proof cover the union of every new
 record before the single commit-and-current operation. A timer invocation with
-no due binding creates no generation. With the default configuration, a
-binding becomes due after 30 days.
+no due binding creates no generation. Instead, it derives the bounded complete
+active RRset inventory from the immutable current generation, checks each exact
+record through the collision-safe publisher, recreates only authoritative
+absence under `NXRRSET`, and then requires fresh authoritative and recursive
+proof for every current record. Exact presence performs no DNS write or TSIG
+load. Conflict, ambiguity, cancellation, or uncertain publication/proof fails
+closed before retention and without any LDAP or generation mutation. A run
+that creates at least one missing RRset reports `reconciled`; an exact no-op
+reports `idle`. With the default configuration, a binding becomes due after 30
+days.
 
 When retention is enabled, automatic execution also inventories the complete
 bounded history and deletes at most `max_delete_batch` oldest eligible
@@ -181,6 +189,8 @@ v2-to-v3 campaign never adds v3 activation metadata to its immutable v2 source.
 Old legacy cleanup remains an explicit migration operation, not automatic
 retention. A retained legacy root does not block deletion of a separately
 eligible older v3 root; it remains counted toward `max_generations`.
+Current DNS reconciliation completes and proves all current records before an
+idle or reconciled run enters this retention phase.
 
 ## Prepare, Publish, Prove, And Activate
 

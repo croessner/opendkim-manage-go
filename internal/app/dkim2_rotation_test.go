@@ -334,6 +334,7 @@ type fakeRotationPublisher struct {
 	events  *[]string
 	results []dnsupdate.PublishResult
 	failAt  int
+	failErr error
 	calls   int
 }
 
@@ -341,6 +342,9 @@ func (f *fakeRotationPublisher) PublishIfAbsent(_ context.Context, _ string, _ d
 	f.calls++
 	*f.events = append(*f.events, fmt.Sprintf("publish-%d", f.calls))
 	if f.failAt == f.calls {
+		if f.failErr != nil {
+			return 0, f.failErr
+		}
 		return 0, errors.New("synthetic DNS publication failure")
 	}
 	if f.calls <= len(f.results) {

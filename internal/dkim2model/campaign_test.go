@@ -24,6 +24,19 @@ func TestChangedActiveBindingsAcceptsCompleteMultiBindingSuccessor(t *testing.T)
 	}
 }
 
+func TestActiveBindingsReturnsEveryBoundedCurrentBinding(t *testing.T) {
+	current := activeRotationGeneration(t)
+	defer func() { _ = current.Close() }()
+
+	bindings, err := ActiveBindings(current, 2)
+	if err != nil || len(bindings) != 2 || bindings[0].Domain() != "one.example" || bindings[1].Domain() != "two.example" {
+		t.Fatalf("bindings = %#v, %v", bindings, err)
+	}
+	if unbounded, boundedErr := ActiveBindings(current, 1); boundedErr == nil || unbounded != nil {
+		t.Fatal("active binding inventory exceeded its configured bound")
+	}
+}
+
 func TestChangedActiveBindingsRejectsUnrelatedMutation(t *testing.T) {
 	source := activeRotationGeneration(t)
 	defer func() { _ = source.Close() }()

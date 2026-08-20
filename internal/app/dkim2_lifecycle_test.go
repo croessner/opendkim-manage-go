@@ -117,6 +117,161 @@ func TestDKIM2AutomaticPendingDryRunPerformsNoDNSOrLDAPMutation(t *testing.T) {
 	}
 }
 
+func TestDKIM2AutoReconcilesAllCurrentDNSWithoutCreatingGeneration(t *testing.T) {
+	current := rotationGenerationBindings(t, []rotationBindingSpec{
+		{domain: "example.test", suffix: "dual", algorithms: []dkim2model.Algorithm{
+			dkim2model.AlgorithmRSASHA256, dkim2model.AlgorithmEd25519SHA256,
+		}},
+		{domain: "other.example", suffix: "ed", algorithms: []dkim2model.Algorithm{
+			dkim2model.AlgorithmEd25519SHA256,
+		}},
+	})
+	manager, repository, events := newRotationHarness(t, current,
+		&cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
+	defer repository.close()
+	manager.cfg.DKIM2.RotationEnabled = true
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	repository.lineageCreatedAt = now
+	publisher := &fakeRotationPublisher{events: events, results: []dnsupdate.PublishResult{
+		dnsupdate.PublishCreated, dnsupdate.PublishAlreadyPresent, dnsupdate.PublishAlreadyPresent,
+	}}
+	proof := &fakeRotationProof{events: events}
+	manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) { return publisher, nil }
+	manager.newRotationProof = func(*config.Config) (dkim2RotationProof, error) { return proof, nil }
+	var output bytes.Buffer
+	manager.out = &output
+
+	result, err := manager.Run()
+	if err != nil || result.DKIM2Outcome != DKIM2OutcomeReconciled || output.String() != "DKIM2 rotation outcome: reconciled\n" {
+		t.Fatalf("automatic reconciliation result=%#v err=%v", result, err)
+	}
+	if publisher.calls != 3 || proof.calls != 1 || repository.stageCalls != 0 || repository.commitCalls != 0 || len(repository.deleteCalls) != 0 {
+		t.Fatalf("publish=%d proof=%d stage=%d commit=%d delete=%v events=%v",
+			publisher.calls, proof.calls, repository.stageCalls, repository.commitCalls, repository.deleteCalls, *events)
+	}
+}
+
+func TestDKIM2AutoReportsIdleWhenEveryCurrentDNSRecordIsExact(t *testing.T) {
+	current := rotationGeneration(t, []dkim2model.Algorithm{
+		dkim2model.AlgorithmRSASHA256, dkim2model.AlgorithmEd25519SHA256,
+	})
+	manager, repository, events := newRotationHarness(t, current,
+		&cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
+	defer repository.close()
+	manager.cfg.DKIM2.RotationEnabled = true
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	repository.lineageCreatedAt = now
+	publisher := &fakeRotationPublisher{events: events, results: []dnsupdate.PublishResult{
+		dnsupdate.PublishAlreadyPresent, dnsupdate.PublishAlreadyPresent,
+	}}
+	proof := &fakeRotationProof{events: events}
+	manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) { return publisher, nil }
+	manager.newRotationProof = func(*config.Config) (dkim2RotationProof, error) { return proof, nil }
+	var output bytes.Buffer
+	manager.out = &output
+
+	result, err := manager.Run()
+	if err != nil || result.DKIM2Outcome != DKIM2OutcomeIdle || output.String() != "DKIM2 rotation outcome: idle\n" {
+		t.Fatalf("exact current DNS result=%#v output=%q err=%v", result, output.String(), err)
+	}
+	if publisher.calls != 2 || proof.calls != 1 || repository.stageCalls != 0 || repository.commitCalls != 0 || len(repository.deleteCalls) != 0 {
+		t.Fatalf("publish=%d proof=%d stage=%d commit=%d delete=%v events=%v",
+			publisher.calls, proof.calls, repository.stageCalls, repository.commitCalls, repository.deleteCalls, *events)
+	}
+}
+
+func TestDKIM2AutoReconciledReportingFailureDoesNotTriggerBlindRetry(t *testing.T) {
+	current := rotationGeneration(t, []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256})
+	manager, repository, events := newRotationHarness(t, current,
+		&cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
+	defer repository.close()
+	manager.cfg.DKIM2.RotationEnabled = true
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	repository.lineageCreatedAt = now
+	manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) {
+		return &fakeRotationPublisher{events: events, results: []dnsupdate.PublishResult{dnsupdate.PublishCreated}}, nil
+	}
+	manager.newRotationProof = func(*config.Config) (dkim2RotationProof, error) {
+		return &fakeRotationProof{events: events}, nil
+	}
+	manager.out = &failAfterMutationWriter{}
+
+	result, err := manager.Run()
+	if err != nil || result.DKIM2Outcome != DKIM2OutcomeReconciled || !result.ReportingFailed ||
+		repository.stageCalls != 0 || repository.commitCalls != 0 {
+		t.Fatalf("result=%#v stage=%d commit=%d err=%v", result, repository.stageCalls, repository.commitCalls, err)
+	}
+}
+
+func TestDKIM2AutoCurrentDNSFailureStopsBeforeLDAPMutation(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		publisherErr error
+		proofFailure bool
+	}{
+		{name: "publication conflict", publisherErr: dnsupdate.ErrPublishConflict},
+		{name: "proof failure", proofFailure: true},
+		{name: "cancelled publication", publisherErr: context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			current := rotationGeneration(t, []dkim2model.Algorithm{dkim2model.AlgorithmRSASHA256})
+			manager, repository, events := newRotationHarness(t, current,
+				&cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
+			defer repository.close()
+			manager.cfg.DKIM2.RotationEnabled = true
+			now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+			manager.now = func() time.Time { return now }
+			repository.lineageCreatedAt = now
+			publisher := &fakeRotationPublisher{events: events}
+			if test.publisherErr != nil {
+				publisher.failAt, publisher.failErr = 1, test.publisherErr
+			}
+			proof := &fakeRotationProof{events: events}
+			if test.proofFailure {
+				proof.failAt = 1
+			}
+			manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) { return publisher, nil }
+			manager.newRotationProof = func(*config.Config) (dkim2RotationProof, error) { return proof, nil }
+
+			result, err := manager.Run()
+			if err == nil || result != nil && result.DKIM2Outcome != "" || repository.stageCalls != 0 ||
+				repository.commitCalls != 0 || len(repository.deleteCalls) != 0 {
+				t.Fatalf("result=%#v stage=%d commit=%d delete=%v events=%v err=%v",
+					result, repository.stageCalls, repository.commitCalls, repository.deleteCalls, *events, err)
+			}
+		})
+	}
+}
+
+func TestDKIM2AutoCurrentDNSInventoryIsBoundedBeforePublication(t *testing.T) {
+	current := rotationGenerationBindings(t, []rotationBindingSpec{
+		{domain: "example.test", suffix: "one", algorithms: []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256}},
+		{domain: "other.example", suffix: "two", algorithms: []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256}},
+	})
+	manager, repository, events := newRotationHarness(t, current,
+		&cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
+	defer repository.close()
+	manager.cfg.DKIM2.RotationEnabled = true
+	manager.cfg.DKIM2.MaxCampaignBindings = 1
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	repository.lineageCreatedAt = now
+	manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) {
+		t.Fatal("bounded inventory opened the DNS publisher")
+		return nil, nil
+	}
+
+	result, err := manager.Run()
+	if err == nil || result != nil && result.DKIM2Outcome != "" || repository.stageCalls != 0 ||
+		repository.commitCalls != 0 || len(repository.deleteCalls) != 0 {
+		t.Fatalf("result=%#v stage=%d commit=%d delete=%v events=%v err=%v",
+			result, repository.stageCalls, repository.commitCalls, repository.deleteCalls, *events, err)
+	}
+}
+
 func TestDKIM2AutoPreservesRetainedHistoryFailureClass(t *testing.T) {
 	current := rotationGeneration(t, []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256})
 	manager, repository, _ := newRotationHarness(t, current, &cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})

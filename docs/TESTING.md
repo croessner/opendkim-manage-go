@@ -77,6 +77,10 @@ The DKIM2 test matrix must cover:
   canonical root `createTimestamp`, injected-clock age decisions, all-due
   bindings in exactly one v3 successor, non-due preservation, and
   pending-candidate-first behavior;
+- bounded idle reconciliation of every active current RRset, including exact
+  presence without a DNS write, absent-record publication, `idle` versus
+  `reconciled` outcome reporting, conflict/cancellation/proof failure before
+  retention, and proof that no LDAP generation is staged or activated;
 - bounded observation states for idle, staged, DNS pending/conflict,
   committed-unreachable, activated, observing, and retire-eligible results
   without protected values;

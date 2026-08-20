@@ -377,7 +377,7 @@ func (m *DKIM2Manager) reportRotation(result *RunResult, outcome DKIM2Outcome) e
 	if _, err := fmt.Fprint(m.out, message); err != nil {
 		result.ReportingFailed = true
 		if outcome == DKIM2OutcomeStaged || outcome == DKIM2OutcomeActivated || outcome == DKIM2OutcomeAlreadyActivated ||
-			outcome == DKIM2OutcomeRetired || outcome == DKIM2OutcomeAlreadyRetired {
+			outcome == DKIM2OutcomeReconciled || outcome == DKIM2OutcomeRetired || outcome == DKIM2OutcomeAlreadyRetired {
 			return nil
 		}
 		return errors.New("DKIM2 rotation outcome reporting failed")

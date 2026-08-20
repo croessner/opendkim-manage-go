@@ -48,6 +48,7 @@ const (
 	DKIM2OutcomeActivated         DKIM2Outcome = "activated"
 	DKIM2OutcomeAlreadyActivated  DKIM2Outcome = "already-activated"
 	DKIM2OutcomeIdle              DKIM2Outcome = "idle"
+	DKIM2OutcomeReconciled        DKIM2Outcome = "reconciled"
 	DKIM2OutcomeRetired           DKIM2Outcome = "retired"
 	DKIM2OutcomeAlreadyRetired    DKIM2Outcome = "already-retired"
 	DKIM2OutcomeRetirementPending DKIM2Outcome = "retirement-pending"

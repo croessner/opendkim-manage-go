@@ -28,6 +28,43 @@ func (BindingIdentity) Format(state fmt.State, _ rune) {
 }
 func (BindingIdentity) MarshalJSON() ([]byte, error) { return json.Marshal(struct{}{}) }
 
+// ActiveBindings returns the bounded exact administrative bindings of one committed generation.
+func ActiveBindings(generation *Generation, maximumBindings int) ([]BindingIdentity, error) {
+	if generation == nil || generation.State() != DatasetStateCommitted || maximumBindings <= 0 {
+		return nil, ErrInvalid
+	}
+	bindings := make([]BindingIdentity, 0, min(len(generation.policies), maximumBindings))
+	seen := make(map[string]struct{}, min(len(generation.policies), maximumBindings))
+	for _, policy := range generation.policies {
+		if policy.Status() != RecordStatusActive {
+			continue
+		}
+		profile, found := generation.ProfileByID(policy.ProfileID())
+		if !found || profile.Status() != RecordStatusActive || profile.SigningDomain() != policy.SigningDomain() ||
+			!policy.Use().SupportsNativeKeyCustody() {
+			return nil, ErrInvalid
+		}
+		identity := policy.TenantID() + "\x00" + policy.SigningDomain() + "\x00" + string(policy.Use())
+		if _, duplicate := seen[identity]; duplicate {
+			return nil, ErrInvalid
+		}
+		seen[identity] = struct{}{}
+		bindings = append(bindings, BindingIdentity{
+			tenant: policy.TenantID(), domain: policy.SigningDomain(), use: policy.Use(),
+		})
+		if len(bindings) > maximumBindings {
+			return nil, ErrInvalid
+		}
+	}
+	if len(bindings) == 0 {
+		return nil, ErrInvalid
+	}
+	slices.SortFunc(bindings, func(a, b BindingIdentity) int {
+		return strings.Compare(a.tenant+"\x00"+a.domain+"\x00"+string(a.use), b.tenant+"\x00"+b.domain+"\x00"+string(b.use))
+	})
+	return bindings, nil
+}
+
 // ChangedActiveBindings proves a complete source-plus-one successor and returns every exact changed binding.
 func ChangedActiveBindings(source, candidate *Generation, maximumBindings int) ([]BindingIdentity, error) {
 	if source == nil || candidate == nil || source.Number() == ^uint64(0) ||

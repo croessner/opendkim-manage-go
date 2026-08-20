@@ -67,8 +67,15 @@ func (m *DKIM2Manager) runAutomaticCampaign(ctx context.Context, result *RunResu
 			return errors.New("DKIM2 automatic campaign planner returned inconsistent state")
 		}
 		if !m.opts.DryRun {
+			reconciled, reconcileErr := m.reconcileCurrentDNS(ctx, current)
+			if reconcileErr != nil {
+				return reconcileErr
+			}
 			if err := m.applyAutomaticRetention(ctx); err != nil {
 				return err
+			}
+			if reconciled {
+				return m.reportRotation(result, DKIM2OutcomeReconciled)
 			}
 		}
 		return m.reportRotation(result, DKIM2OutcomeIdle)
@@ -96,6 +103,49 @@ func (m *DKIM2Manager) runAutomaticCampaign(ctx context.Context, result *RunResu
 		}
 	}
 	return m.continueAutomaticCampaign(ctx, result, current, prepared)
+}
+
+// reconcileCurrentDNS restores absent exact current-generation RRsets without changing LDAP state.
+func (m *DKIM2Manager) reconcileCurrentDNS(ctx context.Context, current *dkim2model.Generation) (bool, error) {
+	bindings, err := dkim2model.ActiveBindings(current, m.cfg.DKIM2.MaxCampaignBindings)
+	if err != nil {
+		return false, errors.New("DKIM2 current DNS reconciliation binding inventory is invalid")
+	}
+	records, err := campaignExpectedRecords(current, bindings)
+	if err != nil {
+		return false, errors.New("DKIM2 current DNS reconciliation expectations are invalid")
+	}
+	if m.newRotationPublisher == nil || m.newRotationProof == nil {
+		return false, errors.New("DKIM2 current DNS reconciliation dependencies are unavailable")
+	}
+	publisher, err := m.newRotationPublisher(m.cfg)
+	if err != nil || publisher == nil {
+		return false, errors.New("DKIM2 current DNS reconciliation publisher is unavailable")
+	}
+	proof, err := m.newRotationProof(m.cfg)
+	if err != nil || proof == nil {
+		return false, errors.New("DKIM2 current DNS reconciliation proof is unavailable")
+	}
+	expected := make([]dnsupdate.ExpectedTXT, len(records))
+	reconciled := false
+	for index, item := range records {
+		expected[index] = item.record
+		publication, publishErr := publisher.PublishIfAbsent(ctx, item.zone, item.record)
+		if publishErr != nil {
+			return false, errors.New("DKIM2 current DNS reconciliation is conflicting or uncertain")
+		}
+		switch publication {
+		case dnsupdate.PublishCreated:
+			reconciled = true
+		case dnsupdate.PublishAlreadyPresent:
+		default:
+			return false, errors.New("DKIM2 current DNS reconciliation outcome is invalid")
+		}
+	}
+	if err := proof.ProveAll(ctx, expected); err != nil {
+		return false, errors.New("DKIM2 current DNS reconciliation proof is pending, conflicting, or uncertain")
+	}
+	return reconciled, nil
 }
 
 func campaignPreparedMatches(prepared *dkim2store.PreparedGeneration, candidate *dkim2model.Generation, metadata dkim2model.CandidateMetadata) bool {
