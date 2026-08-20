@@ -83,6 +83,11 @@ The DKIM2 test matrix must cover:
   hash policy or any key mismatch, absent-record publication, `idle` versus
   `reconciled` outcome reporting, conflict/cancellation/proof failure before
   retention, and proof that no LDAP generation is staged or activated;
+- authoritative SOA update-zone preflight for exact zones and synthetic
+  delegated child domains, unique-domain caching, strict response validation,
+  bounded timeout/cancellation, and proof that any later domain failure causes
+  zero campaign publications while manual failure occurs before its first DNS
+  write;
 - bounded observation states for idle, staged, DNS pending/conflict,
   committed-unreachable, activated, observing, and retire-eligible results
   without protected values;

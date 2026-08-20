@@ -128,6 +128,9 @@ func (m *DKIM2Manager) reconcileCurrentDNS(ctx context.Context, current *dkim2mo
 	}
 	expected := make([]dnsupdate.ExpectedTXT, len(records))
 	reconciled := false
+	if err := resolveCampaignUpdateZones(ctx, publisher, records); err != nil {
+		return false, errors.New("DKIM2 current DNS reconciliation update zones are uncertain")
+	}
 	for index, item := range records {
 		expected[index] = item.record
 		publication, publishErr := publisher.PublishIfAbsent(ctx, item.zone, item.record)
@@ -214,6 +217,9 @@ func (m *DKIM2Manager) continueAutomaticCampaign(
 		return errors.New("DKIM2 automatic campaign DNS proof is unavailable")
 	}
 	public := make([]dnsupdate.ExpectedTXT, len(records))
+	if err := resolveCampaignUpdateZones(ctx, publisher, records); err != nil {
+		return errors.New("DKIM2 automatic campaign DNS update zones are uncertain")
+	}
 	for index, item := range records {
 		public[index] = item.record
 		if _, err := publisher.PublishIfAbsent(ctx, item.zone, item.record); err != nil {
@@ -248,6 +254,36 @@ func (m *DKIM2Manager) continueAutomaticCampaign(
 		return err
 	}
 	return m.reportRotation(result, DKIM2OutcomeActivated)
+}
+
+// resolveCampaignUpdateZones resolves every unique logical binding domain
+// before the first publication and replaces it only with proven SOA authority.
+func resolveCampaignUpdateZones(
+	ctx context.Context, publisher dkim2RotationPublisher, records []campaignDNSRecord,
+) error {
+	if ctx == nil || publisher == nil || len(records) == 0 {
+		return dkim2model.ErrInvalid
+	}
+	resolved := make(map[string]string, len(records))
+	for _, item := range records {
+		if _, found := resolved[item.zone]; found {
+			continue
+		}
+		authority, err := publisher.ResolveUpdateZone(ctx, item.zone)
+		if err != nil {
+			return err
+		}
+		resolved[item.zone] = authority
+	}
+	for index := range records {
+		logical := records[index].zone
+		authority := resolved[logical]
+		if err := dnsupdate.ValidateResolvedUpdateZone(logical, authority, records[index].record); err != nil {
+			return err
+		}
+		records[index].zone = authority
+	}
+	return nil
 }
 
 func campaignExpectedRecords(candidate *dkim2model.Generation, bindings []dkim2model.BindingIdentity) ([]campaignDNSRecord, error) {

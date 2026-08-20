@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -345,6 +346,209 @@ func TestRotationPublisherTreatsExactHashOmissionAsReadOnlyResume(t *testing.T) 
 				t.Fatalf("read-only resume: result=%v queries=%d err=%v", result, queries, err)
 			}
 		})
+	}
+}
+
+func TestRotationPublisherResolvesAuthoritativeUpdateZone(t *testing.T) {
+	tests := []struct {
+		name        string
+		logical     string
+		owner       string
+		authority   string
+		wantLookups []string
+	}{
+		{
+			name: "own zone", logical: "example.test.", owner: "selector._domainkey.example.test.",
+			authority: "example.test.", wantLookups: []string{"example.test"},
+		},
+		{
+			name: "parent zone", logical: "reports.sub.example.test.",
+			owner: "selector._domainkey.reports.sub.example.test.", authority: "example.test.",
+			wantLookups: []string{"reports.sub.example.test", "sub.example.test", "example.test"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := rotationDNSConfig()
+			cfg.DNS.TSIGKeyName, cfg.DNS.TSIGKeyFile = "synthetic-key", "/synthetic/key"
+			publisher, err := NewRotationPublisher(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reads := 0
+			publisher.lookup = func(context.Context, ExpectedTXT) (ProofState, error) {
+				reads++
+				if reads == 1 {
+					return ProofAbsent, nil
+				}
+				return ProofExact, nil
+			}
+			var lookups []string
+			publisher.soaLookup = func(_ context.Context, candidate string) (bool, error) {
+				lookups = append(lookups, candidate)
+				return dns.Fqdn(candidate) == tt.authority, nil
+			}
+			publisher.loadTSIG = func(string) ([]byte, error) { return []byte("c3ludGhldGlj"), nil }
+			updates := 0
+			publisher.exchange = func(_ context.Context, _ *dns.Client, msg *dns.Msg, _ string) (*dns.Msg, error) {
+				updates++
+				if msg.Opcode != dns.OpcodeUpdate || len(msg.Question) != 1 || msg.Question[0].Name != tt.authority {
+					t.Fatalf("update target = %#v", msg.Question)
+				}
+				return nil, errors.New("synthetic lost response")
+			}
+			resolved, err := publisher.ResolveUpdateZone(context.Background(), tt.logical)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := publisher.PublishIfAbsent(context.Background(), resolved, ExpectedTXT{Owner: tt.owner, Content: testDKIMRecord})
+			if err != nil || result != PublishAlreadyPresent || reads != 2 || updates != 1 || !slices.Equal(lookups, tt.wantLookups) {
+				t.Fatalf("result=%v reads=%d updates=%d lookups=%v err=%v", result, reads, updates, lookups, err)
+			}
+		})
+	}
+}
+
+func TestRotationPublisherFailsBeforeWriteWithoutResolvedZone(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "no soa"},
+		{name: "timeout", err: context.DeadlineExceeded},
+		{name: "canceled", err: context.Canceled},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := rotationDNSConfig()
+			cfg.DNS.TSIGKeyName, cfg.DNS.TSIGKeyFile = "synthetic-key", "/synthetic/key"
+			publisher, _ := NewRotationPublisher(cfg)
+			publisher.soaLookup = func(context.Context, string) (bool, error) { return false, tt.err }
+			publisher.loadTSIG = func(string) ([]byte, error) {
+				t.Fatal("TSIG opened before update-zone resolution")
+				return nil, nil
+			}
+			publisher.exchange = func(context.Context, *dns.Client, *dns.Msg, string) (*dns.Msg, error) {
+				t.Fatal("DNS UPDATE sent before update-zone resolution")
+				return nil, nil
+			}
+			_, err := publisher.ResolveUpdateZone(context.Background(), "reports.sub.example.test.")
+			if !errors.Is(err, ErrPublishUncertain) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestRotationPublisherUsesBoundedAuthoritativeSOAQuery(t *testing.T) {
+	cfg := rotationDNSConfig()
+	cfg.DNS.TSIGKeyName, cfg.DNS.TSIGKeyFile = "synthetic-key", "/synthetic/key"
+	publisher, err := NewRotationPublisher(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publisher.loadTSIG = func(string) ([]byte, error) {
+		t.Fatal("TSIG opened during SOA resolution")
+		return nil, nil
+	}
+	publisher.exchange = func(ctx context.Context, client *dns.Client, query *dns.Msg, endpoint string) (*dns.Msg, error) {
+		if client == nil || client.Net != "tcp" || client.Timeout != publisher.queryTimeout || endpoint != publisher.primary ||
+			query == nil || query.RecursionDesired || len(query.Question) != 1 || query.Question[0].Name != "example.test." ||
+			query.Question[0].Qtype != dns.TypeSOA || query.Question[0].Qclass != dns.ClassINET {
+			t.Fatalf("unsafe SOA exchange client=%#v endpoint=%q query=%#v", client, endpoint, query)
+		}
+		deadline, found := ctx.Deadline()
+		if !found || time.Until(deadline) <= 0 || time.Until(deadline) > publisher.queryTimeout {
+			t.Fatalf("SOA exchange deadline = %v, found=%t", deadline, found)
+		}
+		response := new(dns.Msg)
+		response.SetReply(query)
+		response.Authoritative = true
+		response.Answer = []dns.RR{&dns.SOA{Hdr: dns.RR_Header{
+			Name: "example.test.", Rrtype: dns.TypeSOA, Class: dns.ClassINET,
+		}}}
+		return response, nil
+	}
+	resolved, err := publisher.ResolveUpdateZone(context.Background(), "example.test.")
+	if err != nil || resolved != "example.test." {
+		t.Fatalf("resolved=%q err=%v", resolved, err)
+	}
+}
+
+func TestValidateResolvedUpdateZoneRejectsRootAndTLD(t *testing.T) {
+	expected := ExpectedTXT{Owner: "selector._domainkey.child.example.test.", Content: testDKIMRecord}
+	for _, zone := range []string{".", "test."} {
+		if err := ValidateResolvedUpdateZone("child.example.test.", zone, expected); err == nil {
+			t.Fatalf("unsafe update zone accepted: %q", zone)
+		}
+	}
+}
+
+func TestClassifyAuthoritativeSOAResponse(t *testing.T) {
+	query := new(dns.Msg)
+	query.SetQuestion("reports.sub.example.test.", dns.TypeSOA)
+	parentSOA := func() *dns.SOA {
+		return &dns.SOA{Hdr: dns.RR_Header{Name: "example.test.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}
+	}
+	exact := new(dns.Msg)
+	exact.SetReply(query)
+	exact.Authoritative = true
+	exact.Answer = []dns.RR{&dns.SOA{Hdr: dns.RR_Header{
+		Name: "reports.sub.example.test.", Rrtype: dns.TypeSOA, Class: dns.ClassINET,
+	}}}
+	if found, err := classifyAuthoritativeSOAResponse(exact, query); err != nil || !found {
+		t.Fatalf("exact SOA rejected: found=%t err=%v", found, err)
+	}
+	for _, rcode := range []int{dns.RcodeSuccess, dns.RcodeNameError} {
+		negative := new(dns.Msg)
+		negative.SetReply(query)
+		negative.Authoritative = true
+		negative.Rcode = rcode
+		negative.Ns = []dns.RR{parentSOA()}
+		if found, err := classifyAuthoritativeSOAResponse(negative, query); err != nil || found {
+			t.Fatalf("safe parent evidence rejected for rcode=%d: found=%t err=%v", rcode, found, err)
+		}
+	}
+
+	invalid := map[string]func(*dns.Msg){
+		"not response":      func(response *dns.Msg) { response.Response = false },
+		"wrong id":          func(response *dns.Msg) { response.Id++ },
+		"wrong opcode":      func(response *dns.Msg) { response.Opcode = dns.OpcodeStatus },
+		"not authoritative": func(response *dns.Msg) { response.Authoritative = false },
+		"truncated":         func(response *dns.Msg) { response.Truncated = true },
+		"wrong qtype": func(response *dns.Msg) {
+			response.Question[0].Qtype = dns.TypeTXT
+		},
+		"wrong qclass": func(response *dns.Msg) {
+			response.Question[0].Qclass = dns.ClassCHAOS
+		},
+		"wrong question": func(response *dns.Msg) {
+			response.Question[0].Name = "other.example.test."
+		},
+		"error rcode": func(response *dns.Msg) { response.Rcode = dns.RcodeServerFailure },
+		"cname answer": func(response *dns.Msg) {
+			response.Answer = []dns.RR{&dns.CNAME{Hdr: dns.RR_Header{Name: query.Question[0].Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET}, Target: "other.example."}}
+		},
+		"multiple answer": func(response *dns.Msg) {
+			response.Answer = append(response.Answer, response.Answer[0])
+		},
+		"no negative soa": func(response *dns.Msg) { response.Answer = nil },
+		"unrelated negative soa": func(response *dns.Msg) {
+			response.Answer = nil
+			response.Ns = []dns.RR{&dns.SOA{Hdr: dns.RR_Header{Name: "other.example.", Rrtype: dns.TypeSOA, Class: dns.ClassINET}}}
+		},
+	}
+	for name, mutate := range invalid {
+		t.Run(name, func(t *testing.T) {
+			response := exact.Copy()
+			mutate(response)
+			if _, err := classifyAuthoritativeSOAResponse(response, query); err == nil {
+				t.Fatal("unsafe SOA response accepted")
+			}
+		})
+	}
+	if _, err := classifyAuthoritativeSOAResponse(nil, query); err == nil {
+		t.Fatal("nil SOA response accepted")
 	}
 }
 

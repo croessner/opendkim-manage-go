@@ -331,15 +331,37 @@ func (f *fakeRotationRepository) close() {
 }
 
 type fakeRotationPublisher struct {
-	events  *[]string
-	results []dnsupdate.PublishResult
-	failAt  int
-	failErr error
-	calls   int
+	events          *[]string
+	results         []dnsupdate.PublishResult
+	failAt          int
+	failErr         error
+	calls           int
+	resolveCalls    int
+	resolveFailAt   int
+	resolveFailErr  error
+	resolvedZones   map[string]string
+	resolvedLogical []string
+	publishedZones  []string
 }
 
-func (f *fakeRotationPublisher) PublishIfAbsent(_ context.Context, _ string, _ dnsupdate.ExpectedTXT) (dnsupdate.PublishResult, error) {
+func (f *fakeRotationPublisher) ResolveUpdateZone(_ context.Context, zone string) (string, error) {
+	f.resolveCalls++
+	f.resolvedLogical = append(f.resolvedLogical, zone)
+	if f.resolveFailAt == f.resolveCalls {
+		if f.resolveFailErr != nil {
+			return "", f.resolveFailErr
+		}
+		return "", errors.New("synthetic update-zone resolution failure")
+	}
+	if resolved, ok := f.resolvedZones[zone]; ok {
+		return resolved, nil
+	}
+	return zone, nil
+}
+
+func (f *fakeRotationPublisher) PublishIfAbsent(_ context.Context, zone string, _ dnsupdate.ExpectedTXT) (dnsupdate.PublishResult, error) {
 	f.calls++
+	f.publishedZones = append(f.publishedZones, zone)
 	*f.events = append(*f.events, fmt.Sprintf("publish-%d", f.calls))
 	if f.failAt == f.calls {
 		if f.failErr != nil {
@@ -432,6 +454,24 @@ func TestDKIM2ManualRotationCompletesForEachExactAlgorithmSet(t *testing.T) {
 				t.Fatalf("result=%#v publications=%d err=%v", result, publisher.calls, err)
 			}
 		})
+	}
+}
+
+func TestDKIM2ManualRotationUpdateZoneFailureStopsBeforeDNSWrite(t *testing.T) {
+	manager, repository, events := newRotationHarness(t,
+		rotationGeneration(t, []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256}),
+		&cli.Options{Rotate: true, Domains: []string{"example.test"}, UpdateDNS: true, Yes: true, Size: 2048})
+	defer repository.close()
+	publisher := &fakeRotationPublisher{events: events, resolveFailAt: 1, resolveFailErr: dnsupdate.ErrPublishUncertain}
+	proof := &fakeRotationProof{events: events}
+	manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) { return publisher, nil }
+	manager.newRotationProof = func(*config.Config) (dkim2RotationProof, error) { return proof, nil }
+
+	result, err := manager.Run()
+	if err == nil || result == nil || publisher.resolveCalls != 1 || publisher.calls != 0 || proof.calls != 0 ||
+		repository.stageCalls != 1 || repository.commitCalls != 0 {
+		t.Fatalf("result=%#v resolve=%d publish=%d proof=%d stage=%d commit=%d err=%v",
+			result, publisher.resolveCalls, publisher.calls, proof.calls, repository.stageCalls, repository.commitCalls, err)
 	}
 }
 

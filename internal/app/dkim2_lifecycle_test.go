@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -122,7 +123,7 @@ func TestDKIM2AutoReconcilesAllCurrentDNSWithoutCreatingGeneration(t *testing.T)
 		{domain: "example.test", suffix: "dual", algorithms: []dkim2model.Algorithm{
 			dkim2model.AlgorithmRSASHA256, dkim2model.AlgorithmEd25519SHA256,
 		}},
-		{domain: "other.example", suffix: "ed", algorithms: []dkim2model.Algorithm{
+		{domain: "other.example.test", suffix: "ed", algorithms: []dkim2model.Algorithm{
 			dkim2model.AlgorithmEd25519SHA256,
 		}},
 	})
@@ -133,7 +134,9 @@ func TestDKIM2AutoReconcilesAllCurrentDNSWithoutCreatingGeneration(t *testing.T)
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	manager.now = func() time.Time { return now }
 	repository.lineageCreatedAt = now
-	publisher := &fakeRotationPublisher{events: events, results: []dnsupdate.PublishResult{
+	publisher := &fakeRotationPublisher{events: events, resolvedZones: map[string]string{
+		"other.example.test.": "example.test.",
+	}, results: []dnsupdate.PublishResult{
 		dnsupdate.PublishCreated, dnsupdate.PublishAlreadyPresent, dnsupdate.PublishAlreadyPresent,
 	}}
 	proof := &fakeRotationProof{events: events}
@@ -146,9 +149,40 @@ func TestDKIM2AutoReconcilesAllCurrentDNSWithoutCreatingGeneration(t *testing.T)
 	if err != nil || result.DKIM2Outcome != DKIM2OutcomeReconciled || output.String() != "DKIM2 rotation outcome: reconciled\n" {
 		t.Fatalf("automatic reconciliation result=%#v err=%v", result, err)
 	}
-	if publisher.calls != 3 || proof.calls != 1 || repository.stageCalls != 0 || repository.commitCalls != 0 || len(repository.deleteCalls) != 0 {
-		t.Fatalf("publish=%d proof=%d stage=%d commit=%d delete=%v events=%v",
-			publisher.calls, proof.calls, repository.stageCalls, repository.commitCalls, repository.deleteCalls, *events)
+	if publisher.resolveCalls != 2 || publisher.calls != 3 || proof.calls != 1 || repository.stageCalls != 0 ||
+		repository.commitCalls != 0 || len(repository.deleteCalls) != 0 ||
+		!slices.Contains(publisher.resolvedLogical, "example.test.") ||
+		!slices.Contains(publisher.resolvedLogical, "other.example.test.") ||
+		!slices.Equal(publisher.publishedZones, []string{"example.test.", "example.test.", "example.test."}) {
+		t.Fatalf("resolve=%d logical=%v publish=%d zones=%v proof=%d stage=%d commit=%d delete=%v events=%v",
+			publisher.resolveCalls, publisher.resolvedLogical, publisher.calls, publisher.publishedZones, proof.calls,
+			repository.stageCalls, repository.commitCalls, repository.deleteCalls, *events)
+	}
+}
+
+func TestDKIM2AutoResolvesEveryCurrentUpdateZoneBeforePublication(t *testing.T) {
+	current := rotationGenerationBindings(t, []rotationBindingSpec{
+		{domain: "example.test", suffix: "first", algorithms: []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256}},
+		{domain: "other.example.test", suffix: "second", algorithms: []dkim2model.Algorithm{dkim2model.AlgorithmRSASHA256}},
+	})
+	manager, repository, events := newRotationHarness(t, current,
+		&cli.Options{Auto: true, UpdateDNS: true, Yes: true, Size: 2048})
+	defer repository.close()
+	manager.cfg.DKIM2.RotationEnabled = true
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	manager.now = func() time.Time { return now }
+	repository.lineageCreatedAt = now
+	publisher := &fakeRotationPublisher{events: events, resolveFailAt: 2, resolveFailErr: dnsupdate.ErrPublishUncertain}
+	proof := &fakeRotationProof{events: events}
+	manager.newRotationPublisher = func(*config.Config) (dkim2RotationPublisher, error) { return publisher, nil }
+	manager.newRotationProof = func(*config.Config) (dkim2RotationProof, error) { return proof, nil }
+
+	result, err := manager.Run()
+	if err == nil || result == nil || publisher.resolveCalls != 2 || publisher.calls != 0 || proof.calls != 0 ||
+		repository.stageCalls != 0 || repository.commitCalls != 0 || len(repository.deleteCalls) != 0 {
+		t.Fatalf("result=%#v resolve=%d publish=%d proof=%d stage=%d commit=%d delete=%v err=%v events=%v",
+			result, publisher.resolveCalls, publisher.calls, proof.calls, repository.stageCalls,
+			repository.commitCalls, repository.deleteCalls, err, *events)
 	}
 }
 

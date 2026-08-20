@@ -2,6 +2,7 @@ package dnsupdate
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -103,12 +104,27 @@ func buildRemoveMessage(zone, selectorName, subdomain string) *dns.Msg {
 }
 
 func (c *Client) resolveUpdateTarget(zone, subdomain string) (string, string, error) {
+	return resolveUpdateTargetWithLookup(context.Background(), zone, subdomain,
+		func(_ context.Context, candidate string) (bool, error) { return c.hasSOA(candidate) })
+}
+
+// resolveUpdateTargetWithLookup preserves the legacy parent-zone selection
+// semantics while allowing lifecycle callers to supply bounded strict evidence.
+func resolveUpdateTargetWithLookup(
+	ctx context.Context, zone, subdomain string, lookup func(context.Context, string) (bool, error),
+) (string, string, error) {
+	if ctx == nil || lookup == nil {
+		return "", "", errors.New("DNS update zone resolver is unavailable")
+	}
 	zone = strings.Trim(strings.TrimSpace(zone), ".")
 	subdomain = strings.Trim(strings.TrimSpace(subdomain), ".")
 	if zone == "" {
 		return "", "", fmt.Errorf("DNS update zone is empty")
 	}
-	hasSOA, err := c.hasSOA(zone)
+	if err := ctx.Err(); err != nil {
+		return "", "", err
+	}
+	hasSOA, err := lookup(ctx, zone)
 	if err != nil {
 		return "", "", err
 	}
@@ -118,8 +134,11 @@ func (c *Client) resolveUpdateTarget(zone, subdomain string) (string, string, er
 
 	labels := strings.Split(zone, ".")
 	for i := 1; i < len(labels)-1; i++ {
+		if err := ctx.Err(); err != nil {
+			return "", "", err
+		}
 		parent := strings.Join(labels[i:], ".")
-		hasSOA, err = c.hasSOA(parent)
+		hasSOA, err = lookup(ctx, parent)
 		if err != nil {
 			return "", "", err
 		}

@@ -197,6 +197,7 @@ type RotationPublisher struct {
 	exchange      dnsExchange
 	loadTSIG      func(string) ([]byte, error)
 	lookup        func(context.Context, ExpectedTXT) (ProofState, error)
+	soaLookup     func(context.Context, string) (bool, error)
 }
 
 const rotationPublisherRedacted = "<redacted DKIM2 DNS rotation publisher>"
@@ -243,7 +244,74 @@ func NewRotationPublisher(cfg *config.Config) (*RotationPublisher, error) {
 		}
 		return classifyPresenceResponse(response, expected)
 	}
+	p.soaLookup = p.lookupAuthoritativeSOA
 	return p, nil
+}
+
+// ResolveUpdateZone selects the exact authoritative SOA-bearing zone for one
+// canonical signing domain without loading TSIG material or sending an update.
+func (p *RotationPublisher) ResolveUpdateZone(ctx context.Context, logicalZone string) (string, error) {
+	if p == nil || ctx == nil || p.soaLookup == nil || !eligibleUpdateZone(logicalZone) {
+		return "", ErrPublishUncertain
+	}
+	resolved, _, err := resolveUpdateTargetWithLookup(ctx, logicalZone, "", p.soaLookup)
+	if err != nil {
+		return "", fmt.Errorf("%w: authoritative update zone unavailable", ErrPublishUncertain)
+	}
+	resolved = dns.Fqdn(resolved)
+	if !eligibleUpdateZone(resolved) || !dns.IsSubDomain(resolved, logicalZone) {
+		return "", ErrPublishUncertain
+	}
+	return resolved, nil
+}
+
+func (p *RotationPublisher) lookupAuthoritativeSOA(ctx context.Context, candidate string) (bool, error) {
+	if p == nil || ctx == nil || p.exchange == nil || p.queryTimeout < time.Second {
+		return false, ErrPublishUncertain
+	}
+	owner := dns.Fqdn(candidate)
+	if !absoluteCanonicalName(owner) {
+		return false, ErrPublishUncertain
+	}
+	query := new(dns.Msg)
+	query.SetQuestion(owner, dns.TypeSOA)
+	query.RecursionDesired = false
+	queryCtx, cancel := context.WithTimeout(ctx, p.queryTimeout)
+	defer cancel()
+	response, err := p.exchange(queryCtx, &dns.Client{Net: "tcp", Timeout: p.queryTimeout}, query, p.primary)
+	if err != nil {
+		return false, fmt.Errorf("%w: authoritative SOA exchange failed", ErrPublishUncertain)
+	}
+	return classifyAuthoritativeSOAResponse(response, query)
+}
+
+func classifyAuthoritativeSOAResponse(response, query *dns.Msg) (bool, error) {
+	if query == nil || len(query.Question) != 1 || query.Question[0].Qtype != dns.TypeSOA ||
+		query.Question[0].Qclass != dns.ClassINET || !absoluteCanonicalName(query.Question[0].Name) ||
+		response == nil || !response.Response || response.Id != query.Id || response.Opcode != dns.OpcodeQuery ||
+		response.Truncated || !response.Authoritative || len(response.Question) != 1 ||
+		response.Question[0] != query.Question[0] ||
+		(response.Rcode != dns.RcodeSuccess && response.Rcode != dns.RcodeNameError) {
+		return false, ErrPublishUncertain
+	}
+	owner := query.Question[0].Name
+	if len(response.Answer) == 1 {
+		soa, ok := response.Answer[0].(*dns.SOA)
+		if response.Rcode != dns.RcodeSuccess || !ok || soa.Hdr.Name != owner ||
+			soa.Hdr.Rrtype != dns.TypeSOA || soa.Hdr.Class != dns.ClassINET || len(response.Ns) != 0 {
+			return false, ErrPublishUncertain
+		}
+		return true, nil
+	}
+	if len(response.Answer) != 0 || len(response.Ns) != 1 {
+		return false, ErrPublishUncertain
+	}
+	soa, ok := response.Ns[0].(*dns.SOA)
+	if !ok || soa.Hdr.Rrtype != dns.TypeSOA || soa.Hdr.Class != dns.ClassINET ||
+		!absoluteCanonicalName(soa.Hdr.Name) || soa.Hdr.Name == owner || !dns.IsSubDomain(soa.Hdr.Name, owner) {
+		return false, ErrPublishUncertain
+	}
+	return false, nil
 }
 
 // PublishIfAbsent proves current state, then creates one TXT RRset under NXRRSET.
@@ -395,6 +463,21 @@ func validateZoneOwner(zone string, expected ExpectedTXT) error {
 		return errors.New("invalid absolute DKIM2 DNS zone or owner")
 	}
 	return nil
+}
+
+// ValidateResolvedUpdateZone proves that one SOA-bearing authority is the
+// canonical logical zone or an enclosing parent and still owns the record.
+func ValidateResolvedUpdateZone(logicalZone, resolvedZone string, expected ExpectedTXT) error {
+	if !eligibleUpdateZone(logicalZone) || !eligibleUpdateZone(resolvedZone) ||
+		validateZoneOwner(logicalZone, expected) != nil || validateZoneOwner(resolvedZone, expected) != nil ||
+		!dns.IsSubDomain(resolvedZone, logicalZone) {
+		return errors.New("invalid resolved DKIM2 DNS update zone")
+	}
+	return nil
+}
+
+func eligibleUpdateZone(value string) bool {
+	return absoluteCanonicalName(value) && len(dns.SplitDomainName(value)) >= 2
 }
 
 func absoluteCanonicalName(value string) bool {

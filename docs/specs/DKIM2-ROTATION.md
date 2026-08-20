@@ -176,10 +176,16 @@ load. Key comparison accepts the RFC 6376 default when an otherwise exact RSA
 or Ed25519 record omits the optional `h=` tag; an explicit `h=` value must
 remain exactly `sha256`. Conflict, ambiguity, cancellation, or uncertain
 publication/proof fails closed before retention and without any LDAP or
-generation mutation. A run
-that creates at least one missing RRset reports `reconciled`; an exact no-op
-reports `idle`. With the default configuration, a binding becomes due after 30
-days.
+generation mutation. Before the first publication, every unique logical
+signing domain is resolved by bounded direct TCP SOA queries to the configured
+authoritative primary. The resolver accepts only canonical authoritative
+evidence and selects either the exact logical zone or its nearest proven
+enclosing SOA-bearing parent, never a TLD or the DNS root. Every domain must
+resolve successfully before any campaign RRset is written; malformed,
+truncated, non-authoritative, ambiguous, missing, timed-out, or cancelled
+evidence fails the whole preflight closed. A run that creates at least one
+missing RRset reports `reconciled`; an exact no-op reports `idle`. With the
+default configuration, a binding becomes due after 30 days.
 
 When retention is enabled, automatic execution also inventories the complete
 bounded history and deletes at most `max_delete_batch` oldest eligible
@@ -212,6 +218,13 @@ publication, and value-aware retirement also accept canonical PKCS#1
 `RSAPublicKey` DER when it represents the exact same key. Ed25519 `p=` values
 remain the raw 32-byte public key. Other encodings and key mismatches fail
 closed.
+
+The DNS UPDATE question uses the SOA-bearing authority proven in the bounded
+preflight, not an assumed equality between signing domain and update zone.
+Manual rotation resolves its one logical domain before its first DNS write.
+Automatic current reconciliation and candidate publication resolve every
+unique logical domain before the first write, so a later resolution failure
+cannot leave an earlier domain partially published.
 
 Immediately before activation, the authoritative endpoint is queried directly
 over TCP with recursion disabled and must answer authoritatively. The recursive

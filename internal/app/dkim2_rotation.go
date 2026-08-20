@@ -135,8 +135,15 @@ func (m *DKIM2Manager) continuePreparedRotation(
 	if err != nil || proof == nil {
 		return errors.New("DKIM2 DNS proof client is unavailable")
 	}
-	zone := binding.domain + "."
+	logicalZone := binding.domain + "."
+	zone, err := publisher.ResolveUpdateZone(ctx, logicalZone)
+	if err != nil {
+		return errors.New("DKIM2 DNS update zone is uncertain")
+	}
 	for _, record := range records {
+		if err := dnsupdate.ValidateResolvedUpdateZone(logicalZone, zone, record); err != nil {
+			return errors.New("DKIM2 DNS update zone is invalid")
+		}
 		if _, err := publisher.PublishIfAbsent(ctx, zone, record); err != nil {
 			return errors.New("DKIM2 DNS publication is conflicting or uncertain")
 		}

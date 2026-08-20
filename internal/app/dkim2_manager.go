@@ -51,6 +51,7 @@ type dkim2DNSUpdater interface {
 }
 
 type dkim2RotationPublisher interface {
+	ResolveUpdateZone(context.Context, string) (string, error)
 	PublishIfAbsent(context.Context, string, dnsupdate.ExpectedTXT) (dnsupdate.PublishResult, error)
 }
 
