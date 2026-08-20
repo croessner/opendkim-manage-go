@@ -172,8 +172,11 @@ active RRset inventory from the immutable current generation, checks each exact
 record through the collision-safe publisher, recreates only authoritative
 absence under `NXRRSET`, and then requires fresh authoritative and recursive
 proof for every current record. Exact presence performs no DNS write or TSIG
-load. Conflict, ambiguity, cancellation, or uncertain publication/proof fails
-closed before retention and without any LDAP or generation mutation. A run
+load. Key comparison accepts the RFC 6376 default when an otherwise exact RSA
+or Ed25519 record omits the optional `h=` tag; an explicit `h=` value must
+remain exactly `sha256`. Conflict, ambiguity, cancellation, or uncertain
+publication/proof fails closed before retention and without any LDAP or
+generation mutation. A run
 that creates at least one missing RRset reports `reconciled`; an exact no-op
 reports `idle`. With the default configuration, a binding becomes due after 30
 days.

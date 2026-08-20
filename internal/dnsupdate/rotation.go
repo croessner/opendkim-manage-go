@@ -2,6 +2,7 @@ package dnsupdate
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -425,11 +426,14 @@ func matchingDKIMContent(expected, observed string) bool {
 		return false
 	}
 	defer clear(observedPublic)
-	return dkim2model.DNSPublicKeyMatchesSPKI(expectedAlgorithm, expectedPublic, observedPublic) ||
+	return bytes.Equal(expectedPublic, observedPublic) ||
+		dkim2model.DNSPublicKeyMatchesSPKI(expectedAlgorithm, expectedPublic, observedPublic) ||
 		dkim2model.DNSPublicKeyMatchesSPKI(expectedAlgorithm, observedPublic, expectedPublic)
 }
 
 // parseDKIMContent validates the closed key-record shape and returns detached public bytes.
+// RFC 6376 makes h= optional; omission permits sha256 and is therefore
+// equivalent to the generated sha256-only record for the intended key use.
 func parseDKIMContent(content string) (dkim2model.Algorithm, []byte, error) {
 	parts := strings.Split(content, ";")
 	values := make(map[string]string, len(parts))
@@ -450,7 +454,16 @@ func parseDKIMContent(content string) (dkim2model.Algorithm, []byte, error) {
 		}
 		values[pair[0]] = pair[1]
 	}
-	if len(values) != 4 || values["h"] != "sha256" || values["p"] == "" || (values["k"] != "rsa" && values["k"] != "ed25519") {
+	if len(values) < 3 || len(values) > 4 || values["p"] == "" ||
+		(values["k"] != "rsa" && values["k"] != "ed25519") {
+		return "", nil, errors.New("invalid DKIM key record")
+	}
+	for tag := range values {
+		if tag != "v" && tag != "k" && tag != "h" && tag != "p" {
+			return "", nil, errors.New("invalid DKIM key record")
+		}
+	}
+	if hash, present := values["h"]; present && hash != "sha256" {
 		return "", nil, errors.New("invalid DKIM key record")
 	}
 	public, err := base64.StdEncoding.Strict().DecodeString(values["p"])

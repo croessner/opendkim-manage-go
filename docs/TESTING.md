@@ -78,7 +78,9 @@ The DKIM2 test matrix must cover:
   bindings in exactly one v3 successor, non-due preservation, and
   pending-candidate-first behavior;
 - bounded idle reconciliation of every active current RRset, including exact
-  presence without a DNS write, absent-record publication, `idle` versus
+  presence without a DNS write, RFC 6376-compatible omission of the optional
+  `h=` tag for exact RSA and Ed25519 keys, rejection of explicit non-SHA-256
+  hash policy or any key mismatch, absent-record publication, `idle` versus
   `reconciled` outcome reporting, conflict/cancellation/proof failure before
   retention, and proof that no LDAP generation is staged or activated;
 - bounded observation states for idle, staged, DNS pending/conflict,

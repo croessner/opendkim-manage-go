@@ -51,6 +51,61 @@ func TestDNSProofAcceptsEquivalentCanonicalRSAEncodings(t *testing.T) {
 	}
 }
 
+func TestDNSProofAcceptsOptionalHashTagOmission(t *testing.T) {
+	tests := []struct {
+		name     string
+		expected ExpectedTXT
+		observed string
+	}{
+		{
+			name:     "ed25519",
+			expected: ExpectedTXT{Owner: "selector._domainkey.example.test.", Content: testDKIMRecord},
+			observed: strings.Replace(testDKIMRecord, "; h=sha256", "", 1),
+		},
+	}
+	rsaExpected, _ := rsaDNSCompatibilityRecords(t)
+	tests = append(tests, struct {
+		name     string
+		expected ExpectedTXT
+		observed string
+	}{
+		name:     "rsa",
+		expected: rsaExpected,
+		observed: strings.Replace(rsaExpected.Content, "; h=sha256", "", 1),
+	})
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			response := answerFor(ExpectedTXT{Owner: tt.expected.Owner, Content: tt.observed}, true, true)
+			if state, err := classifyProofResponse(response, tt.expected, ProofAuthoritative); err != nil || state != ProofExact {
+				t.Fatalf("equivalent h-omitted proof rejected: state=%v err=%v", state, err)
+			}
+		})
+	}
+}
+
+func TestDNSProofRejectsUnsafeHashTagCompatibility(t *testing.T) {
+	want := ExpectedTXT{Owner: "selector._domainkey.example.test.", Content: testDKIMRecord}
+	tests := map[string]string{
+		"excludes sha256": strings.Replace(testDKIMRecord, "h=sha256", "h=sha1", 1),
+		"unknown hash":    strings.Replace(testDKIMRecord, "h=sha256", "h=sha256:future", 1),
+		"empty hash":      strings.Replace(testDKIMRecord, "h=sha256", "h=", 1),
+		"duplicate hash":  strings.Replace(testDKIMRecord, "h=sha256", "h=sha256; h=sha256", 1),
+		"unknown tag":     strings.Replace(testDKIMRecord, "h=sha256", "x=sha256", 1),
+		"wrong key type":  strings.Replace(testDKIMRecord, "k=ed25519", "k=rsa", 1),
+		"wrong public key": strings.Replace(testDKIMRecord,
+			"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=", 1),
+	}
+	for name, observed := range tests {
+		t.Run(name, func(t *testing.T) {
+			response := answerFor(ExpectedTXT{Owner: want.Owner, Content: observed}, true, true)
+			if _, err := classifyProofResponse(response, want, ProofAuthoritative); err == nil {
+				t.Fatal("unsafe key-record compatibility accepted")
+			}
+		})
+	}
+}
+
 // rsaDNSCompatibilityRecords returns SPKI publication and equivalent PKCS#1 proof content.
 func rsaDNSCompatibilityRecords(t *testing.T) (ExpectedTXT, string) {
 	t.Helper()
@@ -255,6 +310,52 @@ func TestRotationPublisherExactResumeDoesNotLoadTSIG(t *testing.T) {
 	if err != nil || result != PublishAlreadyPresent {
 		t.Fatalf("resume: result=%v err=%v", result, err)
 	}
+}
+
+func TestRotationPublisherTreatsExactHashOmissionAsReadOnlyResume(t *testing.T) {
+	expectedRecords := []ExpectedTXT{{Owner: "selector._domainkey.example.test.", Content: testDKIMRecord}}
+	rsaExpected, _ := rsaDNSCompatibilityRecords(t)
+	expectedRecords = append(expectedRecords, rsaExpected)
+
+	for _, expected := range expectedRecords {
+		t.Run(string(mustDKIMAlgorithm(t, expected.Content)), func(t *testing.T) {
+			cfg := rotationDNSConfig()
+			cfg.DNS.TSIGKeyName, cfg.DNS.TSIGKeyFile = "synthetic-key", "/missing/synthetic-key"
+			publisher, err := NewRotationPublisher(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publisher.loadTSIG = func(string) ([]byte, error) {
+				t.Fatal("TSIG opened for exact h-omitted RRset")
+				return nil, nil
+			}
+			queries := 0
+			publisher.exchange = func(_ context.Context, _ *dns.Client, msg *dns.Msg, _ string) (*dns.Msg, error) {
+				if msg.Opcode != dns.OpcodeQuery {
+					t.Fatal("DNS UPDATE sent for exact h-omitted RRset")
+				}
+				queries++
+				observed := ExpectedTXT{Owner: expected.Owner, Content: strings.Replace(expected.Content, "; h=sha256", "", 1)}
+				response := answerFor(observed, true, false)
+				response.Id = msg.Id
+				return response, nil
+			}
+			result, err := publisher.PublishIfAbsent(context.Background(), "example.test.", expected)
+			if err != nil || result != PublishAlreadyPresent || queries != 1 {
+				t.Fatalf("read-only resume: result=%v queries=%d err=%v", result, queries, err)
+			}
+		})
+	}
+}
+
+func mustDKIMAlgorithm(t *testing.T, content string) dkim2model.Algorithm {
+	t.Helper()
+	algorithm, public, err := parseDKIMContent(content)
+	clear(public)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return algorithm
 }
 
 func TestRotationPublisherAcceptsOnlyAuthoritativeNXDOMAINPresenceRead(t *testing.T) {
