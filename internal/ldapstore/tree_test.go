@@ -1,9 +1,12 @@
 package ldapstore
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-ldap/ldap/v3"
 
 	"github.com/croessner/opendkim-manage-go/internal/types"
 )
@@ -111,6 +114,91 @@ func TestGetSelectorByDomainNameReturnsNilWhenMissing(t *testing.T) {
 	}
 	if selector != nil {
 		t.Fatalf("expected nil selector, got %#v", selector)
+	}
+}
+
+func TestGetKeyConvergesWhenSelectorDisappearsAfterTreeLoad(t *testing.T) {
+	const domainName = "example.org"
+	const selectorName = "selector-rsa-1"
+	tree := &Tree{
+		loaded: true,
+		domains: map[string]*Domain{
+			domainName: {
+				DomainName: domainName,
+				Selectors: map[string]*Selector{
+					selectorName: {
+						DomainName:   domainName,
+						SelectorName: selectorName,
+						LDAPDN:       "DKIMSelector=selector-rsa-1,dc=example,dc=org",
+					},
+				},
+			},
+		},
+		domainLoader: func(domain string) (map[string]*Domain, error) {
+			return map[string]*Domain{
+				domain: {DomainName: domain, Selectors: map[string]*Selector{}},
+			}, nil
+		},
+		keyLoader: func(*Selector) (string, error) {
+			return "", ldap.NewError(ldap.LDAPResultNoSuchObject, errors.New("absent"))
+		},
+	}
+
+	if _, err := tree.GetKey(domainName, selectorName); !errors.Is(err, ErrSelectorDisappeared) {
+		t.Fatalf("unexpected key lookup error: %v", err)
+	}
+	selector, err := tree.GetSelectorByDomainName(domainName, selectorName)
+	if err != nil {
+		t.Fatalf("selector lookup failed: %v", err)
+	}
+	if selector != nil {
+		t.Fatalf("stale selector survived authoritative reload: %#v", selector)
+	}
+}
+
+func TestGetKeyRetriesWithRefreshedSelectorDN(t *testing.T) {
+	const domainName = "example.org"
+	const selectorName = "selector-rsa-1"
+	loads := 0
+	tree := &Tree{
+		loaded: true,
+		domains: map[string]*Domain{
+			domainName: {
+				DomainName: domainName,
+				Selectors: map[string]*Selector{
+					selectorName: {DomainName: domainName, SelectorName: selectorName, LDAPDN: "old-dn"},
+				},
+			},
+		},
+		domainLoader: func(domain string) (map[string]*Domain, error) {
+			return map[string]*Domain{
+				domain: {
+					DomainName: domain,
+					Selectors: map[string]*Selector{
+						selectorName: {DomainName: domain, SelectorName: selectorName, LDAPDN: "new-dn"},
+					},
+				},
+			}, nil
+		},
+		keyLoader: func(selector *Selector) (string, error) {
+			loads++
+			if selector.LDAPDN == "old-dn" {
+				return "", ldap.NewError(ldap.LDAPResultNoSuchObject, errors.New("renamed"))
+			}
+			return "revoked", nil
+		},
+	}
+
+	key, err := tree.GetKey(domainName, selectorName)
+	if err != nil {
+		t.Fatalf("key lookup failed after refresh: %v", err)
+	}
+	if key != "revoked" || loads != 2 {
+		t.Fatalf("unexpected refreshed key result: key=%q loads=%d", key, loads)
+	}
+	selector, err := tree.GetSelectorByDomainName(domainName, selectorName)
+	if err != nil || selector == nil || selector.LDAPDN != "new-dn" || selector.RevokeState != types.RevokeEnabled {
+		t.Fatalf("refreshed selector state mismatch: selector=%#v err=%v", selector, err)
 	}
 }
 

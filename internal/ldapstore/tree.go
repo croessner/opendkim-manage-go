@@ -1,6 +1,7 @@
 package ldapstore
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -40,7 +41,13 @@ type Tree struct {
 	loaded       bool
 	domains      map[string]*Domain
 	domainLoader func(string) (map[string]*Domain, error)
+	keyLoader    func(*Selector) (string, error)
 }
+
+// ErrSelectorDisappeared reports an LDAP selector that was removed after the
+// in-memory domain snapshot was loaded and whose absence was confirmed by a
+// fresh domain read.
+var ErrSelectorDisappeared = errors.New("selector disappeared during LDAP refresh")
 
 func NewTree(cfg *config.Config, domain string) (*Tree, error) {
 	client, err := NewClient(cfg)
@@ -342,19 +349,45 @@ func (t *Tree) GetKey(domainName, selectorName string) (string, error) {
 	if strings.TrimSpace(s.LDAPDN) == "" {
 		return "", nil
 	}
-	entries, err := t.client.Search(fmt.Sprintf("(objectClass=%s)", t.scheme.DKIM), s.LDAPDN, []string{t.scheme.DKIMKey}, ldap.ScopeBaseObject)
+	key, err := t.loadSelectorKey(s)
+	if ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
+		if reloadErr := t.ReloadSelectorsByDomainName(domainName); reloadErr != nil {
+			return "", reloadErr
+		}
+		s, err = t.GetSelectorByDomainName(domainName, selectorName)
+		if err != nil {
+			return "", err
+		}
+		if s == nil {
+			return "", ErrSelectorDisappeared
+		}
+		if s.Key != "" {
+			return s.Key, nil
+		}
+		key, err = t.loadSelectorKey(s)
+	}
 	if err != nil {
 		return "", err
 	}
-	if len(entries) == 0 {
-		return "", nil
-	}
-	key := entries[0].GetAttributeValue(t.scheme.DKIMKey)
 	if key == "revoked" {
 		s.RevokeState = types.RevokeEnabled
 	}
 	s.Key = key
 	return key, nil
+}
+
+// loadSelectorKey reads only the private-key attribute for one exact selector
+// DN. Tests replace this boundary to reproduce LDAP snapshot races without
+// handling key material.
+func (t *Tree) loadSelectorKey(selector *Selector) (string, error) {
+	if t.keyLoader != nil {
+		return t.keyLoader(selector)
+	}
+	entries, err := t.client.Search(fmt.Sprintf("(objectClass=%s)", t.scheme.DKIM), selector.LDAPDN, []string{t.scheme.DKIMKey}, ldap.ScopeBaseObject)
+	if err != nil || len(entries) == 0 {
+		return "", err
+	}
+	return entries[0].GetAttributeValue(t.scheme.DKIMKey), nil
 }
 
 func (t *Tree) GetKeyType(domainName, selectorName string) (types.DKIMKeyType, error) {
@@ -367,6 +400,9 @@ func (t *Tree) GetKeyType(domainName, selectorName string) (types.DKIMKeyType, e
 		}
 	}
 	key, err := t.GetKey(domainName, selectorName)
+	if errors.Is(err, ErrSelectorDisappeared) {
+		return types.DKIMKeyTypeUnknown, nil
+	}
 	if err != nil {
 		return types.DKIMKeyTypeUnknown, err
 	}

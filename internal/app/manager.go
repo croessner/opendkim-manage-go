@@ -200,9 +200,12 @@ func (m *Manager) CmdList() error {
 			if err != nil {
 				return err
 			}
-			revokeState, err := m.tree.GetRevokeState(domainName, selectorName)
+			revokeState, exists, err := m.currentRevokeState(domainName, selectorName)
 			if err != nil {
 				return err
+			}
+			if !exists {
+				continue
 			}
 			keyType, err := m.tree.GetKeyType(domainName, selectorName)
 			if err != nil {
@@ -464,9 +467,12 @@ func (m *Manager) CmdDelete(domainName, selectorName string, forceDelete bool) e
 		}
 
 		if !selector.Modified.IsZero() && selector.Modified.AddDate(0, 0, m.runtime.DeleteDelay).Before(time.Now().UTC()) {
-			rev, err := m.tree.GetRevokeState(resolvedDomain, selectorName)
+			rev, exists, err := m.currentRevokeState(resolvedDomain, selectorName)
 			if err != nil {
 				return err
+			}
+			if !exists {
+				continue
 			}
 			if rev == types.RevokeDisabled {
 				kt, err := m.tree.GetKeyType(resolvedDomain, selectorName)
@@ -519,9 +525,12 @@ func (m *Manager) CmdDelete(domainName, selectorName string, forceDelete bool) e
 		revoked := make([]*ldapstore.Selector, 0)
 		for _, pair := range sortedSelectors {
 			sel := pair[0].(string)
-			rev, err := m.tree.GetRevokeState(dName, sel)
+			rev, exists, err := m.currentRevokeState(dName, sel)
 			if err != nil {
 				return err
+			}
+			if !exists {
+				continue
 			}
 			if rev == types.RevokeEnabled {
 				target, err := m.tree.GetSelectorByDomainName(dName, sel)
@@ -873,9 +882,12 @@ func (m *Manager) CmdRotate() error {
 			if err != nil {
 				return err
 			}
-			revoked, err := m.tree.GetRevokeState(domainName, sel)
+			revoked, exists, err := m.currentRevokeState(domainName, sel)
 			if err != nil {
 				return err
+			}
+			if !exists {
+				continue
 			}
 			if revoked == types.RevokeEnabled {
 				continue
@@ -911,9 +923,12 @@ func (m *Manager) CmdAddNew() error {
 		var selectorRSA, selectorED string
 		for _, pair := range sortedSelectors {
 			sel := pair[0].(string)
-			revoked, err := m.tree.GetRevokeState(domainName, sel)
+			revoked, exists, err := m.currentRevokeState(domainName, sel)
 			if err != nil {
 				return err
+			}
+			if !exists {
+				continue
 			}
 			if revoked == types.RevokeEnabled {
 				continue
@@ -1026,9 +1041,12 @@ func (m *Manager) CmdPrintDNS() error {
 		if err != nil {
 			return err
 		}
-		rev, err := m.tree.GetRevokeState(target.domain, target.selector)
+		rev, exists, err := m.currentRevokeState(target.domain, target.selector)
 		if err != nil {
 			return err
+		}
+		if !exists {
+			continue
 		}
 		dk := dkim.NewKeys()
 		publicKey := ""
@@ -1101,9 +1119,12 @@ func (m *Manager) CmdAddMissing() error {
 		haveRSA := false
 		haveED := false
 		for name := range selectors {
-			revoked, err := m.tree.GetRevokeState(domainName, name)
+			revoked, exists, err := m.currentRevokeState(domainName, name)
 			if err != nil {
 				return err
+			}
+			if !exists {
+				continue
 			}
 			if revoked == types.RevokeEnabled {
 				continue
@@ -1203,9 +1224,12 @@ func (m *Manager) CmdAuto() error {
 			if err != nil {
 				return err
 			}
-			rev, err := m.tree.GetRevokeState(domainName, sel)
+			rev, exists, err := m.currentRevokeState(domainName, sel)
 			if err != nil {
 				return err
+			}
+			if !exists {
+				continue
 			}
 
 			if rev == types.RevokeDisabled && kt == types.DKIMKeyTypeRSA {
@@ -2039,6 +2063,18 @@ func (m *Manager) changeDNSDKIMKey(zone, selectorName, content, subdomain string
 		return nil
 	}
 	return m.dns.ChangeDKIMKey(zone, selectorName, content, subdomain)
+}
+
+// currentRevokeState distinguishes a selector that was authoritatively
+// removed after the domain snapshot from real LDAP failures. The former is an
+// idempotent lifecycle outcome; every other error remains fail closed.
+func (m *Manager) currentRevokeState(domainName, selectorName string) (types.DKIMRevokeState, bool, error) {
+	state, err := m.tree.GetRevokeState(domainName, selectorName)
+	if errors.Is(err, ldapstore.ErrSelectorDisappeared) {
+		m.warnf("selector %q disappeared during LDAP refresh; treating it as already removed", selectorName)
+		return types.RevokeDisabled, false, nil
+	}
+	return state, true, err
 }
 
 func (m *Manager) dryRunf(format string, args ...any) {
