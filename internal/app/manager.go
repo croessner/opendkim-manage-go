@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-ldap/ldap/v3"
+
 	"github.com/croessner/opendkim-manage-go/internal/cli"
 	"github.com/croessner/opendkim-manage-go/internal/config"
 	"github.com/croessner/opendkim-manage-go/internal/dkim"
@@ -2014,7 +2016,21 @@ func (m *Manager) deleteDKIMKey(dn string) error {
 		m.dryRunf("would delete LDAP DKIM key dn=%s", dn)
 		return nil
 	}
-	return m.ldap.DeleteDKIMKey(dn)
+	return m.removeLDAPEntry(m.ldap.DeleteDKIMKey, dn)
+}
+
+// removeLDAPEntry deletes one selector entry through del. A noSuchObject
+// answer means the authoritative server no longer holds the entry: a chaining
+// read replica can still list a selector that the provider has already
+// removed, so a second delete in the same run is the wanted end state rather
+// than a failure. Every other error stays fail closed.
+func (m *Manager) removeLDAPEntry(del func(dn string) error, dn string) error {
+	err := del(dn)
+	if ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
+		m.warnf("LDAP entry %s is already absent; treating the delete as done", dn)
+		return nil
+	}
+	return err
 }
 
 func (m *Manager) revokeDKIMKey(dn string) error {

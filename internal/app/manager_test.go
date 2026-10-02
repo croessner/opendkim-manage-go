@@ -2,11 +2,14 @@ package app
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-ldap/ldap/v3"
 
 	"github.com/croessner/opendkim-manage-go/internal/cli"
 	"github.com/croessner/opendkim-manage-go/internal/config"
@@ -373,5 +376,29 @@ func TestNewManagerPreservesConfiguredMaxRevokedWhenFlagUnset(t *testing.T) {
 	})
 	if m.runtime.MaxRevoked != 17 {
 		t.Fatalf("configured max_revoked was overwritten: %d", m.runtime.MaxRevoked)
+	}
+}
+
+// A chaining read replica can still list a selector that the provider has
+// already removed, so the rotation deletes it a second time. The provider's
+// noSuchObject answer is the wanted end state; other errors stay fatal.
+func TestRemoveLDAPEntryTreatsProviderAbsenceAsDone(t *testing.T) {
+	m := &Manager{}
+	dn := "DKIMSelector=selector-AAAAAA-2026-07,dc=example,dc=com,ou=dkim,o=company"
+	absent := func(string) error {
+		return fmt.Errorf("ldap delete failed for %s: %w", dn, ldap.NewError(ldap.LDAPResultNoSuchObject, errors.New("No Such Object")))
+	}
+	if err := m.removeLDAPEntry(absent, dn); err != nil {
+		t.Fatalf("delete of an already removed selector failed: %v", err)
+	}
+	denied := func(string) error {
+		return fmt.Errorf("ldap delete failed for %s: %w", dn, ldap.NewError(ldap.LDAPResultInsufficientAccessRights, errors.New("denied")))
+	}
+	if err := m.removeLDAPEntry(denied, dn); err == nil {
+		t.Fatal("an access error must not be treated as a completed delete")
+	}
+	called := ""
+	if err := m.removeLDAPEntry(func(got string) error { called = got; return nil }, dn); err != nil || called != dn {
+		t.Fatalf("successful delete: err=%v dn=%q", err, called)
 	}
 }
