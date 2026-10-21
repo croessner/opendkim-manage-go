@@ -91,19 +91,9 @@ func ChangedActiveBindings(source, candidate *Generation, maximumBindings int) (
 		}
 		sourceCredentials := credentialsForProfile(source, sourceProfile.ID())
 		candidateCredentials := credentialsForProfile(candidate, candidateProfile.ID())
-		if len(sourceCredentials) != len(candidateCredentials) {
-			return nil, ErrInvalid
-		}
-		slices.SortFunc(sourceCredentials, compareCredentialAlgorithm)
-		slices.SortFunc(candidateCredentials, compareCredentialAlgorithm)
-		unchanged := true
-		for index := range sourceCredentials {
-			if sourceCredentials[index].Algorithm() != candidateCredentials[index].Algorithm() {
-				return nil, ErrInvalid
-			}
-			if !sameCredentialAndMaterial(source, sourceCredentials[index], candidate, candidateCredentials[index]) {
-				unchanged = false
-			}
+		unchanged, err := campaignProfileUnchanged(source, sourceCredentials, candidate, candidateCredentials)
+		if err != nil {
+			return nil, err
 		}
 		if unchanged {
 			continue
@@ -119,10 +109,13 @@ func ChangedActiveBindings(source, candidate *Generation, maximumBindings int) (
 		if matches != 1 || policy.Status() != RecordStatusActive || sourceProfile.Status() != RecordStatusActive || !policy.Use().SupportsNativeKeyCustody() {
 			return nil, ErrInvalid
 		}
-		for index := range sourceCredentials {
-			if sourceCredentials[index].Selector() == candidateCredentials[index].Selector() ||
-				sourceCredentials[index].HandleID() == candidateCredentials[index].HandleID() {
-				return nil, ErrInvalid
+		for _, sourceCredential := range sourceCredentials {
+			for _, candidateCredential := range candidateCredentials {
+				if sourceCredential.Selector() == candidateCredential.Selector() ||
+					sourceCredential.HandleID() == candidateCredential.HandleID() ||
+					bytes.Equal(sourceCredential.publicSPKI, candidateCredential.publicSPKI) {
+					return nil, ErrInvalid
+				}
 			}
 		}
 		changed = append(changed, BindingIdentity{tenant: policy.TenantID(), domain: policy.SigningDomain(), use: policy.Use()})
@@ -134,6 +127,53 @@ func ChangedActiveBindings(source, candidate *Generation, maximumBindings int) (
 		return strings.Compare(a.tenant+"\x00"+a.domain+"\x00"+string(a.use), b.tenant+"\x00"+b.domain+"\x00"+string(b.use))
 	})
 	return changed, nil
+}
+
+// campaignProfileUnchanged classifies one profile of a campaign successor.
+// An equal-cardinality profile must keep its exact algorithm set and is
+// unchanged only when every credential and key is identical. A larger
+// candidate set is an algorithm extension: it keeps every source algorithm,
+// stays within the per-profile bound, and binds every added credential to
+// fresh key material of the same tenant, domain, and use. A smaller set
+// would drop an algorithm and is always rejected.
+func campaignProfileUnchanged(source *Generation, sourceCredentials []Credential, candidate *Generation, candidateCredentials []Credential) (bool, error) {
+	if len(candidateCredentials) < len(sourceCredentials) || len(candidateCredentials) > MaxCredentialsPerProfile {
+		return false, ErrInvalid
+	}
+	slices.SortFunc(sourceCredentials, compareCredentialAlgorithm)
+	slices.SortFunc(candidateCredentials, compareCredentialAlgorithm)
+	if len(candidateCredentials) == len(sourceCredentials) {
+		unchanged := true
+		for index := range sourceCredentials {
+			if sourceCredentials[index].Algorithm() != candidateCredentials[index].Algorithm() {
+				return false, ErrInvalid
+			}
+			if !sameCredentialAndMaterial(source, sourceCredentials[index], candidate, candidateCredentials[index]) {
+				unchanged = false
+			}
+		}
+		return unchanged, nil
+	}
+	sourceByAlgorithm := make(map[Algorithm]Credential, len(sourceCredentials))
+	for _, credential := range sourceCredentials {
+		sourceByAlgorithm[credential.Algorithm()] = credential
+	}
+	candidateByAlgorithm := make(map[Algorithm]Credential, len(candidateCredentials))
+	for _, credential := range candidateCredentials {
+		candidateByAlgorithm[credential.Algorithm()] = credential
+	}
+	if len(sourceByAlgorithm) != len(sourceCredentials) || len(candidateByAlgorithm) != len(candidateCredentials) {
+		return false, ErrInvalid
+	}
+	for algorithm := range sourceByAlgorithm {
+		if _, found := candidateByAlgorithm[algorithm]; !found {
+			return false, ErrInvalid
+		}
+	}
+	if err := validateExtendedCredentials(source, candidate, sourceByAlgorithm, candidateByAlgorithm); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 func sameProfileFacts(a, b Profile) bool {
@@ -187,4 +227,37 @@ func sameCredentialAndMaterial(left *Generation, lc Credential, right *Generatio
 	defer clear(rp)
 	return lm.TenantID() == rm.TenantID() && lm.SigningDomain() == rm.SigningDomain() && lm.Use() == rm.Use() &&
 		lm.HandleID() == rm.HandleID() && lm.Algorithm() == rm.Algorithm() && bytes.Equal(lp, rp)
+}
+
+// ValidateExtensionCandidate proves that a stored campaign successor is the
+// global extension requested by algorithms: every active source binding is
+// fully replaced and now carries exactly the requested set.
+func ValidateExtensionCandidate(source, candidate *Generation, algorithms []Algorithm, maximumBindings int) error {
+	requested, err := canonicalAlgorithmSet(algorithms)
+	if err != nil {
+		return err
+	}
+	active, err := ActiveBindings(source, maximumBindings)
+	if err != nil {
+		return err
+	}
+	changed, err := ChangedActiveBindings(source, candidate, maximumBindings)
+	if err != nil || len(changed) != len(active) {
+		return ErrInvalid
+	}
+	for index, binding := range changed {
+		if binding != active[index] {
+			return ErrInvalid
+		}
+		_, _, credentials, bindingErr := exactActiveBinding(candidate, binding.tenant, binding.domain, binding.use)
+		if bindingErr != nil || len(credentials) != len(requested) {
+			return ErrInvalid
+		}
+		for _, credential := range credentials {
+			if !slices.Contains(requested, credential.Algorithm()) {
+				return ErrInvalid
+			}
+		}
+	}
+	return nil
 }

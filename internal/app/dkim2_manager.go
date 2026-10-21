@@ -329,7 +329,9 @@ func (m *DKIM2Manager) validateCommand() error {
 		}
 	}
 	if o.Auto {
-		if len(domains) != 0 || len(selectors) != 0 || !o.UpdateDNS || !m.cfg.DKIM2.RotationEnabled || o.KeyType != "" {
+		// An optional --keytype turns the campaign into one global
+		// algorithm-set extension of every active binding.
+		if len(domains) != 0 || len(selectors) != 0 || !o.UpdateDNS || !m.cfg.DKIM2.RotationEnabled {
 			return errors.New("DKIM2 automatic rotation requires rotation_enabled and --update-dns without explicit scope")
 		}
 	}

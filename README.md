@@ -204,8 +204,8 @@ DKIM2 mode supports only these commands:
   `--keytype` may extend that set, never shrink it: `--keytype all` on an RSA
   and Ed25519 binding adds `mldsa44-ed25519-sha512` beside fresh RSA and
   Ed25519 keys and runs the normal publication, proof, activation, and
-  retirement lifecycle. Repeat it per domain to add the composite key to every
-  domain.
+  retirement lifecycle. To extend every binding at once, use the global
+  extension campaign `--auto --keytype all --update-dns` described below.
   `--prepare-only` stops after exact LDAP staging and readback, before TSIG or
   DNS access. `--resume-generation <G>` continues only the exact protected
   candidate already stored in LDAP and never generates replacement keys.
@@ -231,6 +231,21 @@ DKIM2 mode supports only these commands:
   identities. A canonical
   owner-only journal resumes the exact purge plan after partial leaf-first
   deletion or restart.
+- `--auto --keytype <set> --update-dns` is the operator-run global extension
+  campaign. It rotates every active native binding (`originator`,
+  `delivery_status`, `ordinary_transit`), due or not, into fresh keys of
+  exactly the requested set in one generation, through the same staging, TSIG
+  publication, proof, activation, and retention path. The set must keep every
+  current algorithm of every binding; a request that would drop one fails
+  closed before any write. Once every binding already carries exactly the
+  requested set, the campaign is idle and behaves like an idle `--auto` run.
+  An interrupted campaign resumes with the same command or through the daily
+  `--auto`; with `--keytype`, the stored candidate must be exactly that
+  extension of every binding. `--dry-run` plans it without writes. Run
+  `--auto --keytype all --update-dns --yes` once to add
+  `mldsa44-ed25519-sha512` beside fresh RSA and Ed25519 keys everywhere. The
+  daily `--auto` without `--keytype` keeps rotating only due bindings with
+  their current sets.
 - `--observe --domain ...` reports the bounded LDAP/DNS lifecycle phase for
   exactly one native binding without performing a write or opening TSIG
   material.

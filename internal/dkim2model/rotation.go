@@ -90,18 +90,7 @@ func PlanGlobalRotation(plan GlobalRotationPlan) (*Generation, []EligibilityDeci
 		return nil, nil, err
 	}
 	defer func() { _ = builder.Close() }()
-	usedSelectors := make(map[string]struct{}, len(plan.Current.credentials)+2*len(decisions))
-	usedHandles := make(map[string]struct{}, len(plan.Current.handles)+2*len(decisions))
-	for _, credential := range plan.Current.credentials {
-		usedSelectors[credential.Selector()] = struct{}{}
-	}
-	for _, handle := range plan.Current.handles {
-		usedHandles[handle.ID()] = struct{}{}
-	}
-	generate := plan.Generate
-	if generate == nil {
-		generate = GenerateKeyPair
-	}
+	replacer := newCampaignKeyReplacer(plan.Current, plan.NextGeneration, plan.Random, plan.Identifiers, plan.Limits, plan.Generate)
 	for _, decision := range decisions {
 		_, profile, credentials, bindingErr := exactActiveBinding(plan.Current, decision.tenant, decision.domain, decision.use)
 		if bindingErr != nil {
@@ -111,48 +100,10 @@ func PlanGlobalRotation(plan GlobalRotationPlan) (*Generation, []EligibilityDeci
 		for index := range credentials {
 			algorithms[index] = credentials[index].Algorithm()
 		}
-		slices.SortFunc(algorithms, func(left, right Algorithm) int { return algorithmRank(left) - algorithmRank(right) })
-		newCredentials := make([]Credential, 0, len(algorithms))
-		newMaterials := make([]*KeyMaterial, 0, len(algorithms))
-		for _, algorithm := range algorithms {
-			selector, allocateErr := allocateHistoricalIDBounded("dkim2", plan.Random, usedSelectors, plan.Identifiers.SelectorUsed, plan.Limits.AllocationAttempts)
-			if allocateErr != nil {
-				closeKeyMaterials(newMaterials)
-				return nil, nil, allocateErr
-			}
-			handle, allocateErr := allocateHistoricalIDBounded("key", plan.Random, usedHandles, plan.Identifiers.HandleUsed, plan.Limits.AllocationAttempts)
-			if allocateErr != nil {
-				closeKeyMaterials(newMaterials)
-				return nil, nil, allocateErr
-			}
-			pair, generateErr := generate(algorithm, plan.Limits.RSABits, plan.Random)
-			if generateErr != nil || pair == nil {
-				if pair != nil {
-					_ = pair.Close()
-				}
-				closeKeyMaterials(newMaterials)
-				return nil, nil, errors.New("generate protected DKIM2 rotation key")
-			}
-			public := pair.PublicSPKIDER()
-			credential, credentialErr := NewCredential(plan.NextGeneration, profile.ID(), selector, algorithm, public, handle)
-			clear(public)
-			material, materialErr := NewKeyMaterial(plan.NextGeneration, decision.tenant, decision.domain, decision.use, handle, pair)
-			_ = pair.Close()
-			if credentialErr != nil || materialErr != nil {
-				if material != nil {
-					_ = material.Close()
-				}
-				closeKeyMaterials(newMaterials)
-				return nil, nil, ErrInvalid
-			}
-			newCredentials = append(newCredentials, credential)
-			newMaterials = append(newMaterials, material)
-		}
-		if err := builder.ReplaceProfileKeys(profile.ID(), newCredentials, newMaterials); err != nil {
-			closeKeyMaterials(newMaterials)
+		slices.SortFunc(algorithms, CompareAlgorithms)
+		if err := replacer.replace(builder, profile, decision.tenant, decision.domain, decision.use, algorithms); err != nil {
 			return nil, nil, err
 		}
-		closeKeyMaterials(newMaterials)
 	}
 	candidate, err := builder.Build()
 	if err != nil {
@@ -178,26 +129,16 @@ func PlanRotation(plan RotationPlan) (*Generation, error) {
 		currentAlgorithms[index] = credential.Algorithm()
 	}
 	slices.SortFunc(currentAlgorithms, func(left, right Algorithm) int { return algorithmRank(left) - algorithmRank(right) })
-	requested := append([]Algorithm(nil), plan.Algorithms...)
-	if len(requested) == 0 {
-		requested = append(requested, currentAlgorithms...)
+	requestedInput := plan.Algorithms
+	if len(requestedInput) == 0 {
+		requestedInput = currentAlgorithms
 	}
-	slices.SortFunc(requested, func(left, right Algorithm) int { return algorithmRank(left) - algorithmRank(right) })
 	// A rotation replaces every current credential and may extend the
 	// algorithm set, for example with mldsa44-ed25519-sha512; it never drops
 	// an algorithm.
-	if len(requested) > MaxCredentialsPerProfile {
+	requested, err := canonicalAlgorithmSet(requestedInput)
+	if err != nil || !containsEveryAlgorithm(requested, currentAlgorithms) {
 		return nil, ErrInvalid
-	}
-	for _, algorithm := range currentAlgorithms {
-		if !slices.Contains(requested, algorithm) {
-			return nil, ErrInvalid
-		}
-	}
-	for index, algorithm := range requested {
-		if !algorithm.Known() || index > 0 && algorithm == requested[index-1] {
-			return nil, ErrInvalid
-		}
 	}
 	if slices.Contains(requested, AlgorithmRSASHA256) &&
 		(plan.RSABits < MinRSABits || plan.RSABits > MaxRSABits || plan.RSABits%8 != 0) {
@@ -266,6 +207,174 @@ func PlanRotation(plan RotationPlan) (*Generation, error) {
 		return nil, err
 	}
 	return builder.Build()
+}
+
+// GlobalExtensionPlan contains all inputs for one operator-requested
+// all-binding algorithm-set extension successor.
+type GlobalExtensionPlan struct {
+	Current        *Generation
+	NextGeneration uint64
+	Algorithms     []Algorithm
+	Identifiers    HistoricalIdentifierLookup
+	Random         io.Reader
+	Limits         RotationLimits
+	Generate       KeyGenerator
+}
+
+// PlanGlobalExtension rotates every active native binding into fresh keys of
+// exactly the requested algorithm set in one complete successor. The request
+// must be a superset of every binding's current set, so no binding ever loses
+// an algorithm. When every binding already carries exactly the requested set,
+// nothing is extended and no candidate is returned, which keeps a repeated
+// campaign idempotent.
+func PlanGlobalExtension(plan GlobalExtensionPlan) (*Generation, []BindingIdentity, error) {
+	if plan.Current == nil || plan.Current.Number() == ^uint64(0) ||
+		plan.NextGeneration != plan.Current.Number()+1 || plan.Identifiers == nil ||
+		plan.Random == nil || plan.Limits.Validate() != nil {
+		return nil, nil, ErrInvalid
+	}
+	requested, err := canonicalAlgorithmSet(plan.Algorithms)
+	if err != nil {
+		return nil, nil, err
+	}
+	bindings, err := ActiveBindings(plan.Current, plan.Limits.MaximumBindings)
+	if err != nil {
+		return nil, nil, err
+	}
+	profiles := make([]Profile, len(bindings))
+	extends := false
+	for index, binding := range bindings {
+		_, profile, credentials, bindingErr := exactActiveBinding(plan.Current, binding.tenant, binding.domain, binding.use)
+		if bindingErr != nil {
+			return nil, nil, bindingErr
+		}
+		current := make([]Algorithm, len(credentials))
+		for credentialIndex, credential := range credentials {
+			current[credentialIndex] = credential.Algorithm()
+		}
+		if !containsEveryAlgorithm(requested, current) {
+			return nil, nil, ErrInvalid
+		}
+		extends = extends || len(credentials) < len(requested)
+		profiles[index] = profile
+	}
+	if !extends {
+		return nil, nil, nil
+	}
+	builder, err := plan.Current.NextBuilder(plan.NextGeneration, DatasetStateStaging)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = builder.Close() }()
+	replacer := newCampaignKeyReplacer(plan.Current, plan.NextGeneration, plan.Random, plan.Identifiers, plan.Limits, plan.Generate)
+	for index, binding := range bindings {
+		if err := replacer.replace(builder, profiles[index], binding.tenant, binding.domain, binding.use, requested); err != nil {
+			return nil, nil, err
+		}
+	}
+	candidate, err := builder.Build()
+	if err != nil {
+		return nil, nil, err
+	}
+	return candidate, bindings, nil
+}
+
+// canonicalAlgorithmSet returns a sorted detached copy of a nonempty, bounded
+// set of known algorithms and rejects duplicates.
+func canonicalAlgorithmSet(algorithms []Algorithm) ([]Algorithm, error) {
+	if len(algorithms) == 0 || len(algorithms) > MaxCredentialsPerProfile {
+		return nil, ErrInvalid
+	}
+	result := slices.Clone(algorithms)
+	slices.SortFunc(result, CompareAlgorithms)
+	for index, algorithm := range result {
+		if !algorithm.Known() || index > 0 && algorithm == result[index-1] {
+			return nil, ErrInvalid
+		}
+	}
+	return result, nil
+}
+
+// containsEveryAlgorithm reports whether requested keeps every current algorithm.
+func containsEveryAlgorithm(requested, current []Algorithm) bool {
+	for _, algorithm := range current {
+		if !slices.Contains(requested, algorithm) {
+			return false
+		}
+	}
+	return true
+}
+
+// campaignKeyReplacer allocates fresh historical identifiers and keys for the
+// bindings of one campaign successor. It reserves every identifier it hands
+// out, so no two bindings of one successor share a selector or handle.
+type campaignKeyReplacer struct {
+	next          uint64
+	random        io.Reader
+	identifiers   HistoricalIdentifierLookup
+	limits        RotationLimits
+	generate      KeyGenerator
+	usedSelectors map[string]struct{}
+	usedHandles   map[string]struct{}
+}
+
+// newCampaignKeyReplacer reserves every current selector and handle before
+// any successor identifier is allocated.
+func newCampaignKeyReplacer(current *Generation, next uint64, random io.Reader, identifiers HistoricalIdentifierLookup,
+	limits RotationLimits, generate KeyGenerator,
+) *campaignKeyReplacer {
+	if generate == nil {
+		generate = GenerateKeyPair
+	}
+	replacer := &campaignKeyReplacer{next: next, random: random, identifiers: identifiers, limits: limits, generate: generate,
+		usedSelectors: make(map[string]struct{}, len(current.credentials)), usedHandles: make(map[string]struct{}, len(current.handles))}
+	for _, credential := range current.credentials {
+		replacer.usedSelectors[credential.Selector()] = struct{}{}
+	}
+	for _, handle := range current.handles {
+		replacer.usedHandles[handle.ID()] = struct{}{}
+	}
+	return replacer
+}
+
+// replace generates one fresh credential per algorithm for one exact active
+// binding and atomically replaces the profile keys in builder. Protected key
+// material is closed on every path.
+func (r *campaignKeyReplacer) replace(builder *Builder, profile Profile, tenant, domain string, use ProfileUse, algorithms []Algorithm) error {
+	newCredentials := make([]Credential, 0, len(algorithms))
+	newMaterials := make([]*KeyMaterial, 0, len(algorithms))
+	defer func() { closeKeyMaterials(newMaterials) }()
+	for _, algorithm := range algorithms {
+		selector, err := allocateHistoricalIDBounded("dkim2", r.random, r.usedSelectors, r.identifiers.SelectorUsed, r.limits.AllocationAttempts)
+		if err != nil {
+			return err
+		}
+		handle, err := allocateHistoricalIDBounded("key", r.random, r.usedHandles, r.identifiers.HandleUsed, r.limits.AllocationAttempts)
+		if err != nil {
+			return err
+		}
+		pair, err := r.generate(algorithm, r.limits.RSABits, r.random)
+		if err != nil || pair == nil {
+			if pair != nil {
+				_ = pair.Close()
+			}
+			return errors.New("generate protected DKIM2 rotation key")
+		}
+		public := pair.PublicSPKIDER()
+		credential, credentialErr := NewCredential(r.next, profile.ID(), selector, algorithm, public, handle)
+		clear(public)
+		material, materialErr := NewKeyMaterial(r.next, tenant, domain, use, handle, pair)
+		_ = pair.Close()
+		if credentialErr != nil || materialErr != nil {
+			if material != nil {
+				_ = material.Close()
+			}
+			return ErrInvalid
+		}
+		newCredentials = append(newCredentials, credential)
+		newMaterials = append(newMaterials, material)
+	}
+	return builder.ReplaceProfileKeys(profile.ID(), newCredentials, newMaterials)
 }
 
 func exactActiveBinding(generation *Generation, tenant, domain string, use ProfileUse) (Policy, Profile, []Credential, error) {

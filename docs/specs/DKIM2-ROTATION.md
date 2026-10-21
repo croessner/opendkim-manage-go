@@ -266,6 +266,25 @@ evidence fails the whole preflight closed. A run that creates at least one
 missing RRset reports `reconciled`; an exact no-op reports `idle`. With the
 default configuration, a binding becomes due after 30 days.
 
+`--auto --keytype <set> --update-dns` turns one automatic run into the global
+algorithm-set extension campaign. It keeps every precondition above and the
+same pending-candidate resume, staging, publication, proof, single
+commit-and-current, and retention path. Instead of selecting due bindings, it
+freezes every active native binding and replaces each one completely with
+fresh keys, selectors, and handles of exactly the requested set. The request
+must be a superset of every binding's current set; any binding that would lose
+an algorithm rejects the complete campaign before randomness, staging, TSIG, or
+DNS access. When every binding already carries exactly the requested set, no
+generation is created and the run continues as an idle automatic run, so a
+repeated campaign never rotates again. Campaign successor validation accepts an
+extension only when every source algorithm survives, the per-profile bound
+holds, no selector, handle, or public key is reused, and every added key binds
+the same tenant, domain, and use. A pending candidate resumed with `--keytype`
+must be exactly that extension of every active binding; a different set or an
+ordinary due-only candidate fails closed before DNS. The daily `--auto` without
+`--keytype` resumes any exact stored candidate and otherwise keeps rotating
+only due bindings with their unchanged sets.
+
 When retention is enabled, automatic execution also inventories the complete
 bounded history and deletes at most `max_delete_batch` oldest eligible
 generations until no more than `max_generations` remain. The newest

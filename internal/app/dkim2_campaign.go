@@ -41,31 +41,21 @@ func (m *DKIM2Manager) runAutomaticCampaign(ctx context.Context, result *RunResu
 		if loadErr != nil {
 			return errors.New("DKIM2 automatic campaign cannot resume the protected candidate")
 		}
+		if err := m.validateExtensionResume(current, prepared); err != nil {
+			_ = prepared.Close()
+			return err
+		}
 		if m.opts.DryRun {
 			_ = prepared.Close()
 			return m.reportRotationDryRun(result, true)
 		}
 		return m.continueAutomaticCampaign(ctx, result, current, prepared)
 	}
-	lineage, err := history.LineageHistory()
-	if err != nil {
-		return errors.New("DKIM2 automatic campaign lineage is incomplete")
-	}
-	now, err := m.utcNow()
+	candidate, err := m.planAutomaticCampaign(current, history)
 	if err != nil {
 		return err
 	}
-	candidate, decisions, err := dkim2model.PlanGlobalRotation(dkim2model.GlobalRotationPlan{
-		Current: current, NextGeneration: current.Number() + 1, Now: now, History: lineage,
-		Identifiers: history, Random: m.random, Limits: configuredDKIM2RotationLimits(m.cfg.DKIM2, m.opts.Size),
-	})
-	if err != nil {
-		return errors.New("DKIM2 automatic campaign eligibility or candidate is invalid")
-	}
 	if candidate == nil {
-		if len(decisions) != 0 {
-			return errors.New("DKIM2 automatic campaign planner returned inconsistent state")
-		}
 		if !m.opts.DryRun {
 			reconciled, reconcileErr := m.reconcileCurrentDNS(ctx, current)
 			if reconcileErr != nil {
@@ -103,6 +93,70 @@ func (m *DKIM2Manager) runAutomaticCampaign(ctx context.Context, result *RunResu
 		}
 	}
 	return m.continueAutomaticCampaign(ctx, result, current, prepared)
+}
+
+// planAutomaticCampaign builds the next campaign successor or returns nil
+// when nothing is to be rotated. Without --keytype only due bindings rotate
+// and keep their algorithm sets. With --keytype the operator requests one
+// global extension: every active binding rotates into the requested set,
+// which must keep every current algorithm.
+func (m *DKIM2Manager) planAutomaticCampaign(current *dkim2model.Generation, history dkim2store.RetainedHistory) (*dkim2model.Generation, error) {
+	limits := configuredDKIM2RotationLimits(m.cfg.DKIM2, m.opts.Size)
+	if m.opts.KeyType != "" {
+		algorithms, err := m.algorithms()
+		if err != nil {
+			return nil, errors.New("DKIM2 extension campaign algorithm set is invalid")
+		}
+		candidate, _, err := dkim2model.PlanGlobalExtension(dkim2model.GlobalExtensionPlan{
+			Current: current, NextGeneration: current.Number() + 1, Algorithms: algorithms,
+			Identifiers: history, Random: m.random, Limits: limits,
+		})
+		if err != nil {
+			return nil, errors.New("DKIM2 extension campaign would drop an algorithm or its candidate is invalid")
+		}
+		return candidate, nil
+	}
+	lineage, err := history.LineageHistory()
+	if err != nil {
+		return nil, errors.New("DKIM2 automatic campaign lineage is incomplete")
+	}
+	now, err := m.utcNow()
+	if err != nil {
+		return nil, err
+	}
+	candidate, decisions, err := dkim2model.PlanGlobalRotation(dkim2model.GlobalRotationPlan{
+		Current: current, NextGeneration: current.Number() + 1, Now: now, History: lineage,
+		Identifiers: history, Random: m.random, Limits: limits,
+	})
+	if err != nil {
+		return nil, errors.New("DKIM2 automatic campaign eligibility or candidate is invalid")
+	}
+	if candidate == nil && len(decisions) != 0 {
+		return nil, errors.New("DKIM2 automatic campaign planner returned inconsistent state")
+	}
+	return candidate, nil
+}
+
+// validateExtensionResume binds an operator extension request to a stored
+// campaign candidate before any DNS or LDAP mutation. The daily campaign
+// without --keytype resumes whatever exact candidate is stored.
+func (m *DKIM2Manager) validateExtensionResume(source *dkim2model.Generation, prepared *dkim2store.PreparedGeneration) error {
+	if m.opts.KeyType == "" {
+		return nil
+	}
+	algorithms, err := m.algorithms()
+	if err != nil {
+		return errors.New("DKIM2 extension campaign algorithm set is invalid")
+	}
+	candidate, err := prepared.Generation()
+	if err != nil {
+		return errors.New("DKIM2 automatic campaign candidate is malformed")
+	}
+	defer func() { _ = candidate.Close() }()
+	if dkim2model.ValidateExtensionCandidate(source, candidate, algorithms, m.cfg.DKIM2.MaxCampaignBindings) != nil {
+		return errors.New("--keytype does not match the stored DKIM2 campaign candidate")
+	}
+	return nil
 }
 
 // reconcileCurrentDNS restores absent exact current-generation RRsets without changing LDAP state.
