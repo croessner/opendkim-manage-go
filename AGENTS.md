@@ -1,8 +1,8 @@
 # opendkim-manage-go Development Guidelines
 
-This repository is a security-sensitive Go 1.26 project for DKIM key lifecycle
+This repository is a security-sensitive Go 1.27 project for DKIM key lifecycle
 management across LDAP and DNS. Keep `go.mod`, Docker builds, GitHub Actions,
-vendored dependencies, and technical documentation aligned with Go 1.26.
+vendored dependencies, and technical documentation aligned with Go 1.27.
 
 ## Required Workflow
 

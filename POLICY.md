@@ -5,7 +5,7 @@ configuration, packaging, and release change.
 
 ## Must Rules
 
-- MUST: Keep the project on Go 1.26 across module metadata, CI, Docker builds,
+- MUST: Keep the project on Go 1.27 across module metadata, CI, Docker builds,
   vendored dependencies, and documentation.
 - MUST: Keep the module path and internal imports rooted at
   `github.com/croessner/opendkim-manage-go`.

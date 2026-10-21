@@ -24,7 +24,7 @@ description: Use for any code, documentation, configuration, dependency, test, r
   duplicating them.
 - Keep dependencies intentional. Prefer a clear standard-library or local
   implementation for small security-sensitive helpers.
-- Keep Go 1.26 aligned across `go.mod`, Docker, CI, and docs.
+- Keep Go 1.27 aligned across `go.mod`, Docker, CI, and docs.
 - Run `go mod tidy` and `go mod vendor` after dependency changes.
 - Build and test with `-mod=vendor`.
 

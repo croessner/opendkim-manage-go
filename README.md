@@ -1,13 +1,13 @@
 # opendkim-manage-go
 
-[![Go Version](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Guardrails](https://github.com/croessner/opendkim-manage-go/actions/workflows/guardrails.yaml/badge.svg)](https://github.com/croessner/opendkim-manage-go/actions/workflows/guardrails.yaml)
 [![CodeQL](https://github.com/croessner/opendkim-manage-go/actions/workflows/codeql.yml/badge.svg)](https://github.com/croessner/opendkim-manage-go/actions/workflows/codeql.yml)
 
 `opendkim-manage-go` manages DKIM keys in LDAP and synchronizes their DNS TXT
 records through authenticated TSIG updates. Its default `opendkim` mode is a
-Go 1.26 rewrite of the legacy Python `opendkim-manage` utility. The separate
+Go 1.27 rewrite of the legacy Python `opendkim-manage` utility. The separate
 `dkim2` mode manages immutable native DKIM2 datasource generations. The
 project is distributed under the MIT license.
 
