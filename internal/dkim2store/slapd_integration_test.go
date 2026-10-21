@@ -211,7 +211,8 @@ access to * by dn.exact="cn=admin,dc=example,dc=test" manage by * none
 			_ = command.Process.Kill()
 		}
 		select {
-		case <-waited:
+		case waitErr := <-waited:
+			_ = waitErr // Wait reports the deliberate kill; only reaping matters here.
 		case <-time.After(2 * time.Second):
 		}
 	})
@@ -220,8 +221,8 @@ access to * by dn.exact="cn=admin,dc=example,dc=test" manage by * none
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
-		case <-waited:
-			t.Fatal("the required isolated slapd exited during startup")
+		case waitErr := <-waited:
+			t.Fatalf("the required isolated slapd exited during startup: %v", waitErr)
 		default:
 		}
 		connection, err = ldap.DialURL("ldap://"+address, ldap.DialWithDialer(&net.Dialer{Timeout: 200 * time.Millisecond}))
