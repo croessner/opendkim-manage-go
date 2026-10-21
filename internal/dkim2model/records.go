@@ -227,6 +227,9 @@ func (p Policy) WithActivation(status RecordStatus, rollout Rollout) (Policy, er
 
 // canonicalDNSPublicBytes validates canonical SPKI and returns DNS p= bytes.
 func canonicalDNSPublicBytes(algorithm Algorithm, publicSPKI []byte) ([]byte, error) {
+	if algorithm == AlgorithmMLDSA44Ed25519SHA512 {
+		return compositeDNSPublicBytes(publicSPKI)
+	}
 	parsed, err := x509.ParsePKIXPublicKey(publicSPKI)
 	if err != nil {
 		return nil, ErrInvalid

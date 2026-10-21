@@ -448,8 +448,11 @@ func (c DKIM2Config) validate() error {
 	if c.MaxGenerationEntries < 6 || c.MaxGenerationEntries > 1000000 {
 		return errors.New("dkim2.max_generation_entries must be between 6 and 1000000")
 	}
-	if c.MaxAttributeBytes < 1024 || c.MaxAttributeBytes > 1<<20 {
-		return errors.New("dkim2.max_attribute_bytes must be between 1024 and 1048576")
+	// The lower bound admits the largest public SPKI any signing algorithm
+	// stores (the 1365-byte mldsa44-ed25519-sha512 key), up to the model's
+	// 2 KiB SPKI ceiling.
+	if c.MaxAttributeBytes < 2048 || c.MaxAttributeBytes > 1<<20 {
+		return errors.New("dkim2.max_attribute_bytes must be between 2048 and 1048576")
 	}
 	if c.MaxDatasetBytes < 1<<20 || c.MaxDatasetBytes > 1<<30 {
 		return errors.New("dkim2.max_dataset_bytes must be between 1048576 and 1073741824")

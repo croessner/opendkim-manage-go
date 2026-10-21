@@ -16,7 +16,8 @@ The current prerelease is `v1.0.0-beta.11`.
 ## Features
 
 - Select either the legacy OpenDKIM or native DKIM2 LDAP model
-- Manage RSA and ED25519 DKIM keys in LDAP
+- Manage RSA and ED25519 DKIM keys in LDAP, plus the post-quantum composite
+  `mldsa44-ed25519-sha512` in DKIM2 mode
 - List, create, delete, revoke, activate, rotate, and reorder OpenDKIM selectors
 - Create and activate complete immutable DKIM2 datasource generations with
   crash-resumable rotation
@@ -155,10 +156,22 @@ Native key material uses distinct canonical encodings:
 - New RSA DNS `p=` data is SubjectPublicKeyInfo DER, matching OpenDKIM mode;
   proof also accepts canonical PKCS#1 `RSAPublicKey` DER for the same key.
 - Ed25519 DNS `p=` data is the raw 32-byte public key.
+- `mldsa44-ed25519-sha512` private material is the exact
+  id-MLDSA44-Ed25519-SHA512 PKCS#8 encoding (OID 1.3.6.1.5.5.7.6.39) of the
+  32-byte ML-DSA-44 seed followed by the 32-byte Ed25519 seed. Its DNS `p=`
+  data is the raw 1344-byte ML-DSA-44 public key followed by the Ed25519 public
+  key, published as `v=DKIM1; k=mldsa44-ed25519-sha512; p=...` without `h=`.
+  The record is about 1.9 KB and is split into 254-byte character-strings;
+  the serving nameservers and resolvers must answer it over EDNS0 or TCP.
+  The encodings match the DKIM2 reference implementation byte for byte.
 
-The stored DKIM2 algorithms are exactly `rsa-sha256` and
-`ed25519-sha256`. A profile may contain at most one credential per algorithm;
-RSA and Ed25519 credentials use different selectors and handles.
+The stored DKIM2 algorithms are exactly `rsa-sha256`, `ed25519-sha256`, and
+`mldsa44-ed25519-sha512`, in that canonical order. A profile may contain at
+most one credential per algorithm; every credential uses its own selector and
+handle. The composite algorithm requires a `dkim2d` that signs it (v0.1.40 or
+later); publish composite credentials only to daemons of that version.
+`dkim2.max_attribute_bytes` must be at least 2048 so the 1365-byte composite
+SPKI fits; the former 1024 minimum is rejected at configuration load.
 
 DKIM2 mode supports only these commands:
 
@@ -167,7 +180,8 @@ DKIM2 mode supports only these commands:
 - `--create --domain ... [--keytype ...]` publishes a new disabled native
   profile and its complete supporting records. A new domain starts with a
   disabled/off policy. `--keytype both` creates distinct RSA and Ed25519
-  credentials in deterministic RSA-then-Ed25519 order.
+  credentials, `--keytype composite` only `mldsa44-ed25519-sha512`, and
+  `--keytype all` all three, in canonical order.
 - `--create --resume-generation <G>` explicitly recovers one complete native
   v3 creation with the same domain set, tenant, profile use, algorithms, RSA
   size, and feedback route. It validates all unchanged source records and
@@ -186,7 +200,12 @@ DKIM2 mode supports only these commands:
   SubjectPublicKeyInfo or Ed25519 raw public-key encoding. RSA proof accepts
   both canonical SPKI and PKCS#1 representations of the exact stored key.
 - `--rotate --domain ... --update-dns` rotates exactly one active native
-  binding while preserving its RSA-only, Ed25519-only, or dual algorithm set.
+  binding with fresh keys for its current algorithm set. An explicit
+  `--keytype` may extend that set, never shrink it: `--keytype all` on an RSA
+  and Ed25519 binding adds `mldsa44-ed25519-sha512` beside fresh RSA and
+  Ed25519 keys and runs the normal publication, proof, activation, and
+  retirement lifecycle. Repeat it per domain to add the composite key to every
+  domain.
   `--prepare-only` stops after exact LDAP staging and readback, before TSIG or
   DNS access. `--resume-generation <G>` continues only the exact protected
   candidate already stored in LDAP and never generates replacement keys.
@@ -311,7 +330,8 @@ Common options include:
 - `--mode` (`opendkim` or `dkim2`)
 - `--domain` / `-D`
 - `--selectorname` / `-s`
-- `--keytype` (`both`, `rsa`, or `ed25519`)
+- `--keytype` (`both`, `rsa`, or `ed25519`; DKIM2 mode also `composite` and
+  `all`, which legacy OpenDKIM mode rejects)
 - `--update-dns`
 - `--prepare-only`
 - `--resume-generation <G>`

@@ -183,8 +183,16 @@ func PlanRotation(plan RotationPlan) (*Generation, error) {
 		requested = append(requested, currentAlgorithms...)
 	}
 	slices.SortFunc(requested, func(left, right Algorithm) int { return algorithmRank(left) - algorithmRank(right) })
-	if !slices.Equal(requested, currentAlgorithms) {
+	// A rotation replaces every current credential and may extend the
+	// algorithm set, for example with mldsa44-ed25519-sha512; it never drops
+	// an algorithm.
+	if len(requested) > MaxCredentialsPerProfile {
 		return nil, ErrInvalid
+	}
+	for _, algorithm := range currentAlgorithms {
+		if !slices.Contains(requested, algorithm) {
+			return nil, ErrInvalid
+		}
 	}
 	for index, algorithm := range requested {
 		if !algorithm.Known() || index > 0 && algorithm == requested[index-1] {

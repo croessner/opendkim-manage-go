@@ -225,8 +225,13 @@ Manual rotation uses:
 ```
 
 It accepts exactly one canonical domain, no selector or wildcard scope, no
-CNAME behavior, and no force option. A `--keytype` override is valid only when
-it exactly equals the binding's current RSA, Ed25519, or dual algorithm set.
+CNAME behavior, and no force option. A `--keytype` override may equal the
+binding's current algorithm set or extend it, never shrink it: `--keytype all`
+on an RSA and Ed25519 binding stages fresh RSA, Ed25519, and
+`mldsa44-ed25519-sha512` keys. Every current credential is still replaced, and
+lifecycle classification accepts exactly the added algorithms, each with its
+own fresh selector, handle, and key material of the same binding. Resume
+compares an explicit `--keytype` with the stored candidate's exact set.
 `--prepare-only` stages and exactly reads back the candidate, then stops before
 TSIG access or DNS activity. `--resume-generation <G>` accepts one canonical
 nonzero decimal and resumes only the protected stored candidate.
@@ -398,7 +403,9 @@ exact value prerequisite. Partial or response-uncertain deletion continues
 only through the same command plus `--resume-retirement`, after all
 attestations and preconditions are revalidated and authoritative state is read
 back. An absent old record is success-so-far and is never recreated. This is
-cardinality-neutral for RSA-only, Ed25519-only, and dual bindings. Recursive
+independent of the set sizes: replacement proof covers every active record,
+including algorithms added by an extending rotation, and retirement deletes
+every predecessor record. Recursive
 cache retention is an observing condition, not a reason to repeat deletion.
 Automatic DNS retirement remains forbidden. LDAP deletion occurs only through
 the separate bounded v3 retention phase and its durable purge journal.

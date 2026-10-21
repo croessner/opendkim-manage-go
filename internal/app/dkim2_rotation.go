@@ -330,13 +330,15 @@ func rotationExpectedRecords(candidate *dkim2model.Generation, tenant, domain st
 		return nil, dkim2model.ErrInvalid
 	}
 	credentials := credentialsForProfile(candidate, profile.ID())
-	if len(credentials) < 1 || len(credentials) > 2 {
+	if len(credentials) < 1 || len(credentials) > dkim2model.MaxCredentialsPerProfile {
 		return nil, dkim2model.ErrInvalid
 	}
-	sort.Slice(credentials, func(i, j int) bool { return credentials[i].Algorithm() < credentials[j].Algorithm() })
+	sort.Slice(credentials, func(i, j int) bool {
+		return dkim2model.CompareAlgorithms(credentials[i].Algorithm(), credentials[j].Algorithm()) < 0
+	})
 	records := make([]dnsupdate.ExpectedTXT, len(credentials))
 	for index, credential := range credentials {
-		if credential.Algorithm() != dkim2model.AlgorithmRSASHA256 && credential.Algorithm() != dkim2model.AlgorithmEd25519SHA256 {
+		if !credential.Algorithm().Known() {
 			return nil, dkim2model.ErrInvalid
 		}
 		records[index] = dnsupdate.ExpectedTXT{

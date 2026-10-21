@@ -171,7 +171,7 @@ type LifecycleObservation struct {
 
 // NewLifecycleObservation validates one bounded, non-secret status projection.
 func NewLifecycleObservation(generation uint64, phase LifecyclePhase, domain string, credentials []ObservationCredential) (LifecycleObservation, error) {
-	if generation == 0 || !phase.Known() || ValidateCanonicalDNSName(domain) != nil || len(credentials) > 2 {
+	if generation == 0 || !phase.Known() || ValidateCanonicalDNSName(domain) != nil || len(credentials) > MaxCredentialsPerProfile {
 		return LifecycleObservation{}, ErrInvalid
 	}
 	seenAlgorithms := make(map[Algorithm]struct{}, len(credentials))
@@ -528,9 +528,7 @@ func (*ForwardRollbackTransition) Format(state fmt.State, _ rune) {
 func (*ForwardRollbackTransition) MarshalJSON() ([]byte, error) { return json.Marshal(struct{}{}) }
 
 func uniqueRotatedBinding(current, predecessor *Generation) (LifecycleBinding, []LifecycleCredential, []LifecycleCredential, error) {
-	if len(current.profiles) != len(predecessor.profiles) || len(current.policies) != len(predecessor.policies) ||
-		len(current.credentials) != len(predecessor.credentials) || len(current.handles) != len(predecessor.handles) ||
-		len(current.materials) != len(predecessor.materials) {
+	if len(current.profiles) != len(predecessor.profiles) || len(current.policies) != len(predecessor.policies) {
 		return LifecycleBinding{}, nil, nil, ErrInvalid
 	}
 	currentProfiles := profilesByID(current)
@@ -550,10 +548,14 @@ func uniqueRotatedBinding(current, predecessor *Generation) (LifecycleBinding, [
 
 	var changedProfile string
 	var retiring, active []LifecycleCredential
+	added := 0
 	for profileID := range predecessorProfiles {
 		oldCredentials := credentialsByAlgorithm(predecessor, profileID)
 		newCredentials := credentialsByAlgorithm(current, profileID)
-		if len(oldCredentials) == 0 || len(oldCredentials) != len(newCredentials) || len(oldCredentials) > 2 {
+		// A rotation replaces every credential and may extend the algorithm
+		// set; it never removes an algorithm.
+		if len(oldCredentials) == 0 || len(newCredentials) < len(oldCredentials) ||
+			len(newCredentials) > MaxCredentialsPerProfile {
 			return LifecycleBinding{}, nil, nil, ErrInvalid
 		}
 		allEqual := true
@@ -577,18 +579,25 @@ func uniqueRotatedBinding(current, predecessor *Generation) (LifecycleBinding, [
 				!bytes.Equal(oldCredential.publicSPKI, newCredential.publicSPKI) &&
 				materialBindingsEqual(oldMaterial, newMaterial)
 		}
+		extension := len(newCredentials) - len(oldCredentials)
+		if err := validateExtendedCredentials(predecessor, current, oldCredentials, newCredentials); err != nil {
+			return LifecycleBinding{}, nil, nil, err
+		}
 		switch {
-		case allEqual:
+		case allEqual && extension == 0:
 			continue
-		case !allReplaced || changedProfile != "":
+		case allEqual || !allReplaced || changedProfile != "":
 			return LifecycleBinding{}, nil, nil, ErrInvalid
 		default:
+			added = extension
 			changedProfile = profileID
 			retiring = lifecycleCredentials(oldCredentials)
 			active = lifecycleCredentials(newCredentials)
 		}
 	}
-	if changedProfile == "" {
+	if changedProfile == "" || len(current.credentials) != len(predecessor.credentials)+added ||
+		len(current.handles) != len(predecessor.handles)+added ||
+		len(current.materials) != len(predecessor.materials)+added {
 		return LifecycleBinding{}, nil, nil, ErrInvalid
 	}
 	previousPolicy, previousFound := exclusivePolicyForProfile(predecessor, changedProfile)
@@ -645,7 +654,7 @@ func rebaseSourceBinding(plan ForwardRollbackPlan, currentPolicy Policy, current
 	materials := make([]*KeyMaterial, 0, len(plan.Current.materials))
 	defer closeKeyMaterials(materials)
 
-	removedHandles := make(map[string]struct{}, 2)
+	removedHandles := make(map[string]struct{}, MaxCredentialsPerProfile)
 	for _, credential := range plan.Current.credentials {
 		if credential.ProfileID() == currentProfile.ID() {
 			removedHandles[credential.HandleID()] = struct{}{}
@@ -834,6 +843,49 @@ func credentialsLogicalEqual(left, right Credential) bool {
 		bytes.Equal(left.publicSPKI, right.publicSPKI)
 }
 
+// validateExtendedCredentials requires every credential a rotation adds for a
+// new algorithm to own key material of the same tenant, domain, and use as
+// the replaced credentials, under its own algorithm with a handle and selector
+// that no predecessor credential uses.
+func validateExtendedCredentials(predecessor, current *Generation, oldCredentials, newCredentials map[Algorithm]Credential) error {
+	var reference *KeyMaterial
+	for _, oldCredential := range oldCredentials {
+		material, found := materialByHandle(predecessor, oldCredential.HandleID())
+		if !found {
+			return ErrInvalid
+		}
+		reference = material
+		break
+	}
+	for algorithm, newCredential := range newCredentials {
+		if _, existed := oldCredentials[algorithm]; existed {
+			continue
+		}
+		material, found := materialByHandle(current, newCredential.HandleID())
+		if !found || reference == nil || material.Algorithm() != algorithm ||
+			material.TenantID() != reference.TenantID() || material.SigningDomain() != reference.SigningDomain() ||
+			material.Use() != reference.Use() {
+			return ErrInvalid
+		}
+		if _, reused := materialByHandle(predecessor, newCredential.HandleID()); reused ||
+			predecessorUsesSelector(predecessor, newCredential.Selector()) {
+			return ErrInvalid
+		}
+	}
+	return nil
+}
+
+// predecessorUsesSelector reports whether any predecessor credential publishes the selector.
+func predecessorUsesSelector(predecessor *Generation, selector string) bool {
+	for _, credential := range predecessor.credentials {
+		if credential.Selector() == selector {
+			return true
+		}
+	}
+	return false
+}
+
+// materialBindingsEqual reports whether two key materials bind the same tenant, domain, use, and algorithm.
 func materialBindingsEqual(left, right *KeyMaterial) bool {
 	return left != nil && right != nil && left.TenantID() == right.TenantID() &&
 		left.SigningDomain() == right.SigningDomain() && left.Use() == right.Use() &&

@@ -138,7 +138,7 @@ func (g *Generation) validate() error {
 		}
 		algorithms[credential.Algorithm()] = struct{}{}
 		profileCredentialCount[credential.ProfileID()]++
-		if profileCredentialCount[credential.ProfileID()] > 2 {
+		if profileCredentialCount[credential.ProfileID()] > MaxCredentialsPerProfile {
 			return ErrInvalid
 		}
 	}
@@ -710,12 +710,15 @@ func policyKey(tenant, domain string, use ProfileUse) string {
 	return tenant + "\x00" + domain + "\x00" + string(use)
 }
 
-// algorithmRank returns the canonical RSA-before-Ed25519 order.
+// algorithmRank returns the position in the canonical signing order; unknown
+// values rank after every known algorithm.
 func algorithmRank(algorithm Algorithm) int {
-	if algorithm == AlgorithmRSASHA256 {
-		return 0
+	for index, known := range signingAlgorithmOrder {
+		if algorithm == known {
+			return index
+		}
 	}
-	return 1
+	return len(signingAlgorithmOrder)
 }
 
 // stringsCompare avoids locale or normalization semantics for canonical ASCII values.

@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"sort"
@@ -125,7 +124,7 @@ func (m *DKIM2Manager) observeLifecycle(ctx context.Context, result *RunResult) 
 
 // observeDualRecordSet reads each exact record through both configured channels.
 func observeDualRecordSet(ctx context.Context, observer dkim2PresenceObserver, records []dnsupdate.ExpectedTXT) ([]dnsupdate.PresenceObservation, error) {
-	if observer == nil || len(records) < 1 || len(records) > 2 {
+	if observer == nil || len(records) < 1 || len(records) > dkim2model.MaxCredentialsPerProfile {
 		return nil, errors.New("DKIM2 lifecycle DNS observation request is invalid")
 	}
 	observations := make([]dnsupdate.PresenceObservation, len(records))
@@ -165,7 +164,7 @@ func observeCandidateRecordSet(ctx context.Context, observer dkim2PresenceObserv
 
 // classifyPredecessorObservation enforces cardinality-neutral all-record retirement states.
 func classifyPredecessorObservation(observations []dnsupdate.PresenceObservation, overlapProven bool) dkim2model.LifecyclePhase {
-	if len(observations) < 1 || len(observations) > 2 {
+	if len(observations) < 1 || len(observations) > dkim2model.MaxCredentialsPerProfile {
 		return 0
 	}
 	present, cached, absent := 0, 0, 0
@@ -205,7 +204,7 @@ func (m *DKIM2Manager) emitLifecycleObservation(result *RunResult, generation *d
 		return errors.New("DKIM2 lifecycle observed binding is unavailable")
 	}
 	credentials := credentialsForProfile(generation, policy.ProfileID())
-	if len(credentials) < 1 || len(credentials) > 2 {
+	if len(credentials) < 1 || len(credentials) > dkim2model.MaxCredentialsPerProfile {
 		return errors.New("DKIM2 lifecycle observed credentials are ambiguous")
 	}
 	statusCredentials := make([]dkim2model.ObservationCredential, len(credentials))
@@ -587,38 +586,37 @@ func cloneGenerationWithState(source *dkim2model.Generation, state dkim2model.Da
 
 // lifecycleExpectedRecords derives exact public DNS expectations without exposing protected handles.
 func lifecycleExpectedRecords(credentials []dkim2model.LifecycleCredential, domain string) ([]dnsupdate.ExpectedTXT, error) {
-	if len(credentials) < 1 || len(credentials) > 2 {
+	if len(credentials) < 1 || len(credentials) > dkim2model.MaxCredentialsPerProfile {
 		return nil, dkim2model.ErrInvalid
 	}
-	sort.Slice(credentials, func(i, j int) bool { return credentials[i].Algorithm() < credentials[j].Algorithm() })
+	sort.Slice(credentials, func(i, j int) bool {
+		return dkim2model.CompareAlgorithms(credentials[i].Algorithm(), credentials[j].Algorithm()) < 0
+	})
 	result := make([]dnsupdate.ExpectedTXT, len(credentials))
 	for index, credential := range credentials {
-		keyType := "rsa"
-		if credential.Algorithm() == dkim2model.AlgorithmEd25519SHA256 {
-			keyType = "ed25519"
-		} else if credential.Algorithm() != dkim2model.AlgorithmRSASHA256 {
-			return nil, dkim2model.ErrInvalid
-		}
 		public := credential.DNSPublicKeyBytes()
-		if len(public) == 0 {
+		content, err := dkim2model.DNSKeyRecord(credential.Algorithm(), public)
+		clear(public)
+		if err != nil {
 			return nil, dkim2model.ErrInvalid
 		}
 		result[index] = dnsupdate.ExpectedTXT{
 			Owner:   credential.Selector() + "._domainkey." + domain + ".",
-			Content: "v=DKIM1; k=" + keyType + "; h=sha256; p=" + base64.StdEncoding.EncodeToString(public),
+			Content: content,
 		}
-		clear(public)
 	}
 	return result, nil
 }
 
 // reportLifecycleObservation emits only the approved bounded status vocabulary.
 func (m *DKIM2Manager) reportLifecycleObservation(observation dkim2model.LifecycleObservation) error {
-	if !observation.Phase().Known() || observation.Generation() == 0 || len(observation.Credentials()) > 2 {
+	if !observation.Phase().Known() || observation.Generation() == 0 || len(observation.Credentials()) > dkim2model.MaxCredentialsPerProfile {
 		return errors.New("DKIM2 lifecycle observation is invalid")
 	}
 	credentials := observation.Credentials()
-	sort.Slice(credentials, func(i, j int) bool { return credentials[i].Algorithm() < credentials[j].Algorithm() })
+	sort.Slice(credentials, func(i, j int) bool {
+		return dkim2model.CompareAlgorithms(credentials[i].Algorithm(), credentials[j].Algorithm()) < 0
+	})
 	if _, err := fmt.Fprintf(m.out, "DKIM2 lifecycle generation=%d phase=%s domain=%s credentials=%d",
 		observation.Generation(), observation.Phase().Name(), observation.Domain(), len(credentials)); err != nil {
 		return errors.New("DKIM2 lifecycle observation reporting failed")

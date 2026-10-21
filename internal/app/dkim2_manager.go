@@ -757,6 +757,7 @@ func (m *DKIM2Manager) verifyCredential(credential dkim2model.Credential, domain
 	return nil
 }
 
+// algorithms maps the effective key type to the canonical algorithm set.
 func (m *DKIM2Manager) algorithms() ([]dkim2model.Algorithm, error) {
 	switch m.opts.EffectiveKeyType(m.cfg.KeyType) {
 	case types.DKIMKeyTypeRSA:
@@ -765,6 +766,10 @@ func (m *DKIM2Manager) algorithms() ([]dkim2model.Algorithm, error) {
 		return []dkim2model.Algorithm{dkim2model.AlgorithmEd25519SHA256}, nil
 	case types.DKIMKeyTypeBoth:
 		return []dkim2model.Algorithm{dkim2model.AlgorithmRSASHA256, dkim2model.AlgorithmEd25519SHA256}, nil
+	case types.DKIMKeyTypeComposite:
+		return []dkim2model.Algorithm{dkim2model.AlgorithmMLDSA44Ed25519SHA512}, nil
+	case types.DKIMKeyTypeAll:
+		return dkim2model.SigningAlgorithms(), nil
 	default:
 		return nil, errors.New("unsupported DKIM2 key type")
 	}
@@ -932,13 +937,15 @@ func matchesString(filter []string, candidate string) bool {
 	return false
 }
 
+// dnsRecord renders the canonical key record of one validated credential.
 func dnsRecord(credential dkim2model.Credential) string {
-	keyType := "rsa"
-	if credential.Algorithm() == dkim2model.AlgorithmEd25519SHA256 {
-		keyType = "ed25519"
+	public := credential.DNSPublicKeyBytes()
+	defer clear(public)
+	record, err := dkim2model.DNSKeyRecord(credential.Algorithm(), public)
+	if err != nil {
+		return ""
 	}
-	return "v=DKIM1; k=" + keyType + "; h=sha256; p=" +
-		base64.StdEncoding.EncodeToString(credential.DNSPublicKeyBytes())
+	return record
 }
 
 func parseDNSRecord(record string) (dkim2model.Algorithm, []byte, error) {
@@ -983,13 +990,9 @@ func parseDNSRecord(record string) (dkim2model.Algorithm, []byte, error) {
 	if flags, present := values["t"]; present && !validDNSFlags(flags) {
 		return "", nil, errors.New("invalid DKIM DNS flags")
 	}
-	var algorithm dkim2model.Algorithm
-	switch keyType, present := values["k"]; {
-	case !present || keyType == "rsa":
-		algorithm = dkim2model.AlgorithmRSASHA256
-	case keyType == "ed25519":
-		algorithm = dkim2model.AlgorithmEd25519SHA256
-	default:
+	keyType, keyTypePresent := values["k"]
+	algorithm, known := dkim2model.AlgorithmForDNSKeyType(keyType, keyTypePresent)
+	if !known {
 		return "", nil, errors.New("unsupported DKIM DNS algorithm")
 	}
 	public, err := decodeDNSPublicValue(publicValue)

@@ -42,6 +42,8 @@ func GenerateKeyPair(algorithm Algorithm, rsaBits int, random io.Reader) (*KeyPa
 		return GenerateRSAKeyPair(rsaBits, random)
 	case AlgorithmEd25519SHA256:
 		return GenerateEd25519KeyPair(random)
+	case AlgorithmMLDSA44Ed25519SHA512:
+		return GenerateCompositeKeyPair(random)
 	default:
 		return nil, ErrInvalid
 	}
@@ -104,6 +106,16 @@ func NewKeyPair(algorithm Algorithm, privatePKCS8, publicSPKI []byte) (*KeyPair,
 	if !algorithm.Known() || len(privatePKCS8) == 0 || len(publicSPKI) == 0 ||
 		len(privatePKCS8) > 16<<10 || len(publicSPKI) > 2<<10 {
 		return nil, ErrInvalid
+	}
+	if algorithm == AlgorithmMLDSA44Ed25519SHA512 {
+		dnsPublic, err := validateCompositeKey(privatePKCS8, publicSPKI)
+		if err != nil {
+			return nil, err
+		}
+		return &KeyPair{
+			algorithm: algorithm, privatePKCS8: bytes.Clone(privatePKCS8),
+			publicSPKI: bytes.Clone(publicSPKI), dnsPublic: dnsPublic,
+		}, nil
 	}
 	private, err := x509.ParsePKCS8PrivateKey(privatePKCS8)
 	if err != nil {

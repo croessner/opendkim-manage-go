@@ -2,6 +2,7 @@
 package dkim2model
 
 import (
+	"encoding/base64"
 	"errors"
 	"strings"
 )
@@ -28,7 +29,28 @@ const (
 	AlgorithmRSASHA256 Algorithm = "rsa-sha256"
 	// AlgorithmEd25519SHA256 identifies Ed25519 with SHA-256.
 	AlgorithmEd25519SHA256 Algorithm = "ed25519-sha256"
+	// AlgorithmMLDSA44Ed25519SHA512 identifies the LAMPS composite
+	// ML-DSA-44 plus Ed25519 algorithm over SHA-512.
+	AlgorithmMLDSA44Ed25519SHA512 Algorithm = "mldsa44-ed25519-sha512"
 )
+
+// signingAlgorithmOrder is the canonical signing order shared with the DKIM2
+// reference implementation: rsa-sha256, ed25519-sha256, then
+// mldsa44-ed25519-sha512. It is the single owner of algorithm ordering.
+var signingAlgorithmOrder = [...]Algorithm{
+	AlgorithmRSASHA256, AlgorithmEd25519SHA256, AlgorithmMLDSA44Ed25519SHA512,
+}
+
+// MaxCredentialsPerProfile is the largest credential set of one profile: one
+// credential per signing algorithm.
+const MaxCredentialsPerProfile = len(signingAlgorithmOrder)
+
+// SigningAlgorithms returns a detached copy of the canonical signing order.
+func SigningAlgorithms() []Algorithm { return append([]Algorithm(nil), signingAlgorithmOrder[:]...) }
+
+// CompareAlgorithms orders two algorithms by the canonical signing order;
+// unknown values sort after every known algorithm.
+func CompareAlgorithms(left, right Algorithm) int { return algorithmRank(left) - algorithmRank(right) }
 
 // ParseAlgorithm parses one exact closed algorithm value.
 func ParseAlgorithm(value string) (Algorithm, error) {
@@ -41,7 +63,12 @@ func ParseAlgorithm(value string) (Algorithm, error) {
 
 // Known reports whether the algorithm belongs to the closed vocabulary.
 func (a Algorithm) Known() bool {
-	return a == AlgorithmRSASHA256 || a == AlgorithmEd25519SHA256
+	for _, known := range signingAlgorithmOrder {
+		if a == known {
+			return true
+		}
+	}
+	return false
 }
 
 // ProfileUse identifies one exact administrative signing purpose.
@@ -253,4 +280,61 @@ func identifierEdge(value byte) bool {
 func dnsEdge(value byte) bool {
 	return value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' ||
 		value >= '0' && value <= '9'
+}
+
+// DNSKeyType returns the DNS-01 key-record k= token of the algorithm.
+func (a Algorithm) DNSKeyType() (string, bool) {
+	switch a {
+	case AlgorithmRSASHA256:
+		return "rsa", true
+	case AlgorithmEd25519SHA256:
+		return "ed25519", true
+	case AlgorithmMLDSA44Ed25519SHA512:
+		return string(AlgorithmMLDSA44Ed25519SHA512), true
+	default:
+		return "", false
+	}
+}
+
+// AlgorithmForDNSKeyType maps one exact DNS-01 key-record k= token to its
+// signing algorithm; an absent k= means rsa.
+func AlgorithmForDNSKeyType(keyType string, present bool) (Algorithm, bool) {
+	if !present {
+		return AlgorithmRSASHA256, true
+	}
+	for _, algorithm := range signingAlgorithmOrder {
+		if token, _ := algorithm.DNSKeyType(); token == keyType {
+			return algorithm, true
+		}
+	}
+	return "", false
+}
+
+// DNSHashAllowed reports whether a key record's h= value is acceptable for
+// the algorithm. RSA and Ed25519 records may declare sha256; the composite
+// algorithm fixes its hash, so its records carry no h= tag.
+func (a Algorithm) DNSHashAllowed(hash string, present bool) bool {
+	switch a {
+	case AlgorithmRSASHA256, AlgorithmEd25519SHA256:
+		return !present || hash == "sha256"
+	case AlgorithmMLDSA44Ed25519SHA512:
+		return !present
+	default:
+		return false
+	}
+}
+
+// DNSKeyRecord renders the canonical DNS-01 key-record content for one
+// algorithm and its DNS p= bytes. RSA and Ed25519 keep their established
+// h=sha256 form; the composite record omits h=.
+func DNSKeyRecord(algorithm Algorithm, public []byte) (string, error) {
+	keyType, known := algorithm.DNSKeyType()
+	if !known || len(public) == 0 {
+		return "", ErrInvalid
+	}
+	hash := "; h=sha256"
+	if algorithm == AlgorithmMLDSA44Ed25519SHA512 {
+		hash = ""
+	}
+	return "v=DKIM1; k=" + keyType + hash + "; p=" + base64.StdEncoding.EncodeToString(public), nil
 }

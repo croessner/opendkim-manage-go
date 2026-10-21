@@ -149,6 +149,8 @@ func TestPlanRotationSucceedsForEachExactAlgorithmSet(t *testing.T) {
 		{name: "rsa only", algorithms: []Algorithm{AlgorithmRSASHA256}},
 		{name: "ed25519 only", algorithms: []Algorithm{AlgorithmEd25519SHA256}},
 		{name: "dual", algorithms: []Algorithm{AlgorithmRSASHA256, AlgorithmEd25519SHA256}},
+		{name: "composite only", algorithms: []Algorithm{AlgorithmMLDSA44Ed25519SHA512}},
+		{name: "all three", algorithms: SigningAlgorithms()},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			current := activeBindingGeneration(t, 7, test.algorithms...)
@@ -466,8 +468,11 @@ func activeBindingGeneration(t *testing.T, generation uint64, algorithms ...Algo
 	defer func() { closeKeyMaterials(materials) }()
 	for _, algorithm := range algorithms {
 		label := "ed"
-		if algorithm == AlgorithmRSASHA256 {
+		switch algorithm {
+		case AlgorithmRSASHA256:
 			label = "rsa"
+		case AlgorithmMLDSA44Ed25519SHA512:
+			label = "pq"
 		}
 		pair, err := GenerateKeyPair(algorithm, DefaultRSABits, nil)
 		if err != nil {

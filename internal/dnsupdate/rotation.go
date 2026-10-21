@@ -537,8 +537,9 @@ func parseDKIMContent(content string) (dkim2model.Algorithm, []byte, error) {
 		}
 		values[pair[0]] = pair[1]
 	}
-	if len(values) < 3 || len(values) > 4 || values["p"] == "" ||
-		(values["k"] != "rsa" && values["k"] != "ed25519") {
+	keyType, keyTypePresent := values["k"]
+	algorithm, known := dkim2model.AlgorithmForDNSKeyType(keyType, keyTypePresent)
+	if len(values) < 3 || len(values) > 4 || values["p"] == "" || !keyTypePresent || !known {
 		return "", nil, errors.New("invalid DKIM key record")
 	}
 	for tag := range values {
@@ -546,17 +547,13 @@ func parseDKIMContent(content string) (dkim2model.Algorithm, []byte, error) {
 			return "", nil, errors.New("invalid DKIM key record")
 		}
 	}
-	if hash, present := values["h"]; present && hash != "sha256" {
+	if hash, present := values["h"]; !algorithm.DNSHashAllowed(hash, present) {
 		return "", nil, errors.New("invalid DKIM key record")
 	}
 	public, err := base64.StdEncoding.Strict().DecodeString(values["p"])
 	if err != nil || len(public) == 0 {
 		clear(public)
 		return "", nil, errors.New("invalid DKIM public key")
-	}
-	algorithm := dkim2model.AlgorithmRSASHA256
-	if values["k"] == "ed25519" {
-		algorithm = dkim2model.AlgorithmEd25519SHA256
 	}
 	return algorithm, public, nil
 }

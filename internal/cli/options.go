@@ -89,7 +89,7 @@ func Parse(args []string) (*Options, error) {
 	fs.StringSliceVarP(&o.Domains, "domain", "D", nil, "A DNS domain name")
 	fs.StringSliceVarP(&o.Selectors, "selectorname", "s", nil, "A selector name")
 	fs.IntVarP(&o.Size, "size", "S", 2048, "Size of DKIM RSA keys")
-	fs.StringVarP(&o.KeyType, "keytype", "k", "", "Key type: both,rsa,ed25519")
+	fs.StringVarP(&o.KeyType, "keytype", "k", "", "Key type: both,rsa,ed25519; dkim2 mode also composite,all")
 	fs.BoolVarP(&o.TestKey, "testkey", "t", false, "Check that listed DKIM keys are published and useable")
 	fs.StringVarP(&o.ConfigPath, "config", "f", "/etc/opendkim-manage.yaml", "Path to config file")
 	fs.BoolVarP(&o.AddMissing, "add-missing", "m", false, "Add missing DKIM keys")

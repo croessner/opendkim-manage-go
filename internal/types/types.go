@@ -35,6 +35,10 @@ const (
 	DKIMKeyTypeED25519
 	DKIMKeyTypeBoth
 	DKIMKeyTypeRevoked
+	// DKIMKeyTypeComposite selects only the DKIM2 mldsa44-ed25519-sha512 algorithm.
+	DKIMKeyTypeComposite
+	// DKIMKeyTypeAll selects RSA, Ed25519, and the DKIM2 composite algorithm.
+	DKIMKeyTypeAll
 )
 
 func (t DKIMKeyType) String() string {
@@ -47,6 +51,10 @@ func (t DKIMKeyType) String() string {
 		return "both"
 	case DKIMKeyTypeRevoked:
 		return "revoked"
+	case DKIMKeyTypeComposite:
+		return "composite"
+	case DKIMKeyTypeAll:
+		return "all"
 	default:
 		return "unknown"
 	}
@@ -62,9 +70,19 @@ func ParseDKIMKeyType(s string) (DKIMKeyType, error) {
 		return DKIMKeyTypeBoth, nil
 	case "revoked":
 		return DKIMKeyTypeRevoked, nil
+	case "composite":
+		return DKIMKeyTypeComposite, nil
+	case "all":
+		return DKIMKeyTypeAll, nil
 	default:
 		return DKIMKeyTypeUnknown, fmt.Errorf("unsupported key type %q", s)
 	}
+}
+
+// RequiresDKIM2 reports whether the key type selects an algorithm that only
+// DKIM2 mode supports; legacy OpenDKIM cannot sign with it.
+func (t DKIMKeyType) RequiresDKIM2() bool {
+	return t == DKIMKeyTypeComposite || t == DKIMKeyTypeAll
 }
 
 type DKIMActiveState int

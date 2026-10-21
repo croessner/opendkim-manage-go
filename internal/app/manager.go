@@ -71,6 +71,9 @@ type Manager struct {
 var errConfirmationRequired = errors.New("confirmation required; use --yes for non-interactive writes or --interactive")
 
 func NewManager(cfg *config.Config, opts *cli.Options) (*Manager, error) {
+	if opts.EffectiveKeyType(cfg.KeyType).RequiresDKIM2() {
+		return nil, fmt.Errorf("key type %s requires --mode dkim2", opts.EffectiveKeyType(cfg.KeyType))
+	}
 	ldapClient, err := ldapstore.NewClient(cfg)
 	if err != nil {
 		return nil, err

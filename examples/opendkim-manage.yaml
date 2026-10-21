@@ -18,7 +18,7 @@ global:
   # dark|light
   terminal_background: dark
 
-  # both|rsa|ed25519
+  # both|rsa|ed25519; dkim2 mode also composite|all
   keytype: both
 
   # Maximum number of revoked keys retained
@@ -70,6 +70,7 @@ dkim2:
 
   # Every effective LDAP/model safety bound is explicit and overrideable.
   max_generation_entries: 131072
+  # Minimum 2048: an mldsa44-ed25519-sha512 public SPKI is 1365 bytes.
   max_attribute_bytes: 65536
   max_dataset_bytes: 1073741824
   max_ldap_requests: 262144

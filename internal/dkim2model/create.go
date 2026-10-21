@@ -69,7 +69,7 @@ func ValidateCreateCandidateIntent(source, candidate *Generation, history Lineag
 func (i CreateCandidateIntent) validate() error {
 	if ValidateIdentifier(i.TenantID) != nil || !i.Use.SupportsNativeKeyCustody() ||
 		i.MaximumBindings <= 0 || len(i.Domains) == 0 || len(i.Domains) > i.MaximumBindings ||
-		len(i.Algorithms) == 0 || len(i.Algorithms) > 2 ||
+		len(i.Algorithms) == 0 || len(i.Algorithms) > MaxCredentialsPerProfile ||
 		len(i.Selectors) > 0 && (len(i.Domains) != 1 || len(i.Selectors) != len(i.Algorithms)) {
 		return ErrInvalid
 	}
