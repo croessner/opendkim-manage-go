@@ -11,7 +11,7 @@ Go 1.27 rewrite of the legacy Python `opendkim-manage` utility. The separate
 `dkim2` mode manages immutable native DKIM2 datasource generations. The
 project is distributed under the MIT license.
 
-The current prerelease is `v1.0.0-beta.12`.
+The current prerelease is `v1.0.0-beta.13`.
 
 ## Features
 
