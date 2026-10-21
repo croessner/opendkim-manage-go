@@ -41,6 +41,24 @@ the complete operation-bound `dkim2-datasource-v3` wire format.
 - `cn=current` moves only forward under a critical exact-current assertion.
   A staging root becomes committed only under a critical exact-staging
   assertion. Committed generation contents are never edited.
+- The v3 source activation marker is monotonic: add `dkim2WasActive=TRUE`
+  under the exact source commitment and an absent-marker assertion. Its
+  authority requires attribute addition, never replacement/deletion. An
+  existing marker or uncertain write result is accepted only after exact
+  source-bound readback of `TRUE`; a conflicting or malformed marker is
+  retained and stops activation.
+  The production LDAP transport permits this single Add only for the activation
+  authority, on a canonical positive generation root below the configured base,
+  with one critical assertion control. Other attribute additions remain rejected.
+  The isolated LDAP acceptance test exercises this actual authority client as
+  well as the server's add-only ACL, including a fresh-client retry.
+- With the four-authority native runtime enabled, explicit creation and
+  activation of profiles on an existing dataset also publish one complete
+  operation-bound v3 successor. They do not fall back to the legacy v2
+  publication path. Create keeps new bindings disabled; activate retains its
+  preceding DNS checks. Dry-runs stop before staging. An uncertain stage or
+  current switch is accepted only after readback of the exact candidate and
+  commitment; foreign pending work is never replaced.
 - Automatic retention is a separate phase after activation or an idle run. It
   never deletes current, staging, committed-but-unreachable, malformed,
   incomplete, foreign, or rollback-reserve generations. Each deletion is
@@ -134,6 +152,8 @@ cumulative work frame uses the explicit `max_ldap_requests`, `max_ldap_bytes`,
 and `max_retained_root_visits` values across all repeated readback and recovery
 phases; crossing any bound fails closed instead of starting another LDAP
 operation.
+Native administrative create and activation also use this deadline and the
+same in-process mutation fence when the four-authority runtime is enabled.
 
 Automatic eligibility uses the earliest retained root `createTimestamp` for
 the exact selector, algorithm, public-SPKI, and handle lineage of every current
@@ -143,6 +163,60 @@ makes eligibility unknown. `modifyTimestamp` and profile validity are not key
 age.
 
 ## Commands And Authorization
+
+Explicit creation recovery uses the original complete domain scope and
+configuration plus the exact stored successor number:
+
+```text
+--mode dkim2 --create --domain example.test --domain other.example \
+  --keytype ed25519 --resume-generation <G> --update-dns --dry-run
+```
+
+After a successful read-only validation, replace `--dry-run` with `--yes` to
+continue that operation. Recovery requires `rotation_enabled: true` and the
+native campaign repository. Bootstrap generation 1 and candidates without a
+valid v3 operation/source/content commitment cannot be resumed this way.
+`--prepare-only` remains restricted to rotation and rollback.
+
+The named generation must be the one complete immediate successor of its
+retained committed source. Current must still name that exact source or the
+already-committed candidate; any other higher root, incomplete retained
+history, absent source, unknown metadata, or changed current fails closed.
+The frozen candidate is reconstructed in memory from the source and exactly
+the requested tenant, domain set, profile use, algorithm set, RSA size, and
+feedback route. Supplied explicit selectors must match their stored algorithm
+positions; generated selectors are reused without allocation. Each addition
+must be a new disabled profile without a validity window, bound to exactly one
+disabled/off/strict policy and matching credentials, handles, and private key
+material. Selectors and public keys must be distinct within the additions and
+must not reuse retained selector, handle, or public-key lineage.
+
+All pre-existing records and protected key material must compare exactly
+after rebasing only their generation number. Extra, removed, activated, or
+otherwise modified records are rejected even when their candidate commitment
+is valid. The v3 metadata does not claim which CLI originally produced a
+candidate; the explicit requested generation, complete content comparison,
+native authority boundaries, and repeated exact readback authorize this
+semantically precise continuation.
+
+Recovery never stages another generation or requests randomness, keys,
+selectors, handles, or a new operation identity. A full dry-run performs the
+same commitment, source, lineage, intent, and fresh-readback checks without
+opening TSIG material or writing LDAP/DNS. Apply uses the existing native
+`CommitCampaignAndSwitch`, then requires complete exact current readback even
+after a reported success or a lost response. Already-current recovery does
+not repeat that mutation. It may finish optional DNS publication for only
+the new stored selector records using the existing create updater. Each
+record is fenced by fresh exact current/operation/content readback. An error
+retains the candidate and remaining work for the same explicit command;
+previously published exact records can be repeated. This does not claim an
+atomic LDAP/DNS transaction, change the create updater's TXT-only semantics,
+or remove the existing single-writer operational requirement.
+
+Committing the create generation keeps every new signing permission disabled.
+Activation remains a separate `--active` operation with its existing fresh
+DNS proof. `--auto` is not a substitute for explicit additive recovery: its
+changed-active-binding contract is unchanged.
 
 Manual rotation uses:
 
@@ -198,6 +272,30 @@ v2-to-v3 campaign never adds v3 activation metadata to its immutable v2 source.
 Old legacy cleanup remains an explicit migration operation, not automatic
 retention. A retained legacy root does not block deletion of a separately
 eligible older v3 root; it remains counted toward `max_generations`.
+Validated retained roots have one contiguous legacy prefix followed by one
+contiguous v3 suffix. Retention may leave a gap only at that schema transition,
+between the last retained legacy anchor and the first remaining v3 root.
+The legacy prefix itself is not rewritten or given new gap tolerance. A v1
+root remains limited to the existing generation-1 bootstrap contract. Unknown
+or absent schemas, duplicate roots, a legacy root after v3, or a gap inside
+either segment remain errors. The history model retains the validated schema
+so inventory, publication preflight, and pending-candidate discovery use the
+same rule. Current must still be present and exact; a successor remains exactly
+current plus one with its original source and commitment checks.
+
+The purge identity needs only structural deletion rights: `delete (=z)` on
+the target's `entry` pseudo-attribute and on its parent's `children`, including
+the generation container when deleting a root last. The synthetic
+[`examples/dkim2-purge.acl`](../../examples/dkim2-purge.acl) fragment is tested
+against isolated OpenLDAP with the actual snapshot and purge clients. It must
+precede overlapping deny rules, preserve other authorities through `by * break`,
+and keep current, legacy, staging, and never-active targets protected. No add,
+attribute-update, or private-material-read rights are needed for the purger;
+snapshot reads remain a separate authority. Server ACLs do not replace the
+manager's full current, inventory, rollback-reserve, operation, digest, partial
+subtree, and journal fences. Deployments must qualify their complete ACL order
+and exact directory names before applying the fragment.
+
 Current DNS reconciliation completes and proves all current records before an
 idle or reconciled run enters this retention phase.
 

@@ -172,7 +172,8 @@ func NewDKIM2Manager(cfg *config.Config, opts *cli.Options) (*DKIM2Manager, erro
 			return nil, errors.New("DKIM2 DNS update requires a nameserver, positive TTL, and complete TSIG configuration")
 		}
 	}
-	deferredLifecycleDNS := opts.Rotate || opts.Auto || opts.RetireGenerationSet || opts.RollbackFromGenerationSet
+	deferredLifecycleDNS := opts.Rotate || opts.Auto || opts.RetireGenerationSet || opts.RollbackFromGenerationSet ||
+		opts.Create && opts.ResumeGenerationSet
 	if opts.UpdateDNS && !opts.DryRun && !deferredLifecycleDNS {
 		manager.dns, err = dnsupdate.New(cfg)
 		if err != nil {
@@ -206,7 +207,8 @@ func (m *DKIM2Manager) Run() (*RunResult, error) {
 	if err := m.validateCommand(); err != nil {
 		return nil, err
 	}
-	lifecycle := m.opts.Rotate || m.opts.Auto || m.opts.RetireGenerationSet || m.opts.RollbackFromGenerationSet || m.opts.Observe
+	nativeAdministration := (m.opts.Create || m.opts.Active) && m.cfg.DKIM2.RotationEnabled
+	lifecycle := nativeAdministration || m.opts.Rotate || m.opts.Auto || m.opts.RetireGenerationSet || m.opts.RollbackFromGenerationSet || m.opts.Observe
 	ctx := context.Background()
 	cancel := func() {}
 	if lifecycle {
@@ -235,7 +237,7 @@ func (m *DKIM2Manager) Run() (*RunResult, error) {
 		return nil, errors.New("DKIM2 lifecycle deadline expired")
 	}
 	result := &RunResult{}
-	if m.opts.Rotate || m.opts.Auto || m.opts.RetireGenerationSet || m.opts.RollbackFromGenerationSet {
+	if nativeAdministration || m.opts.Rotate || m.opts.Auto || m.opts.RetireGenerationSet || m.opts.RollbackFromGenerationSet {
 		release, err := dkim2LifecycleMutations.acquire(ctx)
 		if err != nil {
 			return nil, errors.New("DKIM2 lifecycle deadline expired while waiting for the mutation fence")
@@ -411,8 +413,11 @@ func (m *DKIM2Manager) list(ctx context.Context) error {
 	return nil
 }
 
-// create builds and publishes one complete successor containing new disabled profiles.
+// create publishes new disabled profiles or resumes one exact stored native addition.
 func (m *DKIM2Manager) create(ctx context.Context) error {
+	if m.opts.ResumeGenerationSet {
+		return m.resumeCreate(ctx)
+	}
 	current, err := m.repository.LoadCurrent(ctx)
 	if err != nil {
 		return err
@@ -563,7 +568,7 @@ func (m *DKIM2Manager) create(ctx context.Context) error {
 		_, err = fmt.Fprintf(m.out, "dry-run: validated complete DKIM2 generation %d with %d new profile(s); no LDAP or DNS writes\n", candidate.Number(), len(domains))
 		return err
 	}
-	if err := m.repository.Publish(ctx, expected, candidate); err != nil {
+	if err := m.publishAdministrativeSuccessor(ctx, expected, candidate); err != nil {
 		return err
 	}
 	if m.opts.UpdateDNS {
@@ -661,7 +666,7 @@ func (m *DKIM2Manager) activate(ctx context.Context) error {
 		_, err = fmt.Fprintf(m.out, "dry-run: DNS verified and DKIM2 generation %d validated; no LDAP write\n", next)
 		return err
 	}
-	if err := m.repository.Publish(ctx, current.Number(), candidate); err != nil {
+	if err := m.publishAdministrativeSuccessor(ctx, current.Number(), candidate); err != nil {
 		return err
 	}
 	_, err = fmt.Fprintf(m.out, "published active DKIM2 generation %d for %s\n", next, domain)
@@ -858,37 +863,9 @@ func (m *DKIM2Manager) loadMutationHistory(ctx context.Context, current *dkim2mo
 	return history, nil
 }
 
-// retainedRootsContiguous validates an order-independent complete retained suffix.
+// retainedRootsContiguous shares the schema-bound inventory and retained-history shape.
 func retainedRootsContiguous(roots []dkim2store.GenerationRoot) bool {
-	if len(roots) == 0 {
-		return false
-	}
-	seen := make(map[uint64]struct{}, len(roots))
-	minimum, maximum := ^uint64(0), uint64(0)
-	for _, root := range roots {
-		if root.Number == 0 {
-			return false
-		}
-		if _, duplicate := seen[root.Number]; duplicate {
-			return false
-		}
-		seen[root.Number] = struct{}{}
-		if root.Number < minimum {
-			minimum = root.Number
-		}
-		if root.Number > maximum {
-			maximum = root.Number
-		}
-	}
-	if maximum-minimum+1 != uint64(len(roots)) {
-		return false
-	}
-	for number := minimum; number <= maximum; number++ {
-		if _, found := seen[number]; !found {
-			return false
-		}
-	}
-	return true
+	return dkim2store.ValidRetainedRoots(roots)
 }
 
 func canonicalUnique(values []string, canonicalize func(string) (string, error)) ([]string, error) {

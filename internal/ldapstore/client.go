@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -425,7 +426,7 @@ func (c *Client) AddRequest(req *ldap.AddRequest) error {
 	return nil
 }
 
-// ModifyRequest validates and executes one replacement-only LDAP modify and
+// ModifyRequest validates and executes one tightly scoped LDAP modify and
 // returns response metadata so callers can reject referrals or ambiguity.
 func (c *Client) ModifyRequest(req *ldap.ModifyRequest) (*ldap.ModifyResult, error) {
 	if err := c.validateModifyRequest(req); err != nil {
@@ -545,8 +546,8 @@ func (c *Client) validateAddRequest(req *ldap.AddRequest) error {
 	return nil
 }
 
-// validateModifyRequest limits immutable-generation publication to exact
-// replacement operations inside the configured dataset.
+// validateModifyRequest permits exact replacements and the narrowly scoped,
+// add-only activation marker inside the configured dataset.
 func (c *Client) validateModifyRequest(req *ldap.ModifyRequest) error {
 	if req == nil {
 		return errors.New("ldap modify request is nil")
@@ -560,8 +561,8 @@ func (c *Client) validateModifyRequest(req *ldap.ModifyRequest) error {
 
 	seen := make(map[string]struct{}, len(req.Changes))
 	for _, change := range req.Changes {
-		if change.Operation != ldap.ReplaceAttribute {
-			return errors.New("ldap modify request permits replacement changes only")
+		if change.Operation != ldap.ReplaceAttribute && !c.isActivationMarkerAddition(req) {
+			return errors.New("ldap modify request requires replacement or a guarded activation marker addition")
 		}
 		if err := validateAttributeDescription(change.Modification.Type); err != nil {
 			return fmt.Errorf("ldap modify request attribute: %w", err)
@@ -579,6 +580,34 @@ func (c *Client) validateModifyRequest(req *ldap.ModifyRequest) error {
 		return fmt.Errorf("ldap modify request controls: %w", err)
 	}
 	return nil
+}
+
+// isActivationMarkerAddition limits the monotonic exception to one generation
+// root, one activation authority, and a critical assertion supplied by the repository.
+func (c *Client) isActivationMarkerAddition(req *ldap.ModifyRequest) bool {
+	if c.authority == nil || c.purpose != AuthorityActivation || len(req.Changes) != 1 || len(req.Controls) != 1 {
+		return false
+	}
+	change := req.Changes[0]
+	if change.Operation != ldap.AddAttribute || !strings.EqualFold(change.Modification.Type, "dkim2WasActive") ||
+		len(change.Modification.Vals) != 1 || change.Modification.Vals[0] != "TRUE" {
+		return false
+	}
+	assertion, ok := req.Controls[0].(*ldap.ControlString)
+	if !ok || assertion == nil || assertion.ControlType != "1.3.6.1.1.12" || !assertion.Criticality || assertion.ControlValue == "" {
+		return false
+	}
+	target, err := ldap.ParseDN(req.DN)
+	if err != nil || len(target.RDNs) < 2 || len(target.RDNs[0].Attributes) != 1 {
+		return false
+	}
+	attribute := target.RDNs[0].Attributes[0]
+	number, err := strconv.ParseUint(attribute.Value, 10, 64)
+	if err != nil || number == 0 || strconv.FormatUint(number, 10) != attribute.Value || !strings.EqualFold(attribute.Type, "dkim2Generation") {
+		return false
+	}
+	parent, err := ldap.ParseDN("ou=generations," + c.BaseDN())
+	return err == nil && parent.Equal(&ldap.DN{RDNs: target.RDNs[1:]})
 }
 
 // validateRequestDN requires a syntactically valid target at or below the

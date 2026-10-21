@@ -409,10 +409,11 @@ func TestDKIM2AutoFailsClosedOnDisabledOrIncompleteHistoryBeforeMutation(t *test
 	}
 }
 
+// TestExactPendingSuccessorRejectsNoncontiguousRetainedRoots preserves rejection of genuine v3 holes.
 func TestExactPendingSuccessorRejectsNoncontiguousRetainedRoots(t *testing.T) {
 	history := dkim2store.NewRetainedHistory([]dkim2store.GenerationRoot{
-		{Number: 1, State: dkim2model.DatasetStateCommitted},
-		{Number: 3, State: dkim2model.DatasetStateCommitted},
+		{Number: 1, Schema: dkim2model.SchemaVersionV3, State: dkim2model.DatasetStateCommitted},
+		{Number: 3, Schema: dkim2model.SchemaVersionV3, State: dkim2model.DatasetStateCommitted},
 	}, true, nil, nil)
 	if _, err := exactPendingSuccessor(history, 3); !errors.Is(err, dkim2store.ErrMalformed) {
 		t.Fatalf("noncontiguous roots accepted: %v", err)
@@ -1018,6 +1019,7 @@ func rotationCommittedPair(t *testing.T, algorithms []dkim2model.Algorithm) (*dk
 	return predecessor, committed
 }
 
+// publicHistoryForGeneration exposes one explicit legacy snapshot without retaining private material.
 func publicHistoryForGeneration(generation *dkim2model.Generation) dkim2store.RetainedHistory {
 	selectors := make([]string, 0, len(generation.Credentials()))
 	for _, credential := range generation.Credentials() {
@@ -1028,6 +1030,6 @@ func publicHistoryForGeneration(generation *dkim2model.Generation) dkim2store.Re
 		handles = append(handles, handle.ID())
 	}
 	return dkim2store.NewRetainedHistory(
-		[]dkim2store.GenerationRoot{{Number: generation.Number(), State: generation.State()}}, true, selectors, handles,
+		[]dkim2store.GenerationRoot{{Number: generation.Number(), Schema: dkim2model.SchemaVersion, State: generation.State()}}, true, selectors, handles,
 	)
 }

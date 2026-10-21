@@ -116,7 +116,7 @@ func Parse(args []string) (*Options, error) {
 	fs.BoolVar(&o.Color, "color", false, "Color output")
 	fs.BoolVarP(&o.ShowVersion, "version", "V", false, "Print version and exit")
 	fs.BoolVar(&o.PrepareOnly, "prepare-only", false, "Stage a DKIM2 candidate without DNS activity")
-	fs.StringVar(&resumeGeneration, "resume-generation", "", "Resume one exact staged DKIM2 generation")
+	fs.StringVar(&resumeGeneration, "resume-generation", "", "Resume one exact stored DKIM2 create, rotation, or rollback generation")
 	fs.StringVar(&retireGeneration, "retire-generation", "", "Retire DNS records for one exact retained generation")
 	fs.StringVar(&rollbackFromGeneration, "rollback-from-generation", "", "Rebase one exact retained generation forward")
 	fs.BoolVar(&o.ResumeRetirement, "resume-retirement", false, "Resume an explicitly authorized DKIM2 retirement")
@@ -187,6 +187,7 @@ func (o *Options) EffectiveMode(configured types.Mode) types.Mode {
 	return configured
 }
 
+// Validate rejects ambiguous command combinations before mode-specific execution.
 func (o *Options) Validate() error {
 	if o.Create && len(o.Domains) == 0 {
 		return errors.New("--create requires --domain")
@@ -260,8 +261,8 @@ func (o *Options) Validate() error {
 	if o.PrepareOnly && !o.Rotate && !o.RollbackFromGenerationSet {
 		return errors.New("--prepare-only requires --rotate or --rollback-from-generation")
 	}
-	if o.ResumeGenerationSet && !o.Rotate && !o.RollbackFromGenerationSet {
-		return errors.New("--resume-generation requires --rotate or --rollback-from-generation")
+	if o.ResumeGenerationSet && !o.Create && !o.Rotate && !o.RollbackFromGenerationSet {
+		return errors.New("--resume-generation requires --create, --rotate, or --rollback-from-generation")
 	}
 	if o.ResumeRetirement && !o.RetireGenerationSet {
 		return errors.New("--resume-retirement requires --retire-generation")

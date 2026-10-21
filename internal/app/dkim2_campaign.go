@@ -165,6 +165,19 @@ func campaignPreparedMatches(prepared *dkim2store.PreparedGeneration, candidate 
 		return false
 	}
 	defer func() { _ = stored.Close() }()
+	if candidate.State() == dkim2model.DatasetStateStaging && stored.State() == dkim2model.DatasetStateCommitted {
+		// Root commit changes only lifecycle state. Preserve exact content
+		// comparison when reconciling the same candidate after that transition.
+		materials := stored.KeyMaterials()
+		defer closeMaterials(materials)
+		staging, err := dkim2model.NewGenerationWithState(stored.Number(), dkim2model.DatasetStateStaging,
+			stored.Handles(), stored.Profiles(), stored.Credentials(), stored.Policies(), materials)
+		if err != nil {
+			return false
+		}
+		defer func() { _ = staging.Close() }()
+		return candidate.Equivalent(staging)
+	}
 	return candidate.Equivalent(stored)
 }
 

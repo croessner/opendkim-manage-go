@@ -298,7 +298,7 @@ func (r *LDAPRepository) LoadRetainedHistory(ctx context.Context, limit int) (Re
 			}
 			return RetainedHistory{}, createdErr
 		}
-		history.Roots = append(history.Roots, GenerationRoot{Number: generation, State: state})
+		history.Roots = append(history.Roots, GenerationRoot{Number: generation, Schema: schemaVersion, State: state})
 		if err := r.loadHistoricalLineages(ctx, &history, generation, created, schemaVersion, legacyBootstrap); err != nil {
 			if errors.Is(err, errHistoryIncomplete) {
 				return NewRetainedHistory(nil, false, nil, nil), nil
@@ -695,17 +695,9 @@ func historyHasPendingShape(roots []GenerationRoot, expected, candidate uint64) 
 	return expectedFound && candidateCount == 1
 }
 
-// contiguousGenerationRoots accepts one complete contiguous retained suffix.
+// contiguousGenerationRoots shares the schema-bound retention shape with inventory and application reads.
 func contiguousGenerationRoots(roots []GenerationRoot) bool {
-	if len(roots) == 0 {
-		return false
-	}
-	for index, root := range roots {
-		if root.Number == 0 || index > 0 && root.Number != roots[index-1].Number+1 {
-			return false
-		}
-	}
-	return true
+	return ValidRetainedRoots(roots)
 }
 
 type historicalProfile struct {

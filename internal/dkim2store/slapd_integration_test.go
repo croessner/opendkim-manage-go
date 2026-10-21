@@ -107,6 +107,7 @@ func TestLDAPV2RepositoryAgainstSlapd(t *testing.T) {
 
 type slapdRequestExecutor struct {
 	baseDN string
+	url    string
 	conn   *ldap.Conn
 }
 
@@ -126,6 +127,12 @@ func (e *slapdRequestExecutor) ModifyRequest(request *ldap.ModifyRequest) (*ldap
 
 // startIsolatedSlapd starts one loopback-only temporary server using the exact pinned test schema.
 func startIsolatedSlapd(t *testing.T) *slapdRequestExecutor {
+	t.Helper()
+	return startIsolatedSlapdWithACL(t, "")
+}
+
+// startIsolatedSlapdWithACL adds only synthetic test ACLs ahead of the default deny rule.
+func startIsolatedSlapdWithACL(t *testing.T, extraACL string) *slapdRequestExecutor {
 	t.Helper()
 	slapd := requireExecutable(t, []string{
 		"/usr/local/opt/openldap/libexec/slapd",
@@ -165,9 +172,10 @@ rootdn "cn=admin,dc=example,dc=test"
 rootpw integration-placeholder
 directory %s
 index objectClass eq
+%s
 access to * by dn.exact="cn=admin,dc=example,dc=test" manage by * none
 `, filepath.Join(schemaDirectory, "core.schema"), filepath.Join(schemaDirectory, "cosine.schema"), pinnedSchema,
-		filepath.Join(temporary, "slapd.pid"), filepath.Join(temporary, "slapd.args"), databaseDirectory)
+		filepath.Join(temporary, "slapd.pid"), filepath.Join(temporary, "slapd.args"), databaseDirectory, extraACL)
 	configurationPath := filepath.Join(temporary, "slapd.conf")
 	if err := os.WriteFile(configurationPath, []byte(configuration), 0o600); err != nil {
 		t.Fatal("cannot write the isolated slapd configuration")
@@ -239,7 +247,7 @@ access to * by dn.exact="cn=admin,dc=example,dc=test" manage by * none
 	addSlapdFixtureEntry(t, connection, "ou=generations,ou=dkim2,dc=example,dc=test", map[string][]string{
 		"objectClass": {"top", "organizationalUnit"}, "ou": {"generations"},
 	})
-	return &slapdRequestExecutor{baseDN: "ou=dkim2,dc=example,dc=test", conn: connection}
+	return &slapdRequestExecutor{baseDN: "ou=dkim2,dc=example,dc=test", url: "ldap://" + address, conn: connection}
 }
 
 func newSlapdRepository(t *testing.T, executor *slapdRequestExecutor) *LDAPRepository {

@@ -1,6 +1,7 @@
 package dkim2store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strconv"
@@ -279,21 +280,70 @@ func currentPointerAssertion(pointer currentPointer) string {
 
 // markSourceWasActive persists monotonic source-generation activation evidence.
 func (r *LDAPRepository) markSourceWasActive(ctx context.Context, source currentPointer) error {
+	marked, err := r.sourceActivationMarked(ctx, source)
+	if err != nil || marked {
+		return err
+	}
 	request := ldap.NewModifyRequest(r.generationRoot(source.generation), nil)
-	request.Replace(attributeWasActive, []string{"TRUE"})
-	control, err := newAssertionControl(currentPointerAssertion(source))
+	// An add-only authority must not require deletion privileges, even when
+	// the attribute is absent. Never replace or clear activation evidence.
+	request.Add(attributeWasActive, []string{"TRUE"})
+	control, err := newAssertionControl("(&" + currentPointerAssertion(source) + "(!(" + attributeWasActive + "=*)))")
 	if err != nil {
 		return ErrMalformed
 	}
 	request.Controls = []ldap.Control{control}
-	result, err := r.modify(ctx, request)
+	_, err = r.modify(ctx, request)
+	if contextErr := validContext(ctx); contextErr != nil {
+		return contextErr
+	}
+	// Exact authoritative readback also reconciles a lost response or a
+	// concurrent identical add. A duplicate-value reply alone is not proof.
+	marked, readErr := r.sourceActivationMarked(ctx, source)
+	if readErr != nil {
+		return readErr
+	}
+	if marked {
+		return nil
+	}
 	if err != nil {
 		return classifyWriteError(err)
 	}
-	if result == nil || result.Referral != "" {
-		return ErrOutcomeUncertain
+	return ErrOutcomeUncertain
+}
+
+// sourceActivationMarked reads only one exact source root and its monotonic marker.
+func (r *LDAPRepository) sourceActivationMarked(ctx context.Context, source currentPointer) (bool, error) {
+	if source.schema != dkim2model.SchemaVersionV3 || source.state != datasetStateCommitted ||
+		source.generation == 0 || source.digest == ([dkim2model.CandidateDigestBytes]byte{}) {
+		return false, ErrMalformed
 	}
-	return nil
+	root := r.generationRoot(source.generation)
+	required := []string{attributeCN, attributeSchemaVersion, attributeGeneration, attributeDatasetState, attributeCandidateDigest}
+	attributes := append([]string{attributeObjectClass, attributeWasActive}, required...)
+	result, err := r.search(ctx, r.boundedSearch(root, ldap.ScopeBaseObject, 2, currentPointerAssertion(source), attributes))
+	if err != nil || !exactSearchResult(result, 1) {
+		if contextErr := validContext(ctx); contextErr != nil {
+			return false, contextErr
+		}
+		return false, ErrUnavailable
+	}
+	values, err := exactEntry(result.Entries[0], root, classDataset, required, []string{attributeWasActive}, r.limits)
+	if err != nil || string(values[attributeCN][0]) != "generation-"+strconv.FormatUint(source.generation, 10) ||
+		string(values[attributeSchemaVersion][0]) != source.schema ||
+		string(values[attributeGeneration][0]) != strconv.FormatUint(source.generation, 10) ||
+		string(values[attributeDatasetState][0]) != source.state ||
+		!bytes.Equal(values[attributeCandidateDigest][0], source.digest[:]) {
+		return false, ErrConflict
+	}
+	marker, present := values[attributeWasActive]
+	if !present {
+		return false, nil
+	}
+	if len(marker) != 1 || string(marker[0]) != "TRUE" {
+		return false, ErrConflict
+	}
+	return true, nil
 }
 
 func (r *LDAPRepository) switchCurrentCampaign(ctx context.Context, source currentPointer, metadata dkim2model.CandidateMetadata) error {

@@ -168,6 +168,16 @@ DKIM2 mode supports only these commands:
   profile and its complete supporting records. A new domain starts with a
   disabled/off policy. `--keytype both` creates distinct RSA and Ed25519
   credentials in deterministic RSA-then-Ed25519 order.
+- `--create --resume-generation <G>` explicitly recovers one complete native
+  v3 creation with the same domain set, tenant, profile use, algorithms, RSA
+  size, and feedback route. It validates all unchanged source records and
+  exactly the new disabled/off/strict profiles, reuses their stored keys, and
+  never stages a replacement. An already-current candidate can finish its
+  optional new-selector DNS publication. Dry-run validates without randomness,
+  TSIG access, or writes. Native authorities and `rotation_enabled: true` are
+  required; activation remains a separate DNS-verified operation. See the
+  [exact recovery contract](docs/specs/DKIM2-ROTATION.md#commands-and-authorization)
+  and [source qualification](docs/CREATE-RECOVERY-QUALIFICATION-2026-09.md).
 - `--active --domain ... --selectorname ...` requires a fresh exact DNS proof
   before publishing an enabled profile and policy.
 - `--testkey` requires exactly one logical TXT RR whose algorithm and public

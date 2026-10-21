@@ -44,6 +44,7 @@ func (f *fakeGenerationRepository) LoadCurrent(context.Context) (*dkim2model.Gen
 	return f.current.Clone()
 }
 
+// LoadRetainedHistory declares the fake repository's legacy wire schema explicitly.
 func (f *fakeGenerationRepository) LoadRetainedHistory(context.Context, int) (dkim2store.RetainedHistory, error) {
 	f.historyLoads++
 	if f.historyErr != nil {
@@ -65,7 +66,7 @@ func (f *fakeGenerationRepository) LoadRetainedHistory(context.Context, int) (dk
 	for _, handle := range f.current.Handles() {
 		handles = append(handles, handle.ID())
 	}
-	return dkim2store.NewRetainedHistory([]dkim2store.GenerationRoot{{Number: f.current.Number(), State: f.current.State()}}, true, selectors, handles), nil
+	return dkim2store.NewRetainedHistory([]dkim2store.GenerationRoot{{Number: f.current.Number(), Schema: dkim2model.SchemaVersion, State: f.current.State()}}, true, selectors, handles), nil
 }
 
 func TestDKIM2CreateAndActiveRejectIncompleteOrOrphanHistoryBeforeProtectedWork(t *testing.T) {
@@ -100,8 +101,8 @@ func TestDKIM2CreateRejectsHigherOrphanRootBeforeRandomness(t *testing.T) {
 	selectors := []string{"selector-rsa", "selector-ed"}
 	handles := []string{"handle-secret-marker-rsa", "handle-secret-marker-ed"}
 	history := dkim2store.NewRetainedHistory([]dkim2store.GenerationRoot{
-		{Number: 1, State: dkim2model.DatasetStateCommitted},
-		{Number: 2, State: dkim2model.DatasetStateStaging},
+		{Number: 1, Schema: dkim2model.SchemaVersion, State: dkim2model.DatasetStateCommitted},
+		{Number: 2, Schema: dkim2model.SchemaVersion, State: dkim2model.DatasetStateStaging},
 	}, true, selectors, handles)
 	repository.history = &history
 	manager := testDKIM2Manager(repository, &cli.Options{

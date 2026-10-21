@@ -190,6 +190,7 @@ func (*PreparedGeneration) MarshalJSON() ([]byte, error) { return json.Marshal(s
 // GenerationRoot is one bounded immutable root fact without generation contents.
 type GenerationRoot struct {
 	Number uint64
+	Schema string
 	State  dkim2model.DatasetState
 }
 

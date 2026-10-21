@@ -61,6 +61,7 @@ func (f *fakeRotationRepository) LoadCurrent(context.Context) (*dkim2model.Gener
 	return f.current.Clone()
 }
 
+// LoadRetainedHistory returns explicit native schema facts for this campaign fixture.
 func (f *fakeRotationRepository) LoadRetainedHistory(context.Context, int) (dkim2store.RetainedHistory, error) {
 	if err := f.event("load-history"); err != nil {
 		return dkim2store.RetainedHistory{}, err
@@ -73,7 +74,7 @@ func (f *fakeRotationRepository) LoadRetainedHistory(context.Context, int) (dkim
 			continue
 		}
 		generations = append(generations, generation)
-		roots = append(roots, dkim2store.GenerationRoot{Number: generation.Number(), State: generation.State()})
+		roots = append(roots, dkim2store.GenerationRoot{Number: generation.Number(), Schema: dkim2model.SchemaVersionV3, State: generation.State()})
 		for _, credential := range generation.Credentials() {
 			selectors = append(selectors, credential.Selector())
 		}
@@ -86,7 +87,7 @@ func (f *fakeRotationRepository) LoadRetainedHistory(context.Context, int) (dkim
 			continue
 		}
 		generations = append(generations, generation)
-		roots = append(roots, dkim2store.GenerationRoot{Number: generation.Number(), State: generation.State()})
+		roots = append(roots, dkim2store.GenerationRoot{Number: generation.Number(), Schema: dkim2model.SchemaVersionV3, State: generation.State()})
 		for _, credential := range generation.Credentials() {
 			selectors = append(selectors, credential.Selector())
 		}

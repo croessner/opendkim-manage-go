@@ -33,6 +33,33 @@ func TestParseAcceptsNativeDKIM2RotationForms(t *testing.T) {
 	}
 }
 
+// TestParseAcceptsNativeDKIM2CreateResume keeps explicit create recovery scoped to native mode.
+func TestParseAcceptsNativeDKIM2CreateResume(t *testing.T) {
+	opts, err := Parse([]string{"--mode", "dkim2", "--create", "--domain", "example.test", "--resume-generation", "2", "--dry-run"})
+	if err != nil {
+		t.Fatalf("parse native create recovery: %v", err)
+	}
+	if !opts.Create || !opts.ResumeGenerationSet || opts.ResumeGeneration != 2 || !opts.DryRun {
+		t.Fatal("create recovery intent was not preserved")
+	}
+	if err := opts.ValidateForMode(types.ModeDKIM2); err != nil {
+		t.Fatal(err)
+	}
+	if err := opts.ValidateForMode(types.ModeOpenDKIM); err == nil {
+		t.Fatal("OpenDKIM mode accepted native create recovery")
+	}
+	for _, args := range [][]string{
+		{"--create", "--domain", "example.test", "--resume-generation", "2", "--prepare-only"},
+		{"--create", "--domain", "example.test", "--resume-generation", "2", "--rotate"},
+		{"--list", "--resume-generation", "2"},
+		{"--active", "--selectorname", "selector", "--resume-generation", "2"},
+	} {
+		if _, err := Parse(args); err == nil {
+			t.Fatal("incompatible command accepted native create recovery")
+		}
+	}
+}
+
 func TestParseRejectsNoncanonicalGenerationArguments(t *testing.T) {
 	for _, flag := range []string{"--resume-generation", "--retire-generation", "--rollback-from-generation"} {
 		for _, value := range []string{"", "0", "00", "+1", " 1", "1 "} {

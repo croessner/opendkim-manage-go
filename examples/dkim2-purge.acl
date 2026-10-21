@@ -1,0 +1,14 @@
+# Synthetic OpenLDAP fragment. Place before overlapping entry/children rules.
+# Adapt only the directory base and exact purge identity to the deployment.
+# Snapshot reads remain under the separate snapshot authority's existing ACLs.
+access to dn.exact="ou=generations,ou=dkim2,dc=example,dc=test"
+    attrs=children
+    by dn.exact="cn=purger,dc=example,dc=test" =z
+    by * break
+
+access to dn.regex="^(.+,)?dkim2Generation=([1-9][0-9]*),ou=generations,ou=dkim2,dc=example,dc=test$"
+    attrs=entry,children
+    by set.expand="(user & [cn=purger,dc=example,dc=test]) + ([cn=current,ou=dkim2,dc=example,dc=test]/dkim2Generation & [$2])" none
+    by set.expand="(user & [cn=purger,dc=example,dc=test]) + ([dkim2Generation=$2,ou=generations,ou=dkim2,dc=example,dc=test]/dkim2SchemaVersion & [dkim2-datasource-v3]) + ([dkim2Generation=$2,ou=generations,ou=dkim2,dc=example,dc=test]/dkim2Generation & [$2]) + ([dkim2Generation=$2,ou=generations,ou=dkim2,dc=example,dc=test]/dkim2DatasetState & [committed]) + ([dkim2Generation=$2,ou=generations,ou=dkim2,dc=example,dc=test]/dkim2WasActive & [TRUE]) + ([cn=current,ou=dkim2,dc=example,dc=test]/dkim2SchemaVersion & ([dkim2-datasource-v2] | [dkim2-datasource-v3])) + ([cn=current,ou=dkim2,dc=example,dc=test]/dkim2DatasetState & [committed]) + [cn=current,ou=dkim2,dc=example,dc=test]/dkim2Generation" =z
+    by dn.exact="cn=purger,dc=example,dc=test" none
+    by * break

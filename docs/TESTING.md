@@ -41,6 +41,28 @@ DN is the dataset base, and the fixture must pre-create that base and its fixed
 placeholder credentials, and must not reuse a production directory or import
 legacy OpenDKIM objects.
 
+Require the installed isolated slapd gate, including the shipped structural
+delete-only ACL and actual separated authority clients, with:
+
+```bash
+OPENDKIM_MANAGE_REQUIRE_SLAPD=1 GOEXPERIMENT=runtimesecret make guardrails
+```
+
+`TestPurgeDeleteOnlyACLAgainstSlapd` starts only a temporary loopback server
+with synthetic identities. It verifies leaf-first/root-last deletion,
+interruption and exact journal recovery with a new writer connection, a
+preserved legacy anchor, and the current/staging/never-active/legacy vetoes.
+It also rejects purger add/attribute changes/private reads and preserves
+another authority's existing rights through ACL fall-through. It does not
+connect to a configured application directory or qualify a production ACL.
+
+The retained-history regression uses complete native repository generations:
+after deleting eligible v3 roots, it keeps the original v2 contents unchanged,
+reloads inventory/history, and publishes the exact next successor. The shared
+shape matrix rejects internal gaps, schema ambiguity, duplicates and reverse
+schema transitions; application tests cover the same current/pending fences
+and a real create dry-run without LDAP writes.
+
 The DKIM2 test matrix must cover:
 
 - exact `opendkim` default, exact `--mode` override, invalid-mode rejection,
@@ -73,6 +95,14 @@ The DKIM2 test matrix must cover:
 - `--resume-generation` reusing only the exact stored candidate without random
   key generation, including partial DNS, lost-response, committed-unreachable,
   pointer-switch, and already-current recovery classifications;
+- explicit `--create --resume-generation` with complete unchanged source,
+  exactly the requested disabled/off/strict additions, all native uses and
+  RSA/Ed25519/dual sets, exact RSA size and explicit selectors, fresh retained
+  key lineage, full dry-run validation, missing/changed metadata, current
+  drift before commit and between DNS records, DNS-failure restart without
+  restaging/rekeying, real loopback SOA/TCP/TSIG update and signed-failure
+  recovery with the unchanged create updater, and rejection of automatic
+  takeover;
 - default-off `--auto`, exact complete selector/algorithm/SPKI/handle lineage,
   canonical root `createTimestamp`, injected-clock age decisions, all-due
   bindings in exactly one v3 successor, non-due preservation, and

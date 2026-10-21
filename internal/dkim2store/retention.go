@@ -111,13 +111,13 @@ func (r *LDAPRepository) inventoryRoot(ctx context.Context, root *ldap.Entry) (G
 		WasActive: wasActive, Complete: true, Metadata: metadata}, nil
 }
 
+// contiguousInventorySuffix uses the same validated schema boundary as retained history.
 func contiguousInventorySuffix(roots []GenerationInventoryRoot) bool {
+	facts := make([]GenerationRoot, len(roots))
 	for index, root := range roots {
-		if root.Number == 0 || index > 0 && root.Number != roots[index-1].Number+1 {
-			return false
-		}
+		facts[index] = GenerationRoot{Number: root.Number, Schema: root.Schema, State: root.State}
 	}
-	return true
+	return ValidRetainedRoots(facts)
 }
 
 // DeleteGeneration removes one exact validated old v3 generation leaf-first and verifies absence.
